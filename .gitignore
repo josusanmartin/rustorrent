@@ -20,8 +20,10 @@ target/
 *.sfc
 *.smc
 
-# Bundled app
-macos/
+# Bundled app binaries (scripts and plist are tracked)
+macos/rustorrent
+macos/rustorrent-bin
+macos/AppIcon.icns
 
 # Test output
 output/
@@ -29,3 +31,8 @@ output/
 # Downloaded content directories
 Top_150_Super-Nintendo*/
 Bugonia*/
+
+# Fuzzing artifacts
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/coverage/

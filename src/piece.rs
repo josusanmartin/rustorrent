@@ -166,6 +166,18 @@ impl PieceManager {
             .all(|piece| !piece.wanted || piece.is_complete())
     }
 
+    pub fn reset_verified(&mut self) {
+        for piece in &mut self.pieces {
+            piece.verified = false;
+            for block in &mut piece.blocks {
+                *block = BlockState::Missing;
+            }
+        }
+        for slot in &mut self.reserved_by {
+            *slot = None;
+        }
+    }
+
     #[allow(dead_code)]
     pub fn next_missing_piece(&self) -> Option<u32> {
         let mut best = None;

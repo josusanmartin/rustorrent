@@ -195,6 +195,33 @@ mod tests {
     fn rejects_negative_zero() {
         assert!(parse(b"i-0e").is_err());
     }
+
+    #[test]
+    fn rejects_trailing_data() {
+        assert!(matches!(parse(b"i1ee"), Err(Error::TrailingData)));
+    }
+
+    #[test]
+    fn rejects_invalid_dict_key_type() {
+        assert!(matches!(parse(b"di1e1:ae"), Err(Error::InvalidDictKey)));
+    }
+
+    #[test]
+    fn rejects_invalid_lengths_and_integers() {
+        assert!(matches!(parse(b"03:abc"), Err(Error::InvalidLen)));
+        assert!(matches!(parse(b"i01e"), Err(Error::InvalidInt)));
+        assert!(matches!(parse(b"ie"), Err(Error::InvalidInt)));
+    }
+
+    #[test]
+    fn parse_value_reports_next_offset() {
+        let data = b"4:spami42e";
+        let (first, pos) = parse_value(data, 0).unwrap();
+        assert_eq!(first, Value::Bytes(b"spam".to_vec()));
+        let (second, end) = parse_value(data, pos).unwrap();
+        assert_eq!(second, Value::Int(42));
+        assert_eq!(end, data.len());
+    }
 }
 
 fn is_digit(b: u8) -> bool {

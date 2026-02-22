@@ -534,4 +534,26 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn read_flushes_overlapping_write_cache() {
+        let dir = temp_dir("cache-flush");
+        fs::create_dir_all(&dir).unwrap();
+        let mut storage = Storage::new(
+            &dummy_meta(),
+            &dir,
+            StorageOptions {
+                preallocate: true,
+                write_cache_bytes: 1024,
+            },
+        )
+        .unwrap();
+
+        storage.write_at(1, &[7, 8, 9]).unwrap();
+        let mut out = [0u8; 3];
+        storage.read_at(1, &mut out).unwrap();
+        assert_eq!(out, [7, 8, 9]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

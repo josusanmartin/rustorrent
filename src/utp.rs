@@ -519,3 +519,150 @@ fn next_u16() -> u16 {
     SEED.store(x, Ordering::Relaxed);
     x as u16
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_roundtrip_preserves_fields() {
+        let payload = b"hello-utp";
+        let packet = build_packet(TYPE_DATA, 42, 100, 99, payload);
+        assert_eq!(packet.len(), UTP_HEADER_LEN + payload.len());
+
+        let (ty, conn_id, seq, ack, parsed_payload) = parse_packet(&packet);
+        assert_eq!(ty, TYPE_DATA);
+        assert_eq!(conn_id, 42);
+        assert_eq!(seq, 100);
+        assert_eq!(ack, 99);
+        assert_eq!(parsed_payload, payload);
+    }
+
+    #[test]
+    fn sequence_compare_handles_wraparound() {
+        assert!(is_seq_before_or_equal(10, 10));
+        assert!(is_seq_before_or_equal(10, 11));
+        assert!(!is_seq_before_or_equal(11, 10));
+        assert!(is_seq_before_or_equal(65530, 5));
+        assert!(!is_seq_before_or_equal(5, 65530));
+    }
+
+    #[test]
+    fn utp_stream_read_uses_channel_and_internal_buffer() {
+        let (send_tx, _send_rx) = mpsc::channel();
+        let (recv_tx, recv_rx) = mpsc::channel();
+        let mut stream = UtpStream {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            send_tx,
+            recv_rx,
+            read_buf: VecDeque::new(),
+            read_timeout: Some(Duration::from_millis(200)),
+            write_timeout: None,
+        };
+
+        recv_tx.send(vec![1, 2, 3]).unwrap();
+        let mut first = [0u8; 2];
+        let n1 = stream.read(&mut first).unwrap();
+        assert_eq!(n1, 2);
+        assert_eq!(first, [1, 2]);
+
+        let mut second = [0u8; 2];
+        let n2 = stream.read(&mut second).unwrap();
+        assert_eq!(n2, 1);
+        assert_eq!(second[0], 3);
+    }
+
+    #[test]
+    fn utp_stream_write_splits_payload_into_packets() {
+        let (send_tx, send_rx) = mpsc::channel();
+        let (_recv_tx, recv_rx) = mpsc::channel();
+        let mut stream = UtpStream {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            send_tx,
+            recv_rx,
+            read_buf: VecDeque::new(),
+            read_timeout: None,
+            write_timeout: Some(Duration::from_secs(1)),
+        };
+
+        let handle = thread::spawn(move || {
+            let mut sizes = Vec::new();
+            for _ in 0..2 {
+                let req = send_rx.recv().unwrap();
+                sizes.push(req.data.len());
+                let _ = req.resp.send(Ok(()));
+            }
+            sizes
+        });
+
+        let total = UTP_PAYLOAD_MAX + 17;
+        let written = stream.write(&vec![9u8; total]).unwrap();
+        assert_eq!(written, total);
+        let sizes = handle.join().unwrap();
+        assert_eq!(sizes, vec![UTP_PAYLOAD_MAX, 17]);
+    }
+
+    #[test]
+    fn utp_stream_write_respects_timeout() {
+        let (send_tx, _send_rx) = mpsc::channel::<SendRequest>();
+        let (_recv_tx, recv_rx) = mpsc::channel();
+        let mut stream = UtpStream {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            send_tx,
+            recv_rx,
+            read_buf: VecDeque::new(),
+            read_timeout: None,
+            write_timeout: Some(Duration::from_millis(10)),
+        };
+
+        let err = stream.write(&[1, 2, 3]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn connector_and_listener_exchange_data() {
+        fn free_port() -> u16 {
+            UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        }
+
+        let port_a = free_port();
+        let port_b = free_port();
+        let (connector_a, _listener_a) = start(port_a);
+        let (_connector_b, listener_b) = start(port_b);
+
+        thread::sleep(Duration::from_millis(50));
+        let addr_b: SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();
+        let mut a = connector_a.connect(addr_b).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut b = loop {
+            if let Some(stream) = listener_b.try_accept() {
+                break stream;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for utp accept"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        a.set_read_timeout(Some(Duration::from_secs(1)));
+        a.set_write_timeout(Some(Duration::from_secs(1)));
+        b.set_read_timeout(Some(Duration::from_secs(1)));
+        b.set_write_timeout(Some(Duration::from_secs(1)));
+
+        a.write_all(b"abc").unwrap();
+        let mut recv = [0u8; 3];
+        b.read_exact(&mut recv).unwrap();
+        assert_eq!(&recv, b"abc");
+
+        b.write_all(b"ok").unwrap();
+        let mut recv2 = [0u8; 2];
+        a.read_exact(&mut recv2).unwrap();
+        assert_eq!(&recv2, b"ok");
+    }
+}

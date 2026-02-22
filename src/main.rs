@@ -238,9 +238,9 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bencode::Value;
 use crate::ip_filter::IpFilter;
@@ -252,6 +252,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_UPLOAD_BLOCK_LEN: u32 = 64 * 1024;
 const MAX_IDLE_TICKS: u32 = 180;
 const MAX_IDLE_TICKS_SEED: u32 = 720;
+const SNUB_TIMEOUT: Duration = Duration::from_secs(60);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(90);
 const ENDGAME_BLOCKS: usize = 32;
 const ENDGAME_DUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -266,6 +267,8 @@ const PEER_RETRY_BASE_SECS: u64 = 5;
 const NO_PEER_REANNOUNCE_SECS: u64 = 10;
 const PEER_BAN_SECS: u64 = 120;
 const MAX_TORRENT_BYTES: usize = 2 * 1024 * 1024;
+const MIN_INBOUND_HANDLER_SLOTS: usize = 64;
+const MAX_INBOUND_HANDLER_SLOTS: usize = 1024;
 const METADATA_PIECE_LEN: usize = 16 * 1024;
 const METADATA_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
@@ -291,10 +294,12 @@ static PAUSED: AtomicBool = AtomicBool::new(false);
 static PROGRESS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PROGRESS_LINE_LEN: AtomicUsize = AtomicUsize::new(0);
 static LOG_LOCK: Mutex<()> = Mutex::new(());
+static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 static SESSION_DOWNLOADED_BYTES: AtomicU64 = AtomicU64::new(0);
 static SESSION_UPLOADED_BYTES: AtomicU64 = AtomicU64::new(0);
 static PEER_CONNECTED: AtomicU64 = AtomicU64::new(0);
 static PEER_DISCONNECTED: AtomicU64 = AtomicU64::new(0);
+static SEED_RATIO_BITS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 enum TorrentSource {
@@ -343,6 +348,12 @@ struct ConnectionConfig {
 struct InboundConfig {
     encryption: EncryptionMode,
     ip_filter: Option<Arc<IpFilter>>,
+    max_handlers: usize,
+    active_handlers: Arc<AtomicUsize>,
+}
+
+struct InboundHandlerGuard {
+    active: Option<Arc<AtomicUsize>>,
 }
 
 struct RateLimiter {
@@ -448,16 +459,57 @@ fn clear_progress_line() {
     let _ = io::stderr().flush();
 }
 
+fn log_timestamp() -> String {
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    // Days since 1970-01-01 to Y-M-D
+    let mut y = 1970i64;
+    let mut rem = days as i64;
+    loop {
+        let ylen = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+        if rem < ylen { break; }
+        rem -= ylen;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut mo = 0usize;
+    for &ml in &mdays {
+        if rem < ml as i64 { break; }
+        rem -= ml as i64;
+        mo += 1;
+    }
+    format!("[{y:04}-{:02}-{:02} {h:02}:{m:02}:{s:02}]", mo + 1, rem + 1)
+}
+
+fn write_to_log_file(args: std::fmt::Arguments) {
+    if let Some(file) = LOG_FILE.get() {
+        if let Ok(mut f) = file.lock() {
+            let ts = log_timestamp();
+            let _ = write!(f, "{ts} {args}\n");
+            let _ = f.flush();
+        }
+    }
+}
+
 pub(crate) fn log_stdout(args: std::fmt::Arguments) {
     let _guard = LOG_LOCK.lock().ok();
     clear_progress_line();
     println!("{args}");
+    write_to_log_file(args);
 }
 
 pub(crate) fn log_stderr(args: std::fmt::Arguments) {
     let _guard = LOG_LOCK.lock().ok();
     clear_progress_line();
     eprintln!("{args}");
+    write_to_log_file(args);
 }
 
 pub(crate) fn system_entropy_u64() -> u64 {
@@ -617,74 +669,13 @@ fn sleep_with_shutdown_or_stop(duration: Duration, stop_flag: &AtomicBool) {
 impl SessionStore {
     fn load(root: &Path) -> Self {
         let path = session_path(root);
-        let mut entries: HashMap<[u8; 20], SessionEntry> = HashMap::new();
-        let data = match fs::read(&path) {
-            Ok(data) => data,
-            Err(_) => {
-                return Self {
-                    path,
-                    entries: Mutex::new(entries),
-                };
-            }
-        };
-        let value = match bencode::parse(&data) {
-            Ok(value) => value,
+        let entries = match load_session_entries_with_recovery(&path, root) {
+            Ok(entries) => entries,
             Err(err) => {
-                log_warn!("session load failed: {err}");
-                return Self {
-                    path,
-                    entries: Mutex::new(entries),
-                };
+                log_warn!("{err}");
+                HashMap::new()
             }
         };
-        let list = match value {
-            Value::List(items) => items,
-            _ => {
-                log_warn!("session load failed: invalid format");
-                return Self {
-                    path,
-                    entries: Mutex::new(entries),
-                };
-            }
-        };
-        for item in list {
-            let Value::Dict(items) = item else {
-                continue;
-            };
-            let info_hash = match dict_get(&items, b"info_hash") {
-                Some(Value::Bytes(bytes)) if bytes.len() == 20 => {
-                    let mut out = [0u8; 20];
-                    out.copy_from_slice(bytes);
-                    out
-                }
-                _ => continue,
-            };
-            let torrent_bytes = match dict_get(&items, b"torrent") {
-                Some(Value::Bytes(bytes)) if !bytes.is_empty() => bytes.clone(),
-                _ => continue,
-            };
-            let name = match dict_get(&items, b"name") {
-                Some(Value::Bytes(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
-                _ => String::new(),
-            };
-            let download_dir = match dict_get(&items, b"download_dir") {
-                Some(Value::Bytes(bytes)) if !bytes.is_empty() => {
-                    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
-                }
-                _ => root.to_path_buf(),
-            };
-            let preallocate = dict_get_int(&items, b"preallocate").unwrap_or(0) != 0;
-            entries.insert(
-                info_hash,
-                SessionEntry {
-                    info_hash,
-                    name,
-                    torrent_bytes,
-                    download_dir,
-                    preallocate,
-                },
-            );
-        }
         Self {
             path,
             entries: Mutex::new(entries),
@@ -797,6 +788,37 @@ impl RateLimiter {
         let sleep_secs = needed / capacity;
         if sleep_secs > 0.0 {
             sleep_with_shutdown(Duration::from_secs_f64(sleep_secs));
+        }
+    }
+}
+
+impl InboundConfig {
+    fn try_acquire_handler_slot(&self) -> Option<InboundHandlerGuard> {
+        if self.max_handlers == 0 {
+            return Some(InboundHandlerGuard { active: None });
+        }
+        loop {
+            let current = self.active_handlers.load(Ordering::SeqCst);
+            if current >= self.max_handlers {
+                return None;
+            }
+            if self
+                .active_handlers
+                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Some(InboundHandlerGuard {
+                    active: Some(Arc::clone(&self.active_handlers)),
+                });
+            }
+        }
+    }
+}
+
+impl Drop for InboundHandlerGuard {
+    fn drop(&mut self) {
+        if let Some(active) = self.active.take() {
+            active.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -989,10 +1011,73 @@ fn next_rng(state: &mut UploadState) -> u64 {
     x
 }
 
+fn inbound_handler_slots(max_peers_global: usize) -> usize {
+    if max_peers_global == 0 {
+        return 0;
+    }
+    max_peers_global
+        .saturating_mul(2)
+        .clamp(MIN_INBOUND_HANDLER_SLOTS, MAX_INBOUND_HANDLER_SLOTS)
+}
+
 fn run() -> Result<(), String> {
     install_signal_handlers();
     install_panic_logger();
     let args = parse_args()?;
+
+    // Initialize log file if --log was specified
+    if let Some(log_path) = args.log_path.as_ref() {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .map_err(|err| format!("failed to open log file: {err}"))?;
+        let _ = LOG_FILE.set(Mutex::new(file));
+    }
+
+    // Daemon mode: fork and detach on Unix
+    #[cfg(unix)]
+    if args.daemon {
+        extern "C" {
+            fn fork() -> i32;
+            fn setsid() -> i32;
+        }
+        let pid = unsafe { fork() };
+        if pid < 0 {
+            return Err("fork failed".to_string());
+        }
+        if pid > 0 {
+            // Parent: exit immediately
+            std::process::exit(0);
+        }
+        // Child: create new session
+        if unsafe { setsid() } < 0 {
+            return Err("setsid failed".to_string());
+        }
+        // Redirect stdin to /dev/null
+        if let Ok(devnull) = std::fs::File::open("/dev/null") {
+            use std::os::unix::io::{AsRawFd, FromRawFd};
+            extern "C" {
+                fn dup2(oldfd: i32, newfd: i32) -> i32;
+            }
+            unsafe {
+                dup2(devnull.as_raw_fd(), 0);
+            }
+        }
+    }
+
+    // Write PID file if requested
+    if let Some(pid_path) = args.pid_file.as_ref() {
+        let pid = std::process::id();
+        fs::write(pid_path, format!("{pid}\n"))
+            .map_err(|err| format!("failed to write pid file: {err}"))?;
+    }
+
+    // Initialize seed ratio from CLI args
+    if args.seed_ratio > 0.0 {
+        SEED_RATIO_BITS.store(args.seed_ratio.to_bits(), Ordering::SeqCst);
+    }
+
     let global_down = Arc::new(RateLimiter::new(args.download_rate));
     let global_up = Arc::new(RateLimiter::new(args.upload_rate));
     let peer_slots = Arc::new(PeerSlots::new(args.max_peers_global));
@@ -1012,10 +1097,15 @@ fn run() -> Result<(), String> {
     update_ui(&ui_state, |ui| {
         ui.global_download_limit_bps = args.download_rate;
         ui.global_upload_limit_bps = args.upload_rate;
+        ui.seed_ratio = args.seed_ratio;
     });
 
     let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
-    let progress_handle = start_console_progress(state.clone(), registry.clone());
+    let progress_handle = if !args.daemon {
+        Some(start_console_progress(state.clone(), registry.clone()))
+    } else {
+        None
+    };
     let ip_filter = if let Some(path) = args.blocklist_path.as_ref() {
         match IpFilter::from_file(path) {
             Ok(filter) => Some(Arc::new(filter)),
@@ -1030,6 +1120,8 @@ fn run() -> Result<(), String> {
     let inbound = InboundConfig {
         encryption: args.encryption,
         ip_filter: ip_filter.clone(),
+        max_handlers: inbound_handler_slots(args.max_peers_global),
+        active_handlers: Arc::new(AtomicUsize::new(0)),
     };
     start_inbound_listener(args.port, registry.clone(), inbound.clone());
     let utp_connector = if args.enable_utp {
@@ -1198,7 +1290,9 @@ fn run() -> Result<(), String> {
     for handle in handles {
         let _ = handle.join();
     }
-    let _ = progress_handle.join();
+    if let Some(handle) = progress_handle {
+        let _ = handle.join();
+    }
 
     Ok(())
 }
@@ -1359,6 +1453,23 @@ fn drain_ui_commands(
                     });
                     let _ = reply.send(Ok(ui::UiCommandSuccess::Ok));
                 }
+                ui::UiCommand::RecheckTorrent { torrent_id, reply } => {
+                    let result = recheck_torrent(registry, ui_state, torrent_id);
+                    if let Err(err) = result.as_ref() {
+                        log_warn!("recheck torrent error: {err}");
+                        update_ui(ui_state, |state| {
+                            state.last_error = err.clone();
+                        });
+                    }
+                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
+                }
+                ui::UiCommand::SetSeedRatio { ratio, reply } => {
+                    SEED_RATIO_BITS.store(ratio.to_bits(), Ordering::SeqCst);
+                    update_ui(ui_state, |state| {
+                        state.seed_ratio = ratio;
+                    });
+                    let _ = reply.send(Ok(ui::UiCommandSuccess::Ok));
+                }
             },
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => break,
@@ -1498,9 +1609,17 @@ fn run_torrent(
     let meta = torrent::parse_torrent(&data).map_err(|err| format!("parse error: {err}"))?;
     let file_spans = Arc::new(build_file_spans(&meta));
     let resume_path = resume_path(&request.download_dir, meta.info_hash);
-    let resume_data = load_resume_data(&resume_path)
-        .ok()
-        .filter(|data| data.info_hash == meta.info_hash);
+    let resume_data = load_resume_data_with_recovery(&resume_path).and_then(|data| {
+        if data.info_hash == meta.info_hash {
+            Some(data)
+        } else {
+            log_warn!(
+                "resume info hash mismatch; ignoring {}",
+                resume_path.display()
+            );
+            None
+        }
+    });
     let mut file_priorities = vec![piece::PRIORITY_NORMAL; file_spans.len()];
     if let Some(resume) = resume_data.as_ref() {
         if resume.file_priorities.len() == file_priorities.len() {
@@ -1734,6 +1853,9 @@ fn run_torrent(
         let peer_tags = Arc::clone(&peer_tags);
         let torrent_id = request.id;
         let allow_pex = !meta.info.private;
+        if meta.info.private {
+            log_info!("private torrent: DHT/PEX/LPD disabled");
+        }
         let dht_rx = if !meta.info.private {
             let (tx, rx) = mpsc::channel();
             dht.add_torrent(meta.info_hash, args.port, tx);
@@ -1901,7 +2023,7 @@ fn run_torrent(
                 log_info!("announcing to trackers...");
 
                 for tracker_url in &trackers.http {
-                    match tracker::announce(
+                    match tracker::announce_with_private(
                         tracker_url,
                         meta.info_hash,
                         peer_id,
@@ -1911,6 +2033,7 @@ fn run_torrent(
                         left,
                         event,
                         args.numwant,
+                        meta.info.private,
                     ) {
                         Ok(response) => {
                             any_success = true;
@@ -2047,7 +2170,7 @@ fn run_torrent(
             let left = total_length.saturating_sub(completed_bytes);
             log_info!("sending tracker stopped event...");
             for tracker_url in &trackers.http {
-                let _ = tracker::announce(
+                let _ = tracker::announce_with_private(
                     tracker_url,
                     meta.info_hash,
                     peer_id,
@@ -2057,6 +2180,7 @@ fn run_torrent(
                     left,
                     Some("stopped"),
                     args.numwant,
+                    meta.info.private,
                 );
             }
             for tracker_url in &trackers.udp {
@@ -3998,6 +4122,116 @@ fn session_path(download_dir: &Path) -> PathBuf {
     download_dir.join(".rustorrent").join("session.benc")
 }
 
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut out = path.as_os_str().to_owned();
+    out.push(suffix);
+    PathBuf::from(out)
+}
+
+fn write_atomic_file(
+    path: &Path,
+    data: &[u8],
+    label: &str,
+    keep_backup: bool,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("{label} dir failed: {err}"))?;
+    }
+    if keep_backup && path.exists() {
+        let backup_path = sidecar_path(path, ".bak");
+        let _ = fs::copy(path, &backup_path);
+    }
+    let tmp_path = sidecar_path(path, ".tmp");
+    fs::write(&tmp_path, data).map_err(|err| format!("{label} write failed: {err}"))?;
+    fs::rename(&tmp_path, path).map_err(|err| format!("{label} rename failed: {err}"))?;
+    Ok(())
+}
+
+fn parse_session_entries(
+    data: &[u8],
+    root: &Path,
+) -> Result<HashMap<[u8; 20], SessionEntry>, String> {
+    let value = bencode::parse(data).map_err(|err| err.to_string())?;
+    let list = match value {
+        Value::List(items) => items,
+        _ => return Err("invalid format".to_string()),
+    };
+    let mut entries: HashMap<[u8; 20], SessionEntry> = HashMap::new();
+    for item in list {
+        let Value::Dict(items) = item else {
+            continue;
+        };
+        let info_hash = match dict_get(&items, b"info_hash") {
+            Some(Value::Bytes(bytes)) if bytes.len() == 20 => {
+                let mut out = [0u8; 20];
+                out.copy_from_slice(bytes);
+                out
+            }
+            _ => continue,
+        };
+        let torrent_bytes = match dict_get(&items, b"torrent") {
+            Some(Value::Bytes(bytes)) if !bytes.is_empty() => bytes.clone(),
+            _ => continue,
+        };
+        let name = match dict_get(&items, b"name") {
+            Some(Value::Bytes(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+            _ => String::new(),
+        };
+        let download_dir = match dict_get(&items, b"download_dir") {
+            Some(Value::Bytes(bytes)) if !bytes.is_empty() => {
+                PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+            }
+            _ => root.to_path_buf(),
+        };
+        let preallocate = dict_get_int(&items, b"preallocate").unwrap_or(0) != 0;
+        entries.insert(
+            info_hash,
+            SessionEntry {
+                info_hash,
+                name,
+                torrent_bytes,
+                download_dir,
+                preallocate,
+            },
+        );
+    }
+    Ok(entries)
+}
+
+fn load_session_entries_with_recovery(
+    path: &Path,
+    root: &Path,
+) -> Result<HashMap<[u8; 20], SessionEntry>, String> {
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(err) => return Err(format!("session read failed: {err}")),
+    };
+    match parse_session_entries(&data, root) {
+        Ok(entries) => Ok(entries),
+        Err(primary_err) => {
+            let backup_path = sidecar_path(path, ".bak");
+            let backup_data = match fs::read(&backup_path) {
+                Ok(data) => data,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    return Err(format!("session load failed: {primary_err}"));
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "session load failed: {primary_err}; backup read failed: {err}"
+                    ));
+                }
+            };
+            let recovered = parse_session_entries(&backup_data, root).map_err(|backup_err| {
+                format!("session load failed: {primary_err}; backup invalid: {backup_err}")
+            })?;
+            let _ = write_atomic_file(path, &backup_data, "session restore", false);
+            log_warn!("session load recovered from backup");
+            Ok(recovered)
+        }
+    }
+}
+
 fn save_session(path: &Path, entries: &HashMap<[u8; 20], SessionEntry>) -> Result<(), String> {
     let mut list = Vec::with_capacity(entries.len());
     for entry in entries.values() {
@@ -4026,16 +4260,16 @@ fn save_session(path: &Path, entries: &HashMap<[u8; 20], SessionEntry>) -> Resul
     }
     let value = Value::List(list);
     let data = bencode::encode(&value);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("session dir failed: {err}"))?;
-    }
-    fs::write(path, &data).map_err(|err| format!("session write failed: {err}"))?;
-    Ok(())
+    write_atomic_file(path, &data, "session", true)
 }
 
 fn load_resume_data(path: &Path) -> Result<ResumeData, String> {
     let data = fs::read(path).map_err(|err| format!("resume read failed: {err}"))?;
-    let value = bencode::parse(&data).map_err(|err| err.to_string())?;
+    parse_resume_data(&data)
+}
+
+fn parse_resume_data(data: &[u8]) -> Result<ResumeData, String> {
+    let value = bencode::parse(data).map_err(|err| err.to_string())?;
     let dict = match value {
         Value::Dict(items) => items,
         _ => return Err("resume format invalid".to_string()),
@@ -4111,6 +4345,37 @@ fn load_resume_data(path: &Path) -> Result<ResumeData, String> {
     })
 }
 
+fn load_resume_data_with_recovery(path: &Path) -> Option<ResumeData> {
+    if path.exists() {
+        match load_resume_data(path) {
+            Ok(resume) => return Some(resume),
+            Err(err) => {
+                log_warn!("resume load failed: {err}");
+            }
+        }
+    }
+
+    let backup_path = sidecar_path(path, ".bak");
+    let backup_data = match fs::read(&backup_path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            log_warn!("resume backup read failed: {err}");
+            return None;
+        }
+    };
+    let resume = match parse_resume_data(&backup_data) {
+        Ok(resume) => resume,
+        Err(err) => {
+            log_warn!("resume backup invalid: {err}");
+            return None;
+        }
+    };
+    let _ = write_atomic_file(path, &backup_data, "resume restore", false);
+    log_warn!("resume load recovered from backup");
+    Some(resume)
+}
+
 fn save_resume_snapshot(
     path: &Path,
     info_hash: [u8; 20],
@@ -4181,13 +4446,7 @@ fn save_resume_data(
         .collect();
     dict.push((b"peers".to_vec(), Value::List(peers_list)));
     let data = bencode::encode(&Value::Dict(dict));
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("resume dir failed: {err}"))?;
-    }
-    let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, &data).map_err(|err| format!("resume write failed: {err}"))?;
-    fs::rename(&tmp_path, path).map_err(|err| format!("resume rename failed: {err}"))?;
-    Ok(())
+    write_atomic_file(path, &data, "resume", true)
 }
 
 fn collect_file_stats(spans: &[FileSpan], download_dir: &Path) -> Vec<ResumeFileStat> {
@@ -4242,6 +4501,10 @@ struct Args {
     sequential: bool,
     move_completed: Option<PathBuf>,
     watch_dir: Option<PathBuf>,
+    log_path: Option<PathBuf>,
+    daemon: bool,
+    pid_file: Option<PathBuf>,
+    seed_ratio: f64,
 }
 
 #[derive(Default)]
@@ -4304,6 +4567,10 @@ fn parse_args() -> Result<Args, String> {
     let mut sequential = false;
     let mut move_completed: Option<PathBuf> = None;
     let mut watch_dir: Option<PathBuf> = None;
+    let mut log_path: Option<PathBuf> = None;
+    let mut daemon = false;
+    let mut pid_file: Option<PathBuf> = None;
+    let mut seed_ratio = 0.0f64;
 
     if let Some(cfg) = config_overrides.as_ref() {
         apply_overrides(
@@ -4540,6 +4807,40 @@ fn parse_args() -> Result<Args, String> {
             idx += 1;
             continue;
         }
+        if arg == "--log" {
+            let value = args_list
+                .get(idx + 1)
+                .ok_or_else(|| "missing value for --log".to_string())?;
+            log_path = Some(PathBuf::from(value));
+            idx += 2;
+            continue;
+        }
+        if arg == "--daemon" {
+            daemon = true;
+            idx += 1;
+            continue;
+        }
+        if arg == "--pid-file" {
+            let value = args_list
+                .get(idx + 1)
+                .ok_or_else(|| "missing value for --pid-file".to_string())?;
+            pid_file = Some(PathBuf::from(value));
+            idx += 2;
+            continue;
+        }
+        if arg == "--seed-ratio" {
+            let value = args_list
+                .get(idx + 1)
+                .ok_or_else(|| "missing value for --seed-ratio".to_string())?;
+            seed_ratio = value
+                .parse::<f64>()
+                .map_err(|_| "invalid value for --seed-ratio".to_string())?;
+            if seed_ratio < 0.0 {
+                return Err("seed ratio must be >= 0".to_string());
+            }
+            idx += 2;
+            continue;
+        }
         if arg == "--create" {
             let source = args_list
                 .get(idx + 1)
@@ -4617,9 +4918,16 @@ fn parse_args() -> Result<Args, String> {
         return Err("retry interval must be > 0".to_string());
     }
 
+    if daemon {
+        ui = true;
+        if log_path.is_none() {
+            log_path = Some(download_dir.join("rustorrent.log"));
+        }
+    }
+
     if torrent_path.is_none() && magnet.is_none() && !ui && watch_dir.is_none() {
         return Err(
-            "usage: rustorrent [path.torrent] [--magnet <link>] [--config <path>] [--download-dir <dir>] [--preallocate] [--sequential] [--move-completed <dir>] [--watch <dir>] [--ui] [--ui-addr <addr>] [--retry-interval <secs>] [--numwant <n>] [--port <port>] [--encryption <disable|prefer|require>] [--no-encryption] [--utp|--no-utp] [--blocklist <path>] [--max-active <n>] [--max-peers <n>] [--max-peers-torrent <n>] [--download-rate <bps>] [--upload-rate <bps>] [--torrent-download-rate <bps>] [--torrent-upload-rate <bps>] [--write-cache <bytes>] [--create <path> --tracker <url> --output <file>]".to_string(),
+            "usage: rustorrent [path.torrent] [--magnet <link>] [--config <path>] [--download-dir <dir>] [--preallocate] [--sequential] [--move-completed <dir>] [--watch <dir>] [--ui] [--ui-addr <addr>] [--retry-interval <secs>] [--numwant <n>] [--port <port>] [--encryption <disable|prefer|require>] [--no-encryption] [--utp|--no-utp] [--blocklist <path>] [--max-active <n>] [--max-peers <n>] [--max-peers-torrent <n>] [--download-rate <bps>] [--upload-rate <bps>] [--torrent-download-rate <bps>] [--torrent-upload-rate <bps>] [--write-cache <bytes>] [--log <path>] [--daemon] [--pid-file <path>] [--seed-ratio <ratio>] [--create <path> --tracker <url> --output <file>]".to_string(),
         );
     }
     if max_peers_torrent == 0 {
@@ -4650,6 +4958,10 @@ fn parse_args() -> Result<Args, String> {
         sequential,
         move_completed,
         watch_dir,
+        log_path,
+        daemon,
+        pid_file,
+        seed_ratio,
     })
 }
 
@@ -5071,6 +5383,7 @@ fn download_from_peer_concurrent(
     let mut pipeline_depth = PIPELINE_DEPTH;
     let mut rtt_ema_ms: Option<f64> = None;
     let mut choke_since: Option<Instant> = None;
+    let mut last_piece_data = Instant::now();
     let mut completed_cursor = {
         let log = completed_log.lock().unwrap();
         log.len()
@@ -5116,6 +5429,13 @@ fn download_from_peer_concurrent(
                         choke_since = None;
                     }
                 }
+            }
+
+            // Snub detection: disconnect peer if no data for 60s while unchoked
+            if !choked && !seed_mode && active_piece.is_some()
+                && last_piece_data.elapsed() > SNUB_TIMEOUT
+            {
+                return Err("peer snubbed (no data for 60s while unchoked)".to_string());
             }
 
             // Check completion with lock
@@ -5429,6 +5749,7 @@ fn download_from_peer_concurrent(
                         peer::Message::Unchoke => {
                             choked = false;
                             choke_since = None;
+                            last_piece_data = Instant::now();
                             log_debug!("unchoked by {addr}");
                         }
                         peer::Message::Request {
@@ -5454,6 +5775,7 @@ fn download_from_peer_concurrent(
                                     log_debug!("upload request rejected: {err}");
                                 } else {
                                     last_sent = Instant::now();
+                                    check_seed_ratio(uploaded, downloaded, stop_flag);
                                 }
                             }
                         }
@@ -5462,6 +5784,7 @@ fn download_from_peer_concurrent(
                             begin,
                             block,
                         } => {
+                            last_piece_data = Instant::now();
                             if let Some(active) = active_piece.as_mut() {
                                 if active.index() != index {
                                     continue;
@@ -5876,6 +6199,57 @@ fn find_context_by_id(registry: &SessionRegistry, torrent_id: u64) -> Option<Arc
     guard.values().find(|ctx| ctx.id == torrent_id).cloned()
 }
 
+fn recheck_torrent(
+    registry: &SessionRegistry,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    torrent_id: u64,
+) -> Result<(), String> {
+    let context = find_context_by_id(registry, torrent_id)
+        .ok_or_else(|| "torrent not found".to_string())?;
+    let pieces_arc = Arc::clone(&context.pieces);
+    let storage_arc = Arc::clone(&context.storage);
+    let base_piece_length = context.base_piece_length;
+    let ui_clone = ui_state.clone();
+    update_ui(ui_state, |state| {
+        state.status = "checking".to_string();
+        update_torrent_entry(state, torrent_id, |torrent| {
+            torrent.status = "checking".to_string();
+        });
+    });
+    thread::spawn(move || {
+        {
+            let mut p = pieces_arc.lock().unwrap();
+            p.reset_verified();
+        }
+        {
+            let mut p = pieces_arc.lock().unwrap();
+            let mut s = storage_arc.lock().unwrap();
+            let _ = full_recheck(&mut p, &mut s, base_piece_length);
+        }
+        let (completed, total, completed_bytes) = {
+            let p = pieces_arc.lock().unwrap();
+            (p.completed_pieces(), p.piece_count(), p.completed_bytes())
+        };
+        let status = if completed == total {
+            "seeding"
+        } else {
+            "downloading"
+        };
+        update_ui(&ui_clone, |state| {
+            state.status = status.to_string();
+            state.completed_pieces = completed;
+            state.completed_bytes = completed_bytes;
+            update_torrent_entry(state, torrent_id, |torrent| {
+                torrent.status = status.to_string();
+                torrent.completed_pieces = completed;
+                torrent.completed_bytes = completed_bytes;
+            });
+        });
+        log_info!("recheck complete: {completed}/{total} pieces valid");
+    });
+    Ok(())
+}
+
 #[cfg(feature = "verbose")]
 fn message_summary(message: &peer::Message) -> String {
     match message {
@@ -6075,11 +6449,16 @@ fn start_utp_listener(
             break;
         }
         if let Some(stream) = listener.try_accept() {
-            let registry = Arc::clone(&registry);
-            let inbound = inbound.clone();
-            thread::spawn(move || {
-                handle_incoming_peer(PeerStream::utp(stream), registry, inbound);
-            });
+            if let Some(slot_guard) = inbound.try_acquire_handler_slot() {
+                let registry = Arc::clone(&registry);
+                let inbound = inbound.clone();
+                thread::spawn(move || {
+                    let _slot_guard = slot_guard;
+                    handle_incoming_peer(PeerStream::utp(stream), registry, inbound);
+                });
+            } else {
+                log_debug!("dropping inbound uTP peer: handler capacity reached");
+            }
         } else {
             sleep_with_shutdown(Duration::from_millis(20));
         }
@@ -6102,11 +6481,16 @@ fn start_inbound_listener(port: u16, registry: SessionRegistry, inbound: Inbound
             }
             match stream {
                 Ok(stream) => {
-                    let registry = Arc::clone(&registry);
-                    let inbound = inbound.clone();
-                    thread::spawn(move || {
-                        handle_incoming_peer(PeerStream::tcp(stream), registry, inbound);
-                    });
+                    if let Some(slot_guard) = inbound.try_acquire_handler_slot() {
+                        let registry = Arc::clone(&registry);
+                        let inbound = inbound.clone();
+                        thread::spawn(move || {
+                            let _slot_guard = slot_guard;
+                            handle_incoming_peer(PeerStream::tcp(stream), registry, inbound);
+                        });
+                    } else {
+                        log_debug!("dropping inbound TCP peer: handler capacity reached");
+                    }
                 }
                 Err(err) => {
                     log_warn!("inbound accept failed: {err}");
@@ -6257,6 +6641,7 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
                                 log_debug!("inbound upload rejected: {err}");
                             } else {
                                 last_sent = Instant::now();
+                                check_seed_ratio(&context.uploaded, &context.downloaded, &context.stop_requested);
                             }
                         }
                     }
@@ -6332,6 +6717,24 @@ fn handle_upload_request<W: Write>(
     SESSION_UPLOADED_BYTES.fetch_add(length as u64, Ordering::SeqCst);
     upload_manager.record_upload(peer_tag, length as u64);
     Ok(())
+}
+
+fn check_seed_ratio(
+    uploaded: &Arc<AtomicU64>,
+    downloaded: &Arc<AtomicU64>,
+    stop_flag: &Arc<AtomicBool>,
+) {
+    let ratio_bits = SEED_RATIO_BITS.load(Ordering::SeqCst);
+    if ratio_bits == 0 {
+        return;
+    }
+    let ratio = f64::from_bits(ratio_bits);
+    let up = uploaded.load(Ordering::SeqCst) as f64;
+    let down = downloaded.load(Ordering::SeqCst).max(1) as f64;
+    if up / down >= ratio {
+        stop_flag.store(true, Ordering::SeqCst);
+        log_info!("seed ratio {:.2} reached, stopping torrent", ratio);
+    }
 }
 
 fn cancel_pending<W: Write>(stream: &mut W, pending: &[PendingRequest]) -> Result<(), String> {
@@ -6596,6 +6999,664 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
         );
         assert_eq!(meta.url_list, vec![b"http://seed.example/file".to_vec()]);
         assert_eq!(meta.info.total_length(), 5);
+    }
+}
+
+#[cfg(test)]
+mod core_helpers_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("rustorrent-main-test-{label}-{nanos}"))
+    }
+
+    fn tracker_meta(private: bool) -> torrent::TorrentMeta {
+        torrent::TorrentMeta {
+            announce: Some(b"http://tracker.local/announce".to_vec()),
+            announce_list: vec![
+                b"http://tracker.local/announce".to_vec(),
+                b"udp://tracker.local:6969/announce".to_vec(),
+            ],
+            url_list: Vec::new(),
+            httpseeds: Vec::new(),
+            info_hash: [1u8; 20],
+            info: torrent::InfoDict {
+                name: b"t".to_vec(),
+                piece_length: 16,
+                pieces: vec![[0u8; 20]],
+                length: Some(16),
+                files: Vec::new(),
+                private,
+            },
+        }
+    }
+
+    #[test]
+    fn parse_rate_and_encryption_mode_cover_common_variants() {
+        assert_eq!(parse_rate("0").unwrap(), 0);
+        assert_eq!(parse_rate("10k").unwrap(), 10 * 1024);
+        assert_eq!(parse_rate("2M").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_rate("3g").unwrap(), 3 * 1024 * 1024 * 1024);
+        assert_eq!(parse_rate(" unlimited ").unwrap(), 0);
+        assert!(parse_rate("1x").is_err());
+        assert!(parse_rate("").is_err());
+
+        assert_eq!(
+            parse_encryption_mode("disable").unwrap(),
+            EncryptionMode::Disable
+        );
+        assert_eq!(
+            parse_encryption_mode("prefer").unwrap(),
+            EncryptionMode::Prefer
+        );
+        assert_eq!(
+            parse_encryption_mode("force").unwrap(),
+            EncryptionMode::Require
+        );
+        assert!(parse_encryption_mode("unknown").is_err());
+    }
+
+    #[test]
+    fn parse_bool_value_handles_truthy_and_falsy_inputs() {
+        assert_eq!(parse_bool_value("true"), Some(true));
+        assert_eq!(parse_bool_value("YES"), Some(true));
+        assert_eq!(parse_bool_value("off"), Some(false));
+        assert_eq!(parse_bool_value("0"), Some(false));
+        assert_eq!(parse_bool_value("maybe"), None);
+    }
+
+    #[test]
+    fn collect_trackers_deduplicates_and_respects_private_flag() {
+        let private_meta = tracker_meta(true);
+        let private_trackers = collect_trackers(&private_meta);
+        assert_eq!(private_trackers.http, vec!["http://tracker.local/announce"]);
+        assert_eq!(
+            private_trackers.udp,
+            vec!["udp://tracker.local:6969/announce"]
+        );
+
+        let public_meta = tracker_meta(false);
+        let public_trackers = collect_trackers(&public_meta);
+        assert!(public_trackers
+            .http
+            .contains(&"http://tracker.local/announce".to_string()));
+        assert!(public_trackers
+            .udp
+            .contains(&"udp://tracker.local:6969/announce".to_string()));
+        assert!(public_trackers
+            .http
+            .contains(&"http://tracker.opentrackr.org:1337/announce".to_string()));
+    }
+
+    #[test]
+    fn pex_payload_roundtrip_includes_v4_and_v6() {
+        let peers = vec![
+            "127.0.0.1:6881".parse().unwrap(),
+            "[2001:db8::1]:51413".parse().unwrap(),
+        ];
+        let payload = build_ut_pex_payload(&peers);
+        let parsed = parse_ut_pex(&payload).unwrap();
+        assert_eq!(parsed, peers);
+    }
+
+    #[test]
+    fn bitfield_helpers_set_bits_and_validate_bounds() {
+        let mut bits = [0u8; 1];
+        set_bit(&mut bits, 0).unwrap();
+        set_bit(&mut bits, 7).unwrap();
+        assert_eq!(bits[0], 0b1000_0001);
+        assert!(set_bit(&mut bits, 8).is_err());
+    }
+
+    #[test]
+    fn delete_torrent_data_removes_only_safe_relative_paths() {
+        let root = temp_path("delete-root");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let inside = root.join("sub").join("file.bin");
+        fs::write(&inside, b"x").unwrap();
+
+        let parent = root.parent().unwrap().to_path_buf();
+        let outside = parent.join("outside-keep.bin");
+        fs::write(&outside, b"y").unwrap();
+
+        delete_torrent_data(
+            Some(&root),
+            &[
+                "sub/file.bin".to_string(),
+                "../outside-keep.bin".to_string(),
+                "/absolute/path.bin".to_string(),
+            ],
+        );
+
+        assert!(!inside.exists());
+        assert!(outside.exists());
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resume_data_roundtrip_preserves_fields() {
+        let path = temp_path("resume").join("state.resume");
+        let info_hash = [2u8; 20];
+        let bitfield = vec![0b1010_0000];
+        let priorities = vec![0, 2, 3];
+        let files = vec![
+            ResumeFileStat {
+                length: 10,
+                mtime: 100,
+            },
+            ResumeFileStat {
+                length: 20,
+                mtime: 200,
+            },
+        ];
+        let peers = vec!["127.0.0.1:6881".parse().unwrap()];
+
+        save_resume_data(
+            &path,
+            info_hash,
+            16384,
+            bitfield.clone(),
+            &priorities,
+            files,
+            1234,
+            5678,
+            peers.clone(),
+        )
+        .unwrap();
+        let loaded = load_resume_data(&path).unwrap();
+        assert_eq!(loaded.info_hash, info_hash);
+        assert_eq!(loaded.piece_length, 16384);
+        assert_eq!(loaded.bitfield, bitfield);
+        assert_eq!(loaded.file_priorities, priorities);
+        assert_eq!(loaded.downloaded, 1234);
+        assert_eq!(loaded.uploaded, 5678);
+        assert_eq!(loaded.peers, peers);
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn resume_load_recovers_from_backup_when_primary_is_corrupt() {
+        let path = temp_path("resume-recover").join("state.resume");
+        let info_hash = [4u8; 20];
+        save_resume_data(
+            &path,
+            info_hash,
+            16384,
+            vec![0b1000_0000],
+            &[1, 2],
+            vec![ResumeFileStat {
+                length: 8,
+                mtime: 9,
+            }],
+            100,
+            50,
+            vec!["127.0.0.1:6881".parse().unwrap()],
+        )
+        .unwrap();
+        let backup_path = sidecar_path(&path, ".bak");
+        fs::copy(&path, &backup_path).unwrap();
+        fs::write(&path, b"corrupt").unwrap();
+
+        let loaded = load_resume_data_with_recovery(&path).expect("expected backup recovery");
+        assert_eq!(loaded.info_hash, info_hash);
+        let restored = load_resume_data(&path).expect("restored primary should parse");
+        assert_eq!(restored.info_hash, info_hash);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&backup_path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn session_save_writes_bencode_file() {
+        let path = temp_path("session").join("session.benc");
+        let mut entries = HashMap::new();
+        entries.insert(
+            [3u8; 20],
+            SessionEntry {
+                info_hash: [3u8; 20],
+                name: "demo".to_string(),
+                torrent_bytes: b"torrent-data".to_vec(),
+                download_dir: PathBuf::from("/tmp/downloads"),
+                preallocate: true,
+            },
+        );
+        save_session(&path, &entries).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let value = bencode::parse(&bytes).unwrap();
+        match value {
+            Value::List(items) => assert_eq!(items.len(), 1),
+            _ => panic!("expected list"),
+        }
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn session_load_recovers_from_backup_when_primary_is_corrupt() {
+        let root = temp_path("session-recover");
+        let path = session_path(&root);
+        let mut entries = HashMap::new();
+        let info_hash = [5u8; 20];
+        entries.insert(
+            info_hash,
+            SessionEntry {
+                info_hash,
+                name: "demo".to_string(),
+                torrent_bytes: b"torrent-data".to_vec(),
+                download_dir: root.clone(),
+                preallocate: false,
+            },
+        );
+        save_session(&path, &entries).unwrap();
+        let backup_path = sidecar_path(&path, ".bak");
+        fs::copy(&path, &backup_path).unwrap();
+        fs::write(&path, b"corrupt").unwrap();
+
+        let store = SessionStore::load(&root);
+        assert!(store.contains(info_hash));
+        let loaded_bytes = fs::read(&path).unwrap();
+        assert!(bencode::parse(&loaded_bytes).is_ok());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inbound_handler_slots_enforce_capacity() {
+        assert_eq!(inbound_handler_slots(0), 0);
+        assert_eq!(inbound_handler_slots(1), MIN_INBOUND_HANDLER_SLOTS);
+        assert_eq!(inbound_handler_slots(600), MAX_INBOUND_HANDLER_SLOTS);
+
+        let inbound = InboundConfig {
+            encryption: EncryptionMode::Disable,
+            ip_filter: None,
+            max_handlers: 2,
+            active_handlers: Arc::new(AtomicUsize::new(0)),
+        };
+        let guard_a = inbound.try_acquire_handler_slot().unwrap();
+        let guard_b = inbound.try_acquire_handler_slot().unwrap();
+        assert!(inbound.try_acquire_handler_slot().is_none());
+        drop(guard_a);
+        assert!(inbound.try_acquire_handler_slot().is_some());
+        drop(guard_b);
+    }
+
+    #[test]
+    fn path_helpers_place_state_under_rustorrent_dir() {
+        let root = Path::new("/tmp/downloads");
+        let info_hash = [0xABu8; 20];
+        let resume = resume_path(root, info_hash);
+        let session = session_path(root);
+        assert!(resume.to_string_lossy().contains(".rustorrent"));
+        assert!(resume.to_string_lossy().ends_with(".resume"));
+        assert!(session
+            .to_string_lossy()
+            .ends_with(".rustorrent/session.benc"));
+    }
+
+    #[test]
+    fn apply_overrides_updates_selected_fields() {
+        let cfg = ConfigOverrides {
+            download_dir: Some(PathBuf::from("/tmp/alt")),
+            preallocate: Some(true),
+            ui: Some(true),
+            ui_addr: Some("127.0.0.1:9090".to_string()),
+            retry_interval: Some(30),
+            numwant: Some(80),
+            port: Some(7000),
+            enable_utp: Some(false),
+            encryption: Some(EncryptionMode::Require),
+            blocklist_path: Some(PathBuf::from("/tmp/blocklist.txt")),
+            max_peers_global: Some(111),
+            max_peers_torrent: Some(22),
+            max_active_torrents: Some(3),
+            download_rate: Some(10),
+            upload_rate: Some(20),
+            torrent_download_rate: Some(30),
+            torrent_upload_rate: Some(40),
+            write_cache_bytes: Some(50),
+        };
+
+        let mut download_dir = PathBuf::from(".");
+        let mut preallocate = false;
+        let mut ui = false;
+        let mut ui_addr = "127.0.0.1:8080".to_string();
+        let mut retry_interval = 60;
+        let mut numwant = 200;
+        let mut port = 6881;
+        let mut enable_utp = true;
+        let mut encryption = EncryptionMode::Prefer;
+        let mut blocklist_path = None;
+        let mut max_peers_global = 200;
+        let mut max_peers_torrent = 30;
+        let mut max_active_torrents = 4;
+        let mut download_rate = 0;
+        let mut upload_rate = 0;
+        let mut torrent_download_rate = 0;
+        let mut torrent_upload_rate = 0;
+        let mut write_cache_bytes = 0;
+        apply_overrides(
+            &cfg,
+            &mut download_dir,
+            &mut preallocate,
+            &mut ui,
+            &mut ui_addr,
+            &mut retry_interval,
+            &mut numwant,
+            &mut port,
+            &mut enable_utp,
+            &mut encryption,
+            &mut blocklist_path,
+            &mut max_peers_global,
+            &mut max_peers_torrent,
+            &mut max_active_torrents,
+            &mut download_rate,
+            &mut upload_rate,
+            &mut torrent_download_rate,
+            &mut torrent_upload_rate,
+            &mut write_cache_bytes,
+        );
+
+        assert_eq!(download_dir, PathBuf::from("/tmp/alt"));
+        assert!(preallocate);
+        assert!(ui);
+        assert_eq!(ui_addr, "127.0.0.1:9090");
+        assert_eq!(retry_interval, 30);
+        assert_eq!(numwant, 80);
+        assert_eq!(port, 7000);
+        assert!(!enable_utp);
+        assert_eq!(encryption, EncryptionMode::Require);
+        assert_eq!(blocklist_path, Some(PathBuf::from("/tmp/blocklist.txt")));
+        assert_eq!(max_peers_global, 111);
+        assert_eq!(max_peers_torrent, 22);
+        assert_eq!(max_active_torrents, 3);
+        assert_eq!(download_rate, 10);
+        assert_eq!(upload_rate, 20);
+        assert_eq!(torrent_download_rate, 30);
+        assert_eq!(torrent_upload_rate, 40);
+        assert_eq!(write_cache_bytes, 50);
+    }
+
+    #[test]
+    fn load_config_overrides_parses_and_rejects_unknown_keys() {
+        let path = temp_path("config-ok");
+        fs::write(
+            &path,
+            "\
+download_dir=/tmp/dl
+preallocate=yes
+ui=true
+port=7001
+encryption=require
+download_rate=2M
+write_cache=64k
+",
+        )
+        .unwrap();
+        let cfg = load_config_overrides(&path).unwrap();
+        assert_eq!(cfg.download_dir, Some(PathBuf::from("/tmp/dl")));
+        assert_eq!(cfg.preallocate, Some(true));
+        assert_eq!(cfg.ui, Some(true));
+        assert_eq!(cfg.port, Some(7001));
+        assert_eq!(cfg.encryption, Some(EncryptionMode::Require));
+        assert_eq!(cfg.download_rate, Some(2 * 1024 * 1024));
+        assert_eq!(cfg.write_cache_bytes, Some(64 * 1024));
+        let _ = fs::remove_file(&path);
+
+        let bad_path = temp_path("config-bad");
+        fs::write(&bad_path, "unknown_key=value\n").unwrap();
+        let err = match load_config_overrides(&bad_path) {
+            Ok(_) => panic!("expected unknown key error"),
+            Err(err) => err,
+        };
+        assert!(err.contains("unknown key"));
+        let _ = fs::remove_file(&bad_path);
+    }
+
+    #[cfg(feature = "webseed")]
+    #[test]
+    fn webseed_url_builder_encodes_paths_for_multi_file_mode() {
+        assert_eq!(
+            build_webseed_url("https://seed.example/base", "ignored", false),
+            "https://seed.example/base"
+        );
+        assert_eq!(
+            build_webseed_url("https://seed.example/base/", "dir/file name#.bin", true),
+            "https://seed.example/base/dir/file%20name%23.bin"
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_harness_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, UdpSocket};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    fn free_udp_port() -> u16 {
+        UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn compact_peer(addr: SocketAddr) -> Vec<u8> {
+        match addr {
+            SocketAddr::V4(v4) => {
+                let mut out = Vec::with_capacity(6);
+                out.extend_from_slice(&v4.ip().octets());
+                out.extend_from_slice(&v4.port().to_be_bytes());
+                out
+            }
+            SocketAddr::V6(_) => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn local_http_tracker_fixture_serves_announce() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer_addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let body = bencode::encode(&Value::Dict(vec![
+            (b"interval".to_vec(), Value::Int(60)),
+            (b"peers".to_vec(), Value::Bytes(compact_peer(peer_addr))),
+        ]));
+        let body_for_server = body.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut req = [0u8; 2048];
+            let n = stream.read(&mut req).unwrap();
+            let request = String::from_utf8_lossy(&req[..n]);
+            assert!(request.starts_with("GET /announce?"));
+            assert!(request.contains("info_hash="));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body_for_server.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body_for_server).unwrap();
+        });
+
+        let url = format!("http://127.0.0.1:{}/announce", addr.port());
+        let response = tracker::announce(
+            &url,
+            [1u8; 20],
+            [2u8; 20],
+            6881,
+            0,
+            0,
+            1,
+            Some("started"),
+            5,
+        )
+        .unwrap();
+        assert_eq!(response.interval, 60);
+        assert_eq!(response.peers, vec![peer_addr]);
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "udp_tracker")]
+    #[test]
+    fn local_udp_tracker_fixture_serves_announce() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let peer_addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let server = thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let (n, src) = socket.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 16);
+            let tx = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+            let mut connect_resp = [0u8; 16];
+            connect_resp[0..4].copy_from_slice(&0u32.to_be_bytes());
+            connect_resp[4..8].copy_from_slice(&tx.to_be_bytes());
+            connect_resp[8..16].copy_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+            socket.send_to(&connect_resp, src).unwrap();
+
+            let (n2, src2) = socket.recv_from(&mut buf).unwrap();
+            assert!(n2 >= 98);
+            let tx2 = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+            let mut resp = Vec::new();
+            resp.extend_from_slice(&1u32.to_be_bytes()); // announce action
+            resp.extend_from_slice(&tx2.to_be_bytes());
+            resp.extend_from_slice(&30u32.to_be_bytes()); // interval
+            resp.extend_from_slice(&0u32.to_be_bytes()); // leechers
+            resp.extend_from_slice(&1u32.to_be_bytes()); // seeders
+            resp.extend_from_slice(&compact_peer(peer_addr));
+            socket.send_to(&resp, src2).unwrap();
+        });
+
+        let url = format!("udp://127.0.0.1:{port}/announce");
+        let response = udp_tracker::announce(
+            &url,
+            [3u8; 20],
+            [4u8; 20],
+            6881,
+            0,
+            0,
+            1,
+            Some("started"),
+            10,
+        )
+        .unwrap();
+        assert_eq!(response.interval, 30);
+        assert_eq!(response.peers, vec![peer_addr]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn local_peer_fixture_completes_plaintext_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let info_hash = [9u8; 20];
+        let local_peer_id = [7u8; 20];
+        let remote_peer_id = [8u8; 20];
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut peer_stream = PeerStream::tcp(stream);
+            let request = peer::read_handshake(&mut peer_stream).unwrap();
+            assert_eq!(request.info_hash, info_hash);
+            assert!(request.supports_extensions());
+            peer::write_handshake(&mut peer_stream, info_hash, remote_peer_id, true).unwrap();
+        });
+
+        let cfg = ConnectionConfig {
+            encryption: EncryptionMode::Disable,
+            utp: None,
+            ip_filter: None,
+        };
+        let mut stream = connect_peer_for_metadata(addr, &cfg).unwrap();
+        let handshake = plaintext_handshake(&mut stream, info_hash, local_peer_id).unwrap();
+        assert_eq!(handshake.peer_id, remote_peer_id);
+        assert_eq!(handshake.info_hash, info_hash);
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "dht")]
+    #[test]
+    fn local_dht_fixture_node_returns_peers() {
+        let dht_port = free_udp_port();
+        let fixture = UdpSocket::bind("127.0.0.1:0").unwrap();
+        fixture
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let fixture_addr = fixture.local_addr().unwrap();
+
+        let cache_path = PathBuf::from(".rustorrent").join("dht_nodes.dat");
+        let backup = fs::read(&cache_path).ok();
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&[0x22u8; 20]);
+        entry.extend_from_slice(&[127, 0, 0, 1]);
+        entry.extend_from_slice(&fixture_addr.port().to_be_bytes());
+        if let Some(parent) = cache_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(&cache_path, entry).unwrap();
+
+        let fixture_thread = thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let (n, src) = fixture.recv_from(&mut buf).unwrap();
+            let parsed = bencode::parse(&buf[..n]).unwrap();
+            let Value::Dict(dict) = parsed else {
+                panic!("expected dict");
+            };
+            let tx = match dict_get(&dict, b"t") {
+                Some(Value::Bytes(tx)) => tx.clone(),
+                _ => panic!("missing tx id"),
+            };
+            let peer = compact_peer("127.0.0.1:6881".parse().unwrap());
+            let response = bencode::encode(&Value::Dict(vec![
+                (b"t".to_vec(), Value::Bytes(tx)),
+                (b"y".to_vec(), Value::Bytes(b"r".to_vec())),
+                (
+                    b"r".to_vec(),
+                    Value::Dict(vec![
+                        (b"id".to_vec(), Value::Bytes(vec![0x33u8; 20])),
+                        (b"values".to_vec(), Value::List(vec![Value::Bytes(peer)])),
+                    ]),
+                ),
+            ]));
+            fixture.send_to(&response, src).unwrap();
+        });
+
+        let dht = dht::start(dht_port);
+        thread::sleep(Duration::from_millis(300));
+        let (tx, rx) = mpsc::channel();
+        let info_hash = [1u8; 20];
+        dht.add_torrent(info_hash, 6881, tx);
+        let peers = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(peers.contains(&"127.0.0.1:6881".parse().unwrap()));
+        dht.remove_torrent(info_hash);
+        fixture_thread.join().unwrap();
+        match backup {
+            Some(data) => {
+                let _ = fs::write(&cache_path, data);
+            }
+            None => {
+                let _ = fs::remove_file(&cache_path);
+            }
+        }
     }
 }
 

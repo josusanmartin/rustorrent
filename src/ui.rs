@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -49,6 +50,14 @@ pub enum UiCommand {
     SetRateLimits {
         download_limit_bps: u64,
         upload_limit_bps: u64,
+        reply: mpsc::Sender<UiCommandResult>,
+    },
+    RecheckTorrent {
+        torrent_id: u64,
+        reply: mpsc::Sender<UiCommandResult>,
+    },
+    SetSeedRatio {
+        ratio: f64,
         reply: mpsc::Sender<UiCommandResult>,
     },
 }
@@ -103,6 +112,7 @@ pub struct UiState {
     pub session_uploaded_bytes: u64,
     pub global_download_limit_bps: u64,
     pub global_upload_limit_bps: u64,
+    pub seed_ratio: f64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -177,18 +187,51 @@ fn hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
+struct UiConnectionGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for UiConnectionGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn try_acquire_ui_connection_slot(active: &Arc<AtomicUsize>) -> Option<UiConnectionGuard> {
+    loop {
+        let current = active.load(Ordering::SeqCst);
+        if current >= UI_MAX_ACTIVE_CONNECTIONS {
+            return None;
+        }
+        if active
+            .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Some(UiConnectionGuard {
+                active: Arc::clone(active),
+            });
+        }
+    }
+}
+
 pub fn start(
     addr: String,
     state: Arc<Mutex<UiState>>,
     cmd_tx: Option<mpsc::Sender<UiCommand>>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(&addr)?;
+    let active_connections = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         for stream in listener.incoming() {
             if let Ok(stream) = stream {
+                let Some(slot_guard) = try_acquire_ui_connection_slot(&active_connections) else {
+                    let _ = send_api_error_with_status(stream, 503, "ui busy");
+                    continue;
+                };
                 let state = state.clone();
                 let cmd_tx = cmd_tx.clone();
                 thread::spawn(move || {
+                    let _slot_guard = slot_guard;
                     let _ = handle_connection(stream, state, cmd_tx);
                 });
             }
@@ -202,6 +245,8 @@ fn handle_connection(
     state: Arc<Mutex<UiState>>,
     cmd_tx: Option<mpsc::Sender<UiCommand>>,
 ) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(UI_READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(UI_WRITE_TIMEOUT))?;
     let request = match read_request(&mut stream) {
         Ok(request) => request,
         Err(_) => {
@@ -285,6 +330,20 @@ fn handle_connection(
             }
             return send_api_ok(stream);
         }
+        if path == "/torrent/recheck" {
+            if let Err(err) = handle_torrent_recheck(&query, &cmd_tx) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
+        if path == "/settings/seed-ratio" {
+            if let Err(err) = handle_set_seed_ratio(&request, &cmd_tx) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
         return send_api_error_with_status(stream, 404, "unknown endpoint");
     }
 
@@ -308,6 +367,11 @@ fn handle_connection(
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const COMMAND_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const UI_MAX_ACTIVE_CONNECTIONS: usize = 64;
+const UI_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const UI_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(3);
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct HttpRequest {
     method: String,
@@ -329,9 +393,20 @@ impl HttpRequest {
 fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
     let mut buffer = Vec::with_capacity(1024);
     let mut header_end = None;
+    let header_deadline = Instant::now() + REQUEST_HEADER_TIMEOUT;
     loop {
+        if Instant::now() >= header_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request header timeout",
+            ));
+        }
         let mut chunk = [0u8; 1024];
-        let n = stream.read(&mut chunk)?;
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            Err(err) if is_retryable_io_error(&err) => continue,
+            Err(err) => return Err(err),
+        };
         if n == 0 {
             break;
         }
@@ -356,8 +431,20 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
         .next()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid request"))?;
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("/").to_string();
+    let method = parts
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid method"))?
+        .to_string();
+    let path = parts
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid path"))?
+        .to_string();
+    if !path.starts_with('/') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid path",
+        ));
+    }
 
     let mut content_length = 0usize;
     let mut headers = Vec::new();
@@ -367,7 +454,9 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
             let header_value = value.trim().to_string();
             headers.push((header_name.clone(), header_value.clone()));
             if name.trim().eq_ignore_ascii_case("content-length") {
-                content_length = header_value.parse::<usize>().unwrap_or(0);
+                content_length = header_value.parse::<usize>().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid content length")
+                })?;
             }
         }
     }
@@ -379,9 +468,20 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
     }
 
     let mut body = buffer[header_end + 4..].to_vec();
+    let body_deadline = Instant::now() + REQUEST_BODY_TIMEOUT;
     while body.len() < content_length {
+        if Instant::now() >= body_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request body timeout",
+            ));
+        }
         let mut chunk = [0u8; 1024];
-        let n = stream.read(&mut chunk)?;
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            Err(err) if is_retryable_io_error(&err) => continue,
+            Err(err) => return Err(err),
+        };
         if n == 0 {
             break;
         }
@@ -391,6 +491,12 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
             break;
         }
     }
+    if body.len() < content_length {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "request body truncated",
+        ));
+    }
 
     Ok(HttpRequest {
         method,
@@ -398,6 +504,13 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
         headers,
         body,
     })
+}
+
+fn is_retryable_io_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 fn find_header_end(data: &[u8]) -> Option<usize> {
@@ -580,6 +693,32 @@ fn handle_rate_limits(
     guard.global_download_limit_bps = download_limit_bps;
     guard.global_upload_limit_bps = upload_limit_bps;
     Ok(())
+}
+
+fn handle_torrent_recheck(
+    query: &[(String, String)],
+    cmd_tx: &Option<mpsc::Sender<UiCommand>>,
+) -> Result<(), String> {
+    let torrent_id = query_value(query, "id")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| "missing torrent id".to_string())?;
+    dispatch_command_ok(cmd_tx, |reply| UiCommand::RecheckTorrent { torrent_id, reply })
+}
+
+fn handle_set_seed_ratio(
+    request: &HttpRequest,
+    cmd_tx: &Option<mpsc::Sender<UiCommand>>,
+) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let ratio = query_value(&form, "ratio")
+        .ok_or_else(|| "missing ratio".to_string())?
+        .parse::<f64>()
+        .map_err(|_| "invalid ratio".to_string())?;
+    if ratio < 0.0 {
+        return Err("ratio must be >= 0".to_string());
+    }
+    dispatch_command_ok(cmd_tx, |reply| UiCommand::SetSeedRatio { ratio, reply })
 }
 
 fn handle_select_download_dir() -> Result<Option<String>, String> {
@@ -2163,6 +2302,7 @@ document.addEventListener('click',e=>{
     else if(action==='stop'){torrentAction('stop',id).catch(showActionError);}
     else if(action==='delete'){confirmDelete(id,card.dataset.name||'torrent').catch(showActionError);}
     else if(action==='open-folder'){torrentAction('open-folder',id).catch(showActionError);}
+    else if(action==='recheck'){torrentAction('recheck',id).catch(showActionError);}
     else if(action==='toggle-expand'){toggleExpand(card);}
   }
 });
@@ -2177,11 +2317,21 @@ document.addEventListener('input',e=>{
   if(target&&(target.id==='downloadLimit'||target.id==='uploadLimit')){
     updateRateLimitLabels();
   }
+  if(target&&target.id==='seedRatio'){
+    const v=Number(target.value)/10;
+    const label=document.getElementById('seedRatioValue');
+    if(label){label.textContent=v>0?v.toFixed(2):'unlimited';}
+  }
 });
 document.addEventListener('change',e=>{
   const target=e.target;
   if(target&&(target.id==='downloadLimit'||target.id==='uploadLimit')){
     setGlobalRateLimits().catch(showActionError);
+  }
+  if(target&&target.id==='seedRatio'){
+    const v=Number(target.value)/10;
+    const body='ratio='+encodeURIComponent(v);
+    apiPost('/settings/seed-ratio',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).catch(showActionError);
   }
 });
 function toggleExpand(card){
@@ -2475,6 +2625,18 @@ fn app_body_html(state: &UiState) -> String {
         "<input id=\"uploadLimit\" class=\"limit-slider\" type=\"range\" min=\"0\" max=\"102400\" step=\"64\" value=\"{upload_limit_kbps}\">"
     ));
     out.push_str("</div>");
+    out.push_str("<div class=\"limit-group\">");
+    out.push_str("<div class=\"limit-label\">Seed Ratio</div>");
+    out.push_str(&format!(
+        "<div class=\"limit-value\" id=\"seedRatioValue\">{}</div>",
+        if state.seed_ratio > 0.0 { format!("{:.2}", state.seed_ratio) } else { "unlimited".to_string() }
+    ));
+    out.push_str("</div>");
+    out.push_str(&format!(
+        "<input id=\"seedRatio\" class=\"limit-slider\" type=\"range\" min=\"0\" max=\"100\" step=\"1\" value=\"{}\" title=\"0 = unlimited\">",
+        (state.seed_ratio * 10.0).round() as u32
+    ));
+    out.push_str("</div>");
     out.push_str("</div>");
     out.push_str("</aside>");
 
@@ -2575,6 +2737,7 @@ fn app_body_html(state: &UiState) -> String {
             ));
             out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"toggle-expand\"><span class=\"material-symbols-rounded\">unfold_more</span>Expand</button>");
             out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"open-folder\"><span class=\"material-symbols-rounded\">folder_open</span>Open Folder</button>");
+            out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"recheck\"><span class=\"material-symbols-rounded\">verified</span>Recheck</button>");
             out.push_str(&format!(
                 "<button class=\"btn ghost\" type=\"button\" data-action=\"stop\"{stop_attrs}><span class=\"material-symbols-rounded\">stop</span>Stop</button>"
             ));
@@ -2794,7 +2957,7 @@ fn status_json(state: &UiState) -> String {
     }
     torrents_json.push(']');
     format!(
-        "{{\"name\":\"{}\",\"info_hash\":\"{}\",\"download_dir\":\"{}\",\"status\":\"{}\",\"last_error\":\"{}\",\"total_pieces\":{},\"completed_pieces\":{},\"total_bytes\":{},\"completed_bytes\":{},\"downloaded_bytes\":{},\"uploaded_bytes\":{},\"ratio\":{:.3},\"percent\":{},\"tracker_peers\":{},\"active_peers\":{},\"preallocate\":{},\"paused\":{},\"download_rate_bps\":{:.2},\"upload_rate_bps\":{:.2},\"eta_secs\":{},\"queue_len\":{},\"last_added\":\"{}\",\"current_id\":{},\"peer_connected\":{},\"peer_disconnected\":{},\"disk_read_ms_avg\":{:.3},\"disk_write_ms_avg\":{:.3},\"session_downloaded_bytes\":{},\"session_uploaded_bytes\":{},\"global_download_limit_bps\":{},\"global_upload_limit_bps\":{},\"files\":{},\"torrents\":{}}}",
+        "{{\"name\":\"{}\",\"info_hash\":\"{}\",\"download_dir\":\"{}\",\"status\":\"{}\",\"last_error\":\"{}\",\"total_pieces\":{},\"completed_pieces\":{},\"total_bytes\":{},\"completed_bytes\":{},\"downloaded_bytes\":{},\"uploaded_bytes\":{},\"ratio\":{:.3},\"percent\":{},\"tracker_peers\":{},\"active_peers\":{},\"preallocate\":{},\"paused\":{},\"download_rate_bps\":{:.2},\"upload_rate_bps\":{:.2},\"eta_secs\":{},\"queue_len\":{},\"last_added\":\"{}\",\"current_id\":{},\"peer_connected\":{},\"peer_disconnected\":{},\"disk_read_ms_avg\":{:.3},\"disk_write_ms_avg\":{:.3},\"session_downloaded_bytes\":{},\"session_uploaded_bytes\":{},\"global_download_limit_bps\":{},\"global_upload_limit_bps\":{},\"seed_ratio\":{:.2},\"files\":{},\"torrents\":{}}}",
         escape_json(&state.name),
         escape_json(&state.info_hash),
         escape_json(&state.download_dir),
@@ -2826,6 +2989,7 @@ fn status_json(state: &UiState) -> String {
         state.session_uploaded_bytes,
         state.global_download_limit_bps,
         state.global_upload_limit_bps,
+        state.seed_ratio,
         files_json,
         torrents_json
     )
@@ -3025,5 +3189,61 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"ok\":true"));
         assert!(response.contains("\"torrent_id\":77"));
+    }
+
+    #[test]
+    fn split_path_query_and_percent_decode_work() {
+        let (path, query) = split_path_query("/add?name=hello+world&x=%2Ftmp&empty=");
+        assert_eq!(path, "/add");
+        assert_eq!(
+            query,
+            vec![
+                ("name".to_string(), "hello world".to_string()),
+                ("x".to_string(), "/tmp".to_string()),
+                ("empty".to_string(), "".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn authorize_mutating_request_allows_valid_token_and_origin() {
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/torrent/pause?id=1".to_string(),
+            headers: vec![
+                ("host".to_string(), "127.0.0.1:8080".to_string()),
+                ("origin".to_string(), "http://127.0.0.1:8080".to_string()),
+                (API_TOKEN_HEADER.to_string(), api_token().to_string()),
+            ],
+            body: Vec::new(),
+        };
+        assert!(authorize_mutating_request(&request).is_ok());
+    }
+
+    #[test]
+    fn parse_bool_and_origin_extraction() {
+        assert!(parse_bool("true"));
+        assert!(parse_bool("YES"));
+        assert!(parse_bool("1"));
+        assert!(!parse_bool("0"));
+        assert!(!parse_bool("no"));
+        assert_eq!(
+            extract_origin_host("https://Example.com:8443/path"),
+            Some("example.com:8443".to_string())
+        );
+        assert_eq!(extract_origin_host("invalid"), None);
+    }
+
+    #[test]
+    fn formatting_helpers_are_stable() {
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1024), "1.00 KB");
+        assert_eq!(human_rate(0.0), "0 B/s");
+        assert_eq!(human_rate(1536.0), "1.50 KB/s");
+        assert_eq!(format_eta_secs(0), "--:--");
+        assert_eq!(format_eta_secs(61), "01:01");
+        assert_eq!(format_eta_secs(3661), "01:01:01");
+        assert_eq!(escape_html("<a&\"'>"), "&lt;a&amp;&quot;&#39;&gt;");
+        assert_eq!(escape_json("a\"b\\\n"), "a\\\"b\\\\\\n");
     }
 }

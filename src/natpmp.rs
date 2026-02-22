@@ -78,3 +78,83 @@ fn default_gateway() -> Option<Ipv4Addr> {
 fn default_gateway() -> Option<Ipv4Addr> {
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    fn local_addr(port: u16) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
+    }
+
+    #[test]
+    fn map_port_proto_sends_expected_request_and_accepts_success() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 12);
+            assert_eq!(buf[0], 0);
+            assert_eq!(buf[1], 2);
+            assert_eq!(u16::from_be_bytes([buf[4], buf[5]]), 51413);
+            assert_eq!(u16::from_be_bytes([buf[6], buf[7]]), 51413);
+            assert_eq!(u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]), 1800);
+
+            let mut resp = [0u8; 16];
+            resp[1] = 130; // op + 128 for TCP map
+            server.send_to(&resp, peer).unwrap();
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        map_port_proto(&client, local_addr(server_addr.port()), 51413, 1800, 2).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn map_port_proto_rejects_wrong_opcode() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let (_, peer) = server.recv_from(&mut buf).unwrap();
+            let mut resp = [0u8; 16];
+            resp[1] = 129; // wrong for op=2
+            server.send_to(&resp, peer).unwrap();
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let err = map_port_proto(&client, local_addr(server_addr.port()), 1, 60, 2).unwrap_err();
+        assert!(err.contains("invalid response"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn map_port_proto_rejects_nonzero_result_code() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let (_, peer) = server.recv_from(&mut buf).unwrap();
+            let mut resp = [0u8; 16];
+            resp[1] = 129; // op=1 (udp) + 128
+            resp[2..4].copy_from_slice(&2u16.to_be_bytes());
+            server.send_to(&resp, peer).unwrap();
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let err = map_port_proto(&client, local_addr(server_addr.port()), 1, 60, 1).unwrap_err();
+        assert!(err.contains("natpmp error 2"));
+        handle.join().unwrap();
+    }
+}

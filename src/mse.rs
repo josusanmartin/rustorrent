@@ -456,3 +456,106 @@ impl Rc4 {
         self.apply(&mut buf);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
+    #[test]
+    fn xor_and_key_derivation_are_consistent() {
+        let a = [0xAAu8; 20];
+        let b = [0x0Fu8; 20];
+        let x = xor_hash(&a, &b);
+        assert_eq!(x, [0xA5u8; 20]);
+
+        let shared = [3u8; 96];
+        let info_hash = [9u8; 20];
+        let (i_enc, i_dec) = derive_keys(&shared, &info_hash, true);
+        let (r_enc, r_dec) = derive_keys(&shared, &info_hash, false);
+        assert_eq!(i_enc, r_dec);
+        assert_eq!(i_dec, r_enc);
+    }
+
+    #[test]
+    fn to_fixed_bytes_pads_and_truncates() {
+        let small = BigUint::from(0x1234u32);
+        let padded = to_fixed_bytes(&small, 4);
+        assert_eq!(padded, vec![0x00, 0x00, 0x12, 0x34]);
+
+        let large = BigUint::from_str_radix("1122334455", 16).unwrap();
+        let truncated = to_fixed_bytes(&large, 3);
+        assert_eq!(truncated, vec![0x33, 0x44, 0x55]);
+    }
+
+    #[test]
+    fn cipher_state_roundtrip() {
+        let mut cipher = CipherState::new(b"key", b"key");
+        let mut data = b"hello world".to_vec();
+        let original = data.clone();
+        cipher.encrypt(&mut data);
+        assert_ne!(data, original);
+        cipher.decrypt(&mut data);
+        assert_eq!(data, original);
+    }
+
+    #[test]
+    fn find_info_hash_matches_req2_digest() {
+        let target = [7u8; 20];
+        let other = [8u8; 20];
+        let req2_target = sha1_bytes(b"req2", &target);
+        let found = find_info_hash(&[other, target], &req2_target);
+        assert_eq!(found, Some(target));
+    }
+
+    #[test]
+    fn mse_initiate_accept_roundtrip_over_tcp() {
+        let info_hash = [5u8; 20];
+        let initial_payload = b"bt-handshake";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).unwrap();
+            let (mode, mut cipher, matched_hash, ia) =
+                accept(&mut stream, &[info_hash], first[0], false).unwrap();
+            assert!(matches!(mode, CryptoMode::Rc4));
+            assert_eq!(matched_hash, info_hash);
+            assert_eq!(ia, initial_payload);
+
+            let mut outbound = b"pong".to_vec();
+            if let Some(c) = cipher.as_mut() {
+                c.encrypt(&mut outbound);
+            }
+            stream.write_all(&outbound).unwrap();
+
+            let mut inbound = [0u8; 4];
+            stream.read_exact(&mut inbound).unwrap();
+            if let Some(c) = cipher.as_mut() {
+                c.decrypt(&mut inbound);
+            }
+            assert_eq!(&inbound, b"ping");
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mode, mut cipher) = initiate(&mut client, info_hash, false, initial_payload).unwrap();
+        assert!(matches!(mode, CryptoMode::Rc4));
+
+        let mut inbound = [0u8; 4];
+        client.read_exact(&mut inbound).unwrap();
+        if let Some(c) = cipher.as_mut() {
+            c.decrypt(&mut inbound);
+        }
+        assert_eq!(&inbound, b"pong");
+
+        let mut outbound = b"ping".to_vec();
+        if let Some(c) = cipher.as_mut() {
+            c.encrypt(&mut outbound);
+        }
+        client.write_all(&outbound).unwrap();
+        server.join().unwrap();
+    }
+}

@@ -104,3 +104,53 @@ impl Write for PeerStream {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = thread::spawn(move || TcpStream::connect(addr).unwrap());
+        let (server_stream, _) = listener.accept().unwrap();
+        let client_stream = client.join().unwrap();
+        (client_stream, server_stream)
+    }
+
+    #[test]
+    fn peer_stream_plaintext_roundtrip() {
+        let (client, server) = tcp_pair();
+        let mut writer = PeerStream::tcp(client);
+        let mut reader = PeerStream::tcp(server);
+        assert!(writer.peer_addr().is_some());
+        assert!(!writer.is_encrypted());
+
+        writer.write_all(b"hello").unwrap();
+        writer.flush().unwrap();
+        let mut buf = [0u8; 5];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn peer_stream_encryption_roundtrip() {
+        let (client, server) = tcp_pair();
+        let mut writer = PeerStream::tcp(client);
+        let mut reader = PeerStream::tcp(server);
+        writer.enable_encryption(CipherState::new(b"key", b"key"));
+        reader.enable_encryption(CipherState::new(b"key", b"key"));
+        assert!(writer.is_encrypted());
+        assert!(reader.is_encrypted());
+
+        writer.write_all(b"encrypted").unwrap();
+        writer.flush().unwrap();
+
+        let mut buf = [0u8; 9];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"encrypted");
+    }
+}

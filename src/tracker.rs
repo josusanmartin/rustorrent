@@ -85,9 +85,29 @@ pub fn announce(
     event: Option<&str>,
     numwant: u32,
 ) -> Result<TrackerResponse, Error> {
-    let query = build_query(
+    announce_with_private(
+        announce_url, info_hash, peer_id, port, uploaded, downloaded, left, event, numwant, false,
+    )
+}
+
+pub fn announce_with_private(
+    announce_url: &str,
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+    port: u16,
+    uploaded: u64,
+    downloaded: u64,
+    left: u64,
+    event: Option<&str>,
+    numwant: u32,
+    private: bool,
+) -> Result<TrackerResponse, Error> {
+    let mut query = build_query(
         info_hash, peer_id, port, uploaded, downloaded, left, event, numwant,
     );
+    if private {
+        push_query(&mut query, "private", "1");
+    }
     let mut url = announce_url.to_string();
     for _ in 0..=TRACKER_REDIRECT_LIMIT {
         let parsed = parse_url(&url)?;
