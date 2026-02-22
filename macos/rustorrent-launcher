@@ -1,5 +1,8 @@
 #!/bin/bash
 # Launcher script for Rustorrent - starts the app and opens the web UI
+#
+# The key to staying in the Dock: exec replaces this shell with rustorrent-bin
+# so macOS tracks the real binary as the .app process.
 
 # Get the directory where this script lives (inside .app/Contents/MacOS/)
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -52,36 +55,26 @@ if /usr/bin/curl -s --connect-timeout 1 "$UI_URL" >/dev/null 2>&1; then
 fi
 
 # Start rustorrent
-log "Starting rustorrent daemon..."
+log "Starting rustorrent..."
 cd "$HOME"
 mkdir -p "$DOWNLOAD_DIR"
 
+# Background task: poll until UI is ready, then open browser
+(
+    for i in {1..30}; do
+        if /usr/bin/curl -s --connect-timeout 1 "$UI_URL" >/dev/null 2>&1; then
+            log "UI is ready, opening browser"
+            /usr/bin/open "$UI_URL"
+            break
+        fi
+        sleep 0.2
+    done
+) &
+
+# exec replaces this shell with the actual binary.
+# macOS tracks this PID as the .app process → stays in the Dock.
 if [[ -n "$TORRENT_FILE" ]]; then
-    "$BINARY" "$TORRENT_FILE" --ui --ui-addr "127.0.0.1:$UI_PORT" --download-dir "$DOWNLOAD_DIR" >> "$LOG_FILE" 2>&1 &
+    exec "$BINARY" "$TORRENT_FILE" --ui --ui-addr "127.0.0.1:$UI_PORT" --download-dir "$DOWNLOAD_DIR" --log "$LOG_FILE" >> "$LOG_FILE" 2>&1
 else
-    "$BINARY" --ui --ui-addr "127.0.0.1:$UI_PORT" --download-dir "$DOWNLOAD_DIR" >> "$LOG_FILE" 2>&1 &
-fi
-RUSTORRENT_PID=$!
-log "Started with PID: $RUSTORRENT_PID"
-
-# Wait for the UI to be ready (up to 6 seconds)
-for i in {1..30}; do
-    if /usr/bin/curl -s --connect-timeout 1 "$UI_URL" >/dev/null 2>&1; then
-        log "UI is ready"
-        break
-    fi
-    sleep 0.2
-done
-
-# Check if process is still running
-if kill -0 $RUSTORRENT_PID 2>/dev/null; then
-    log "Opening browser"
-    /usr/bin/open "$UI_URL"
-    log "Waiting on daemon PID $RUSTORRENT_PID (keeps app in Dock)"
-    wait $RUSTORRENT_PID
-    log "Daemon exited"
-else
-    log "ERROR: Daemon failed to start"
-    # Show error to user
-    osascript -e 'display dialog "Rustorrent failed to start. Check ~/.rustorrent/launcher.log for details." buttons {"OK"} default button "OK" with icon stop with title "Rustorrent"' 2>/dev/null
+    exec "$BINARY" --ui --ui-addr "127.0.0.1:$UI_PORT" --download-dir "$DOWNLOAD_DIR" --log "$LOG_FILE" >> "$LOG_FILE" 2>&1
 fi
