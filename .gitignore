@@ -36,3 +36,4 @@ Bugonia*/
 fuzz/artifacts/
 fuzz/corpus/
 fuzz/coverage/
+.github/
