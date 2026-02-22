@@ -1,0 +1,31 @@
+# Build
+target/
+
+# Runtime data
+.rustorrent/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# Downloads / large files
+*.iso
+*.msi
+*.torrent
+*.mp4
+*.mkv
+*.avi
+*.sfc
+*.smc
+
+# Bundled app
+macos/
+
+# Test output
+output/
+
+# Downloaded content directories
+Top_150_Super-Nintendo*/
+Bugonia*/

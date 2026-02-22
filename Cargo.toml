@@ -1,0 +1,39 @@
+[package]
+name = "rustorrent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+native-tls = "0.2"
+num-bigint = { version = "0.4", optional = true, default-features = false, features = ["std"] }
+num-traits = { version = "0.2", optional = true, default-features = false, features = ["std"] }
+
+[features]
+default = ["full"]
+core = []
+full = [
+    "udp_tracker",
+    "dht",
+    "lpd",
+    "utp",
+    "mse",
+    "natpmp",
+    "upnp",
+    "webseed",
+]
+udp_tracker = []
+dht = []
+lpd = []
+utp = []
+mse = ["dep:num-bigint", "dep:num-traits"]
+natpmp = []
+upnp = []
+webseed = []
+verbose = []
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
