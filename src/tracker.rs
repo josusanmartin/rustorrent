@@ -86,7 +86,16 @@ pub fn announce(
     numwant: u32,
 ) -> Result<TrackerResponse, Error> {
     announce_with_private(
-        announce_url, info_hash, peer_id, port, uploaded, downloaded, left, event, numwant, false,
+        announce_url,
+        info_hash,
+        peer_id,
+        port,
+        uploaded,
+        downloaded,
+        left,
+        event,
+        numwant,
+        false,
     )
 }
 

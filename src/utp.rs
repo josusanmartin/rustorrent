@@ -42,7 +42,10 @@ pub fn start(port: u16) -> (UtpConnector, UtpListener) {
     thread::spawn(move || {
         let socket = match UdpSocket::bind(("0.0.0.0", port)) {
             Ok(socket) => socket,
-            Err(_) => return,
+            Err(_) => match UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, port)) {
+                Ok(socket) => socket,
+                Err(_) => return,
+            },
         };
         let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
         utp_loop(socket, cmd_rx, accept_tx);

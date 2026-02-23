@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const LPD_ADDR: &str = "239.192.152.143:6771";
+const LPD_ADDR_V4: &str = "239.192.152.143:6771";
+const LPD_ADDR_V6: &str = "[ff15::efc0:988f]:6771";
 const LPD_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
@@ -67,6 +68,14 @@ fn lpd_thread(cmd_rx: mpsc::Receiver<Command>) {
         &Ipv4Addr::new(0, 0, 0, 0),
     );
 
+    // IPv6 multicast socket (BEP 14)
+    let socket6 = UdpSocket::bind("[::]:6771").ok();
+    if let Some(ref s6) = socket6 {
+        let _ = s6.set_read_timeout(Some(Duration::from_millis(200)));
+        let group: Ipv6Addr = "ff15::efc0:988f".parse().unwrap();
+        let _ = s6.join_multicast_v6(&group, 0);
+    }
+
     let mut entries: HashMap<[u8; 20], Entry> = HashMap::new();
     let mut buf = [0u8; 1500];
     loop {
@@ -96,7 +105,10 @@ fn lpd_thread(cmd_rx: mpsc::Receiver<Command>) {
         for (info_hash, entry) in entries.iter_mut() {
             if entry.last_announce.elapsed() >= LPD_INTERVAL {
                 let msg = build_search_message(info_hash, entry.port);
-                let _ = socket.send_to(&msg, LPD_ADDR);
+                let _ = socket.send_to(&msg, LPD_ADDR_V4);
+                if let Some(ref s6) = socket6 {
+                    let _ = s6.send_to(&msg, LPD_ADDR_V6);
+                }
                 entry.last_announce = now;
             }
         }
@@ -106,6 +118,16 @@ fn lpd_thread(cmd_rx: mpsc::Receiver<Command>) {
                 if let Some(entry) = entries.get(&info_hash) {
                     let peer = SocketAddr::new(addr.ip(), port);
                     let _ = entry.peers_tx.send(vec![peer]);
+                }
+            }
+        }
+        if let Some(ref s6) = socket6 {
+            if let Ok((n, addr)) = s6.recv_from(&mut buf) {
+                if let Some((info_hash, port)) = parse_search_message(&buf[..n]) {
+                    if let Some(entry) = entries.get(&info_hash) {
+                        let peer = SocketAddr::new(addr.ip(), port);
+                        let _ = entry.peers_tx.send(vec![peer]);
+                    }
                 }
             }
         }

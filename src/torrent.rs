@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::bencode::{self, Value};
 use crate::sha1;
+use crate::sha256;
 
 #[derive(Debug)]
 pub struct TorrentMeta {
@@ -13,6 +14,9 @@ pub struct TorrentMeta {
     pub httpseeds: Vec<Vec<u8>>,
     pub info: InfoDict,
     pub info_hash: [u8; 20],
+    pub info_hash_v2: Option<[u8; 32]>,
+    pub piece_layers: Vec<(Vec<u8>, Vec<[u8; 32]>)>,
+    pub meta_version: u8,
 }
 
 #[derive(Debug)]
@@ -23,6 +27,7 @@ pub struct InfoDict {
     pub length: Option<u64>,
     pub files: Vec<FileInfo>,
     pub private: bool,
+    pub file_tree: Vec<FileTreeEntry>,
 }
 
 #[derive(Debug)]
@@ -31,12 +36,21 @@ pub struct FileInfo {
     pub path: Vec<Vec<u8>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FileTreeEntry {
+    pub path: Vec<Vec<u8>>,
+    pub length: u64,
+    pub pieces_root: Option<[u8; 32]>,
+}
+
 impl InfoDict {
     pub fn total_length(&self) -> u64 {
         if let Some(length) = self.length {
             length
-        } else {
+        } else if !self.files.is_empty() {
             self.files.iter().map(|file| file.length).sum()
+        } else {
+            self.file_tree.iter().map(|entry| entry.length).sum()
         }
     }
 }
@@ -96,7 +110,24 @@ pub fn parse_torrent(data: &[u8]) -> Result<TorrentMeta, Error> {
     };
     let info_value = dict_get(&top_dict, b"info").ok_or(Error::MissingField("info"))?;
     let info = parse_info_dict(info_value)?;
-    let info_hash = sha1::sha1(&data[info_span.0..info_span.1]);
+    let info_bytes = &data[info_span.0..info_span.1];
+    let info_hash = sha1::sha1(info_bytes);
+    let info_hash_v2 = Some(sha256::sha256(info_bytes));
+
+    let piece_layers = match dict_get(&top_dict, b"piece layers") {
+        Some(value) => parse_piece_layers(value)?,
+        None => Vec::new(),
+    };
+
+    let has_pieces = !info.pieces.is_empty();
+    let has_file_tree = !info.file_tree.is_empty();
+    let meta_version = if has_pieces && has_file_tree {
+        3 // hybrid
+    } else if has_file_tree {
+        2 // v2-only
+    } else {
+        1 // v1
+    };
 
     Ok(TorrentMeta {
         announce,
@@ -105,6 +136,9 @@ pub fn parse_torrent(data: &[u8]) -> Result<TorrentMeta, Error> {
         httpseeds,
         info,
         info_hash,
+        info_hash_v2,
+        piece_layers,
+        meta_version,
     })
 }
 
@@ -149,17 +183,33 @@ fn parse_info_dict(value: &Value) -> Result<InfoDict, Error> {
     let name = dict_get_bytes(dict, b"name").ok_or(Error::MissingField("name"))?;
     let piece_length =
         dict_get_int(dict, b"piece length").ok_or(Error::MissingField("piece length"))?;
-    let pieces_bytes = dict_get_bytes(dict, b"pieces").ok_or(Error::MissingField("pieces"))?;
 
-    if pieces_bytes.len() % 20 != 0 {
-        return Err(Error::InvalidPiecesLength);
-    }
-    let mut pieces = Vec::with_capacity(pieces_bytes.len() / 20);
-    for chunk in pieces_bytes.chunks_exact(20) {
-        let mut hash = [0u8; 20];
-        hash.copy_from_slice(chunk);
-        pieces.push(hash);
-    }
+    let file_tree = match dict_get(dict, b"file tree") {
+        Some(ft_value) => parse_file_tree(ft_value)?,
+        None => Vec::new(),
+    };
+    let has_file_tree = !file_tree.is_empty();
+
+    let pieces = match dict_get_bytes(dict, b"pieces") {
+        Some(pieces_bytes) => {
+            if pieces_bytes.len() % 20 != 0 {
+                return Err(Error::InvalidPiecesLength);
+            }
+            let mut pieces = Vec::with_capacity(pieces_bytes.len() / 20);
+            for chunk in pieces_bytes.chunks_exact(20) {
+                let mut hash = [0u8; 20];
+                hash.copy_from_slice(chunk);
+                pieces.push(hash);
+            }
+            pieces
+        }
+        None => {
+            if !has_file_tree {
+                return Err(Error::MissingField("pieces"));
+            }
+            Vec::new()
+        }
+    };
 
     let length = dict_get_int(dict, b"length");
     let files_value = dict_get(dict, b"files");
@@ -183,6 +233,7 @@ fn parse_info_dict(value: &Value) -> Result<InfoDict, Error> {
         length,
         files,
         private,
+        file_tree,
     })
 }
 
@@ -259,6 +310,69 @@ fn parse_httpseeds(value: &Value) -> Result<Vec<Vec<u8>>, Error> {
         }
     }
     Ok(urls)
+}
+
+fn parse_file_tree(value: &Value) -> Result<Vec<FileTreeEntry>, Error> {
+    let dict = as_dict(value)?;
+    let mut entries = Vec::new();
+    parse_file_tree_recursive(dict, &mut Vec::new(), &mut entries)?;
+    Ok(entries)
+}
+
+fn parse_file_tree_recursive(
+    dict: &[(Vec<u8>, Value)],
+    path: &mut Vec<Vec<u8>>,
+    entries: &mut Vec<FileTreeEntry>,
+) -> Result<(), Error> {
+    for (key, value) in dict {
+        if key.is_empty() {
+            let inner = as_dict(value)?;
+            let length = dict_get_int(inner, b"length").ok_or(Error::MissingField("length"))?;
+            let pieces_root = dict_get_bytes(inner, b"pieces root").and_then(|bytes| {
+                if bytes.len() == 32 {
+                    let mut root = [0u8; 32];
+                    root.copy_from_slice(&bytes);
+                    Some(root)
+                } else {
+                    None
+                }
+            });
+            entries.push(FileTreeEntry {
+                path: path.clone(),
+                length,
+                pieces_root,
+            });
+        } else {
+            let inner = as_dict(value)?;
+            path.push(key.clone());
+            parse_file_tree_recursive(inner, path, entries)?;
+            path.pop();
+        }
+    }
+    Ok(())
+}
+
+fn parse_piece_layers(value: &Value) -> Result<Vec<(Vec<u8>, Vec<[u8; 32]>)>, Error> {
+    let dict = as_dict(value)?;
+    let mut layers = Vec::new();
+    for (key, value) in dict {
+        match value {
+            Value::Bytes(hashes_bytes) => {
+                if hashes_bytes.len() % 32 != 0 {
+                    continue;
+                }
+                let mut hashes = Vec::with_capacity(hashes_bytes.len() / 32);
+                for chunk in hashes_bytes.chunks_exact(32) {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(chunk);
+                    hashes.push(hash);
+                }
+                layers.push((key.clone(), hashes));
+            }
+            _ => continue,
+        }
+    }
+    Ok(layers)
 }
 
 fn dict_get<'a>(dict: &'a [(Vec<u8>, Value)], key: &[u8]) -> Option<&'a Value> {

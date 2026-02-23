@@ -156,6 +156,22 @@ impl RoutingTable {
         }
         out
     }
+
+    fn encode_closest_nodes6(&self, target: &[u8; 20]) -> Vec<u8> {
+        let closest = self.closest(target, 8);
+        let mut out = Vec::new();
+        for node in closest {
+            match node.addr.ip() {
+                std::net::IpAddr::V6(ip) => {
+                    out.extend_from_slice(&node.id);
+                    out.extend_from_slice(&ip.octets());
+                    out.extend_from_slice(&node.addr.port().to_be_bytes());
+                }
+                std::net::IpAddr::V4(_) => continue,
+            }
+        }
+        out
+    }
 }
 
 fn xor_distance(a: &[u8; 20], b: &[u8; 20]) -> [u8; 20] {
@@ -186,14 +202,26 @@ fn nodes_file_path() -> PathBuf {
     path
 }
 
+const NODES_FILE_MAGIC: &[u8; 5] = b"DHTN\x01";
+
 fn save_nodes(rt: &RoutingTable) {
     let nodes = rt.all_nodes();
-    let mut data = Vec::with_capacity(nodes.len() * 26);
+    let mut data = Vec::with_capacity(NODES_FILE_MAGIC.len() + nodes.len() * 39);
+    data.extend_from_slice(NODES_FILE_MAGIC);
     for node in nodes {
-        if let std::net::IpAddr::V4(ip) = node.addr.ip() {
-            data.extend_from_slice(&node.id);
-            data.extend_from_slice(&ip.octets());
-            data.extend_from_slice(&node.addr.port().to_be_bytes());
+        match node.addr.ip() {
+            std::net::IpAddr::V4(ip) => {
+                data.push(4u8); // type marker
+                data.extend_from_slice(&node.id);
+                data.extend_from_slice(&ip.octets());
+                data.extend_from_slice(&node.addr.port().to_be_bytes());
+            }
+            std::net::IpAddr::V6(ip) => {
+                data.push(6u8); // type marker
+                data.extend_from_slice(&node.id);
+                data.extend_from_slice(&ip.octets());
+                data.extend_from_slice(&node.addr.port().to_be_bytes());
+            }
         }
     }
     let _ = fs::write(nodes_file_path(), &data);
@@ -204,22 +232,79 @@ fn load_nodes(rt: &mut RoutingTable) -> usize {
         Ok(d) => d,
         Err(_) => return 0,
     };
-    let mut count = 0;
-    let mut i = 0;
+    let decoded = if data.starts_with(NODES_FILE_MAGIC) {
+        decode_nodes_type_prefixed(&data[NODES_FILE_MAGIC.len()..]).unwrap_or_default()
+    } else if let Some(nodes) = decode_nodes_type_prefixed(&data) {
+        nodes
+    } else {
+        decode_legacy_nodes(&data)
+    };
+    for node in &decoded {
+        rt.insert(node.clone());
+    }
+    decoded.len()
+}
+
+fn decode_nodes_type_prefixed(data: &[u8]) -> Option<Vec<Node>> {
+    let mut nodes = Vec::new();
+    let mut i = 0usize;
+    while i < data.len() {
+        let marker = data[i];
+        i += 1;
+        if marker == 4 {
+            if i + 26 > data.len() {
+                return None;
+            }
+            let mut id = [0u8; 20];
+            id.copy_from_slice(&data[i..i + 20]);
+            let ip =
+                std::net::Ipv4Addr::new(data[i + 20], data[i + 21], data[i + 22], data[i + 23]);
+            let port = u16::from_be_bytes([data[i + 24], data[i + 25]]);
+            nodes.push(Node {
+                id,
+                addr: SocketAddr::new(ip.into(), port),
+                last_seen: Instant::now(),
+            });
+            i += 26;
+        } else if marker == 6 {
+            if i + 38 > data.len() {
+                return None;
+            }
+            let mut id = [0u8; 20];
+            id.copy_from_slice(&data[i..i + 20]);
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&data[i + 20..i + 36]);
+            let ip = std::net::Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([data[i + 36], data[i + 37]]);
+            nodes.push(Node {
+                id,
+                addr: SocketAddr::new(ip.into(), port),
+                last_seen: Instant::now(),
+            });
+            i += 38;
+        } else {
+            return None;
+        }
+    }
+    Some(nodes)
+}
+
+fn decode_legacy_nodes(data: &[u8]) -> Vec<Node> {
+    let mut nodes = Vec::new();
+    let mut i = 0usize;
     while i + 26 <= data.len() {
         let mut id = [0u8; 20];
         id.copy_from_slice(&data[i..i + 20]);
         let ip = std::net::Ipv4Addr::new(data[i + 20], data[i + 21], data[i + 22], data[i + 23]);
         let port = u16::from_be_bytes([data[i + 24], data[i + 25]]);
-        rt.insert(Node {
+        nodes.push(Node {
             id,
             addr: SocketAddr::new(ip.into(), port),
             last_seen: Instant::now(),
         });
-        count += 1;
         i += 26;
     }
-    count
+    nodes
 }
 
 struct TorrentEntry {
@@ -237,18 +322,21 @@ struct PendingQuery {
 fn dht_thread(bind_port: u16, cmd_rx: mpsc::Receiver<Command>) {
     let socket = match UdpSocket::bind(("0.0.0.0", bind_port)) {
         Ok(socket) => socket,
-        Err(err) => {
-            crate::log_stderr(format_args!(
-                "dht bind {bind_port} failed: {err}, using ephemeral port"
-            ));
-            match UdpSocket::bind("0.0.0.0:0") {
-                Ok(socket) => socket,
-                Err(err) => {
-                    crate::log_stderr(format_args!("dht bind failed: {err}"));
-                    return;
+        Err(_) => match UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, bind_port)) {
+            Ok(socket) => socket,
+            Err(err) => {
+                crate::log_stderr(format_args!(
+                    "dht bind {bind_port} failed: {err}, using ephemeral port"
+                ));
+                match UdpSocket::bind("0.0.0.0:0") {
+                    Ok(socket) => socket,
+                    Err(err) => {
+                        crate::log_stderr(format_args!("dht bind failed: {err}"));
+                        return;
+                    }
                 }
             }
-        }
+        },
     };
     let _ = socket.set_read_timeout(Some(DHT_TIMEOUT));
     let node_id = random_node_id();
@@ -390,6 +478,11 @@ fn handle_response(
             rt.insert(node);
         }
     }
+    if let Some(Value::Bytes(nodes6_bytes)) = dict_get(r, b"nodes6") {
+        for node in decode_nodes6(nodes6_bytes) {
+            rt.insert(node);
+        }
+    }
     if let Some(Value::List(values)) = dict_get(r, b"values") {
         let mut peers = Vec::new();
         for value in values {
@@ -477,10 +570,14 @@ fn handle_query(
                 _ => rt.own_id,
             };
             let nodes_bytes = rt.encode_closest_nodes(&target);
-            let r = vec![
+            let nodes6_bytes = rt.encode_closest_nodes6(&target);
+            let mut r = vec![
                 (b"id".to_vec(), Value::Bytes(node_id.to_vec())),
                 (b"nodes".to_vec(), Value::Bytes(nodes_bytes)),
             ];
+            if !nodes6_bytes.is_empty() {
+                r.push((b"nodes6".to_vec(), Value::Bytes(nodes6_bytes)));
+            }
             let resp = build_response(node_id, &tx, r);
             let _ = socket.send_to(&resp, addr);
         }
@@ -663,6 +760,27 @@ fn encode_peers(peers: &[SocketAddr]) -> Vec<u8> {
     out
 }
 
+fn decode_nodes6(bytes: &[u8]) -> Vec<Node> {
+    let mut nodes = Vec::new();
+    let mut i = 0;
+    // 38 bytes: 20-byte node ID + 16-byte IPv6 + 2-byte port
+    while i + 38 <= bytes.len() {
+        let mut id = [0u8; 20];
+        id.copy_from_slice(&bytes[i..i + 20]);
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&bytes[i + 20..i + 36]);
+        let ip = std::net::Ipv6Addr::from(octets);
+        let port = u16::from_be_bytes([bytes[i + 36], bytes[i + 37]]);
+        nodes.push(Node {
+            id,
+            addr: SocketAddr::new(ip.into(), port),
+            last_seen: Instant::now(),
+        });
+        i += 38;
+    }
+    nodes
+}
+
 fn make_token(secret: &[u8; 20], addr: &SocketAddr) -> [u8; 4] {
     let mut data = Vec::with_capacity(32);
     data.extend_from_slice(secret);
@@ -805,5 +923,31 @@ mod tests {
 
         let encoded = rt.encode_closest_nodes(&target);
         assert_eq!(encoded.len(), 26 * 8);
+    }
+
+    #[test]
+    fn type_prefixed_decoder_rejects_partial_records() {
+        let mut bytes = Vec::new();
+        bytes.push(4u8);
+        bytes.extend_from_slice(&[1u8; 10]); // truncated record
+        assert!(decode_nodes_type_prefixed(&bytes).is_none());
+    }
+
+    #[test]
+    fn legacy_data_starting_with_4_does_not_require_type_format() {
+        let mut legacy = Vec::new();
+        let mut id = [0u8; 20];
+        id[0] = 4; // could be misdetected as a marker in ambiguous parser
+        legacy.extend_from_slice(&id);
+        legacy.extend_from_slice(&[192, 0, 2, 7]);
+        legacy.extend_from_slice(&7000u16.to_be_bytes());
+
+        let parsed_prefixed = decode_nodes_type_prefixed(&legacy);
+        assert!(parsed_prefixed.is_none());
+
+        let parsed_legacy = decode_legacy_nodes(&legacy);
+        assert_eq!(parsed_legacy.len(), 1);
+        assert_eq!(parsed_legacy[0].id[0], 4);
+        assert_eq!(parsed_legacy[0].addr, "192.0.2.7:7000".parse().unwrap());
     }
 }

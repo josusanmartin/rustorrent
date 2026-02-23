@@ -291,6 +291,27 @@ impl Storage {
         }
         Ok(())
     }
+
+    pub fn rename_file(
+        &mut self,
+        file_index: usize,
+        old_path: &Path,
+        new_path: &Path,
+    ) -> Result<(), Error> {
+        if file_index >= self.entries.len() {
+            return Err(Error::OutOfBounds);
+        }
+        self.flush_cache()?;
+        if let Some(parent) = new_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::rename(old_path, new_path)?;
+        let file = OpenOptions::new().read(true).write(true).open(new_path)?;
+        self.entries[file_index].file = file;
+        Ok(())
+    }
 }
 
 fn build_layout(meta: &TorrentMeta, download_dir: &Path) -> Result<Vec<FileLayout>, Error> {
@@ -309,28 +330,51 @@ fn build_layout(meta: &TorrentMeta, download_dir: &Path) -> Result<Vec<FileLayou
         }]);
     }
 
-    if meta.info.files.is_empty() {
+    if meta.info.files.is_empty() && meta.info.file_tree.is_empty() {
         return Err(Error::InvalidFiles);
     }
 
     let base = download_dir.join(name);
-    let mut layouts = Vec::with_capacity(meta.info.files.len());
+    let mut layouts = if !meta.info.files.is_empty() {
+        Vec::with_capacity(meta.info.files.len())
+    } else {
+        Vec::with_capacity(meta.info.file_tree.len())
+    };
     let mut offset = 0u64;
-    for file in &meta.info.files {
-        if file.path.is_empty() {
-            return Err(Error::InvalidPathSegment);
+    if !meta.info.files.is_empty() {
+        for file in &meta.info.files {
+            if file.path.is_empty() {
+                return Err(Error::InvalidPathSegment);
+            }
+            let mut path = base.clone();
+            for segment in &file.path {
+                let segment = clean_segment(segment)?;
+                path.push(segment);
+            }
+            layouts.push(FileLayout {
+                path,
+                offset,
+                length: file.length,
+            });
+            offset = offset.saturating_add(file.length);
         }
-        let mut path = base.clone();
-        for segment in &file.path {
-            let segment = clean_segment(segment)?;
-            path.push(segment);
+    } else {
+        for file in &meta.info.file_tree {
+            if file.path.is_empty() {
+                return Err(Error::InvalidPathSegment);
+            }
+            let mut path = base.clone();
+            for segment in &file.path {
+                let segment = clean_segment(segment)?;
+                path.push(segment);
+            }
+            layouts.push(FileLayout {
+                path,
+                offset,
+                length: file.length,
+            });
+            offset = offset.saturating_add(file.length);
         }
-        layouts.push(FileLayout {
-            path,
-            offset,
-            length: file.length,
-        });
-        offset = offset.saturating_add(file.length);
     }
 
     if offset != total_length {
@@ -423,7 +467,7 @@ fn bytes_to_os_string(bytes: &[u8]) -> Result<OsString, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::torrent::{FileInfo, InfoDict};
+    use crate::torrent::{FileInfo, FileTreeEntry, InfoDict};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn dummy_meta() -> TorrentMeta {
@@ -433,6 +477,9 @@ mod tests {
             url_list: Vec::new(),
             httpseeds: Vec::new(),
             info_hash: [0u8; 20],
+            info_hash_v2: None,
+            piece_layers: Vec::new(),
+            meta_version: 1,
             info: InfoDict {
                 name: b"root".to_vec(),
                 piece_length: 16384,
@@ -449,8 +496,27 @@ mod tests {
                     },
                 ],
                 private: false,
+                file_tree: Vec::new(),
             },
         }
+    }
+
+    fn dummy_meta_v2_tree() -> TorrentMeta {
+        let mut meta = dummy_meta();
+        meta.info.files.clear();
+        meta.info.file_tree = vec![
+            FileTreeEntry {
+                path: vec![b"a.txt".to_vec()],
+                length: 3,
+                pieces_root: None,
+            },
+            FileTreeEntry {
+                path: vec![b"dir".to_vec(), b"b.bin".to_vec()],
+                length: 5,
+                pieces_root: None,
+            },
+        ];
+        meta
     }
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -464,6 +530,18 @@ mod tests {
     #[test]
     fn builds_multi_file_layout() {
         let meta = dummy_meta();
+        let base = Path::new("/tmp");
+        let layout = build_layout(&meta, base).unwrap();
+        assert_eq!(layout.len(), 2);
+        assert_eq!(layout[0].offset, 0);
+        assert_eq!(layout[0].length, 3);
+        assert_eq!(layout[1].offset, 3);
+        assert_eq!(layout[1].length, 5);
+    }
+
+    #[test]
+    fn builds_v2_file_tree_layout() {
+        let meta = dummy_meta_v2_tree();
         let base = Path::new("/tmp");
         let layout = build_layout(&meta, base).unwrap();
         assert_eq!(layout.len(), 2);

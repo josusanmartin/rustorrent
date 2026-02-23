@@ -60,6 +60,46 @@ pub enum UiCommand {
         ratio: f64,
         reply: mpsc::Sender<UiCommandResult>,
     },
+    SetLabel {
+        torrent_id: u64,
+        label: String,
+        reply: mpsc::Sender<UiCommandResult>,
+    },
+    AddTracker {
+        torrent_id: u64,
+        url: String,
+        reply: mpsc::Sender<UiCommandResult>,
+    },
+    RemoveTracker {
+        torrent_id: u64,
+        url: String,
+        reply: mpsc::Sender<UiCommandResult>,
+    },
+    RenameFile {
+        torrent_id: u64,
+        file_index: usize,
+        new_name: String,
+        reply: mpsc::Sender<UiCommandResult>,
+    },
+    AddRssFeed {
+        url: String,
+        interval: u64,
+        reply: mpsc::Sender<UiCommandResult>,
+    },
+    RemoveRssFeed {
+        url: String,
+        reply: mpsc::Sender<UiCommandResult>,
+    },
+    AddRssRule {
+        name: String,
+        feed_url: String,
+        pattern: String,
+        reply: mpsc::Sender<UiCommandResult>,
+    },
+    RemoveRssRule {
+        name: String,
+        reply: mpsc::Sender<UiCommandResult>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +153,7 @@ pub struct UiState {
     pub global_download_limit_bps: u64,
     pub global_upload_limit_bps: u64,
     pub seed_ratio: f64,
+    pub proxy_label: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -137,6 +178,10 @@ pub struct UiTorrent {
     pub paused: bool,
     pub last_error: String,
     pub files: Vec<UiFile>,
+    pub label: String,
+    pub trackers: Vec<String>,
+    pub peer_country_counts: Vec<(String, u32)>,
+    pub meta_version: u8,
 }
 
 fn lock_state(state: &Arc<Mutex<UiState>>) -> MutexGuard<'_, UiState> {
@@ -323,6 +368,13 @@ fn handle_connection(
             }
             return send_api_ok(stream);
         }
+        if path == "/rename-file" {
+            if let Err(err) = handle_rename_file(&request, &state, &cmd_tx) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
         if path == "/rate-limits" {
             if let Err(err) = handle_rate_limits(&request, &state, &cmd_tx) {
                 update_error(&state, &err);
@@ -344,7 +396,67 @@ fn handle_connection(
             }
             return send_api_ok(stream);
         }
+        if path == "/torrent/set-label" {
+            if let Err(err) = handle_set_label(&request, &state, &cmd_tx) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
+        if path == "/torrent/add-tracker" {
+            if let Err(err) = handle_add_tracker(&request, &cmd_tx) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
+        if path == "/torrent/remove-tracker" {
+            if let Err(err) = handle_remove_tracker(&request, &cmd_tx) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
+        if path == "/rss/add-feed" {
+            if let Err(err) = handle_rss_add_feed(&request, &cmd_tx) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
+        if path == "/rss/remove-feed" {
+            if let Err(err) = handle_rss_remove_feed(&request, &cmd_tx) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
+        if path == "/rss/add-rule" {
+            if let Err(err) = handle_rss_add_rule(&request, &cmd_tx) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
+        if path == "/rss/remove-rule" {
+            if let Err(err) = handle_rss_remove_rule(&request, &cmd_tx) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
         return send_api_error_with_status(stream, 404, "unknown endpoint");
+    }
+
+    if path == "/rss/status" {
+        let body = rss_status_json();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        return Ok(());
     }
 
     let mut guard = lock_state(&state);
@@ -665,6 +777,180 @@ fn handle_file_priority(
     Ok(())
 }
 
+fn handle_rename_file(
+    request: &HttpRequest,
+    state: &Arc<Mutex<UiState>>,
+    cmd_tx: &Option<mpsc::Sender<UiCommand>>,
+) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let index = query_value(&form, "index")
+        .ok_or_else(|| "missing index".to_string())?
+        .parse::<usize>()
+        .map_err(|_| "invalid index".to_string())?;
+    let new_name = query_value(&form, "name")
+        .ok_or_else(|| "missing name".to_string())?
+        .to_string();
+    if new_name.is_empty()
+        || new_name.contains('/')
+        || new_name.contains('\\')
+        || new_name.contains('\0')
+        || new_name == "."
+        || new_name == ".."
+    {
+        return Err("invalid file name".to_string());
+    }
+    let torrent_id = query_value(&form, "id")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| "missing torrent id".to_string())?;
+
+    dispatch_command_ok(cmd_tx, |reply| UiCommand::RenameFile {
+        torrent_id,
+        file_index: index,
+        new_name: new_name.clone(),
+        reply,
+    })?;
+
+    let mut guard = lock_state(state);
+    if let Some(torrent) = guard
+        .torrents
+        .iter_mut()
+        .find(|torrent| torrent.id == torrent_id)
+    {
+        if let Some(file) = torrent.files.get_mut(index) {
+            if let Some(pos) = file.path.rfind('/') {
+                file.path = format!("{}/{}", &file.path[..pos], new_name);
+            } else {
+                file.path = new_name.clone();
+            }
+        }
+    }
+    if guard.current_id == Some(torrent_id) {
+        if let Some(file) = guard.files.get_mut(index) {
+            if let Some(pos) = file.path.rfind('/') {
+                file.path = format!("{}/{}", &file.path[..pos], new_name);
+            } else {
+                file.path = new_name;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_rss_add_feed(
+    request: &HttpRequest,
+    cmd_tx: &Option<mpsc::Sender<UiCommand>>,
+) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let url = query_value(&form, "url")
+        .ok_or_else(|| "missing url".to_string())?
+        .to_string();
+    if url.is_empty() {
+        return Err("empty url".to_string());
+    }
+    let interval = query_value(&form, "interval")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(900);
+    dispatch_command_ok(cmd_tx, |reply| UiCommand::AddRssFeed {
+        url: url.clone(),
+        interval,
+        reply,
+    })
+}
+
+fn handle_rss_remove_feed(
+    request: &HttpRequest,
+    cmd_tx: &Option<mpsc::Sender<UiCommand>>,
+) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let url = query_value(&form, "url")
+        .ok_or_else(|| "missing url".to_string())?
+        .to_string();
+    dispatch_command_ok(cmd_tx, |reply| UiCommand::RemoveRssFeed {
+        url: url.clone(),
+        reply,
+    })
+}
+
+fn handle_rss_add_rule(
+    request: &HttpRequest,
+    cmd_tx: &Option<mpsc::Sender<UiCommand>>,
+) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let name = query_value(&form, "name")
+        .ok_or_else(|| "missing name".to_string())?
+        .to_string();
+    let feed_url = query_value(&form, "feed_url").unwrap_or("").to_string();
+    let pattern = query_value(&form, "pattern")
+        .ok_or_else(|| "missing pattern".to_string())?
+        .to_string();
+    dispatch_command_ok(cmd_tx, |reply| UiCommand::AddRssRule {
+        name: name.clone(),
+        feed_url: feed_url.clone(),
+        pattern: pattern.clone(),
+        reply,
+    })
+}
+
+fn handle_rss_remove_rule(
+    request: &HttpRequest,
+    cmd_tx: &Option<mpsc::Sender<UiCommand>>,
+) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let name = query_value(&form, "name")
+        .ok_or_else(|| "missing name".to_string())?
+        .to_string();
+    dispatch_command_ok(cmd_tx, |reply| UiCommand::RemoveRssRule {
+        name: name.clone(),
+        reply,
+    })
+}
+
+fn rss_status_json() -> String {
+    use crate::RSS_STATE;
+
+    let lock = match RSS_STATE.get() {
+        Some(lock) => lock,
+        None => return "{\"feeds\":[],\"rules\":[]}".to_string(),
+    };
+    let state = match lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => return "{\"feeds\":[],\"rules\":[]}".to_string(),
+    };
+    let mut out = String::from("{\"feeds\":[");
+    for (i, feed) in state.feeds.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"url\":\"{}\",\"title\":\"{}\",\"items\":{},\"last_poll\":{},\"interval\":{}}}",
+            escape_json(&feed.url),
+            escape_json(&feed.title),
+            feed.items.len(),
+            feed.last_poll,
+            feed.poll_interval_secs,
+        ));
+    }
+    out.push_str("],\"rules\":[");
+    for (i, rule) in state.rules.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"name\":\"{}\",\"feed_url\":\"{}\",\"pattern\":\"{}\"}}",
+            escape_json(&rule.name),
+            escape_json(&rule.feed_url),
+            escape_json(&rule.pattern),
+        ));
+    }
+    out.push_str("]}");
+    out
+}
+
 fn handle_rate_limits(
     request: &HttpRequest,
     state: &Arc<Mutex<UiState>>,
@@ -702,7 +988,10 @@ fn handle_torrent_recheck(
     let torrent_id = query_value(query, "id")
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| "missing torrent id".to_string())?;
-    dispatch_command_ok(cmd_tx, |reply| UiCommand::RecheckTorrent { torrent_id, reply })
+    dispatch_command_ok(cmd_tx, |reply| UiCommand::RecheckTorrent {
+        torrent_id,
+        reply,
+    })
 }
 
 fn handle_set_seed_ratio(
@@ -719,6 +1008,72 @@ fn handle_set_seed_ratio(
         return Err("ratio must be >= 0".to_string());
     }
     dispatch_command_ok(cmd_tx, |reply| UiCommand::SetSeedRatio { ratio, reply })
+}
+
+fn handle_set_label(
+    request: &HttpRequest,
+    state: &Arc<Mutex<UiState>>,
+    cmd_tx: &Option<mpsc::Sender<UiCommand>>,
+) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let torrent_id = query_value(&form, "id")
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| "missing torrent id".to_string())?;
+    let label = query_value(&form, "label").unwrap_or("").to_string();
+
+    dispatch_command_ok(cmd_tx, |reply| UiCommand::SetLabel {
+        torrent_id,
+        label: label.clone(),
+        reply,
+    })?;
+
+    let mut guard = lock_state(state);
+    if let Some(torrent) = guard.torrents.iter_mut().find(|t| t.id == torrent_id) {
+        torrent.label = label;
+    }
+    Ok(())
+}
+
+fn handle_add_tracker(
+    request: &HttpRequest,
+    cmd_tx: &Option<mpsc::Sender<UiCommand>>,
+) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let torrent_id = query_value(&form, "id")
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| "missing torrent id".to_string())?;
+    let url = query_value(&form, "url")
+        .ok_or_else(|| "missing tracker url".to_string())?
+        .to_string();
+    if url.trim().is_empty() {
+        return Err("tracker url is empty".to_string());
+    }
+    dispatch_command_ok(cmd_tx, |reply| UiCommand::AddTracker {
+        torrent_id,
+        url,
+        reply,
+    })
+}
+
+fn handle_remove_tracker(
+    request: &HttpRequest,
+    cmd_tx: &Option<mpsc::Sender<UiCommand>>,
+) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let torrent_id = query_value(&form, "id")
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| "missing torrent id".to_string())?;
+    let url = query_value(&form, "url")
+        .ok_or_else(|| "missing tracker url".to_string())?
+        .to_string();
+    dispatch_command_ok(cmd_tx, |reply| UiCommand::RemoveTracker {
+        torrent_id,
+        url,
+        reply,
+    })
 }
 
 fn handle_select_download_dir() -> Result<Option<String>, String> {
@@ -1602,6 +1957,52 @@ body{
 }
 .empty-state .material-symbols-rounded{font-size:48px;color:var(--on-surface-var);opacity:.5;margin-bottom:12px}
 .empty-state p{font:400 14px "Inter",sans-serif;color:var(--on-surface-var);max-width:320px}
+.rss-form{display:flex;gap:6px;margin-top:10px}
+.rss-form .input{height:32px;padding:0 10px;font-size:12px;flex:1;min-width:0}
+.rss-form .btn{height:32px;padding:0 12px;font-size:12px;flex-shrink:0}
+.rss-list{margin-top:10px;display:flex;flex-direction:column;gap:2px}
+.rss-item{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:6px 10px;border-radius:8px;font-size:12px;
+  background:var(--surface-cont);transition:background .15s;
+}
+.rss-item:hover{background:var(--surface-cont-high)}
+.rss-item-info{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rss-item-meta{color:var(--on-surface-var);font-size:11px;margin-left:8px;flex-shrink:0}
+.rss-item .remove-btn{
+  background:none;border:none;color:var(--on-surface-var);cursor:pointer;
+  padding:2px 6px;border-radius:4px;font-size:14px;line-height:1;margin-left:4px;
+  transition:color .15s,background .15s;
+}
+.rss-item .remove-btn:hover{color:var(--error);background:var(--danger-cont)}
+.rss-section-label{
+  font:600 10px "Inter",sans-serif;text-transform:uppercase;
+  letter-spacing:.06em;color:var(--on-surface-var);margin-top:12px;margin-bottom:4px;
+}
+.country-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.country-tag{
+  display:inline-flex;align-items:center;gap:4px;padding:4px 10px;
+  background:var(--surface-cont-high);border:1px solid var(--outline-var);
+  border-radius:8px;font-size:12px;
+}
+.country-tag b{font-weight:700;color:var(--on-surface)}
+.inline-form{display:flex;gap:6px;align-items:center;margin-top:8px}
+.inline-form .input{
+  flex:1;min-width:0;height:30px;padding:0 8px;font-size:12px;border-radius:8px;
+}
+.inline-form .btn{
+  height:30px;padding:0 10px;font-size:12px;border-radius:8px;flex-shrink:0;
+}
+.tracker-item{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:4px 0;font-size:12px;word-break:break-all;
+}
+.tracker-item .remove-btn{
+  background:none;border:none;color:var(--on-surface-var);cursor:pointer;
+  padding:2px 6px;border-radius:4px;font-size:14px;line-height:1;
+  flex-shrink:0;margin-left:8px;transition:color .15s,background .15s;
+}
+.tracker-item .remove-btn:hover{color:var(--error);background:var(--danger-cont)}
 @keyframes progressSheen{0%{transform:translateX(-100%)}100%{transform:translateX(200%)}}
 @keyframes modalFade{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:scale(1)}}
 @media(max-width:980px){
@@ -1695,7 +2096,11 @@ function applyFilter(filter){
   cards.forEach(card=>{
     const status=card.dataset.status||'downloading';
     const name=(card.dataset.name||'').toLowerCase();
-    const matchesFilter=(filter==='all'||status===filter);
+    const cardLabel=card.dataset.label||'';
+    let matchesFilter;
+    if(filter==='all'){matchesFilter=true;}
+    else if(filter.startsWith('label:')){matchesFilter=cardLabel===filter.slice(6);}
+    else{matchesFilter=status===filter;}
     const matchesSearch=!search||name.includes(search);
     if(matchesFilter&&matchesSearch){card.style.display='';}else{card.style.display='none';}
   });
@@ -2304,6 +2709,20 @@ document.addEventListener('click',e=>{
     else if(action==='open-folder'){torrentAction('open-folder',id).catch(showActionError);}
     else if(action==='recheck'){torrentAction('recheck',id).catch(showActionError);}
     else if(action==='toggle-expand'){toggleExpand(card);}
+    else if(action==='add-tracker'){
+      const input=card.querySelector('.tracker-add-input');
+      if(input&&input.value.trim()){
+        apiPost('/torrent/add-tracker',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+encodeURIComponent(id)+'&url='+encodeURIComponent(input.value.trim())}).then(()=>{input.value='';}).catch(showActionError);
+      }
+    }
+    else if(action==='remove-tracker'){
+      const url=actionBtn.dataset.url||'';
+      if(url){apiPost('/torrent/remove-tracker',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+encodeURIComponent(id)+'&url='+encodeURIComponent(url)}).catch(showActionError);}
+    }
+    else if(action==='set-label'){
+      const input=card.querySelector('.label-input');
+      if(input){apiPost('/torrent/set-label',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+encodeURIComponent(id)+'&label='+encodeURIComponent(input.value.trim())}).catch(showActionError);}
+    }
   }
 });
 document.addEventListener('input',e=>{
@@ -2471,6 +2890,52 @@ async function setPriority(torrentId,index,priority){
     alert('Priority update failed: '+actionErrorMessage(err));
   }
 }
+function startRename(torrentId,index,cell){
+  const oldText=cell.textContent;
+  const parts=oldText.split('/');
+  const basename=parts[parts.length-1];
+  const input=document.createElement('input');
+  input.type='text';input.className='input';input.value=basename;
+  input.style.cssText='width:100%;box-sizing:border-box;font-size:12px';
+  cell.textContent='';cell.appendChild(input);input.focus();input.select();
+  let done=false;
+  function finish(save){
+    if(done)return;done=true;
+    const val=input.value.trim();
+    cell.textContent=oldText;
+    if(save&&val&&val!==basename&&!val.includes('/')&&!val.includes('\\\\')&&val!=='.'&&val!=='..'){
+      const newPath=parts.length>1?parts.slice(0,-1).join('/')+'/'+val:val;
+      cell.textContent=newPath;
+      const body='id='+encodeURIComponent(torrentId)+'&index='+encodeURIComponent(index)+'&name='+encodeURIComponent(val);
+      apiPost('/rename-file',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).catch(function(err){
+        cell.textContent=oldText;
+        alert('Rename failed: '+actionErrorMessage(err));
+      });
+    }
+  }
+  input.addEventListener('keydown',function(e){if(e.key==='Enter'){finish(true)}else if(e.key==='Escape'){finish(false)}});
+  input.addEventListener('blur',function(){finish(true)});
+}
+function addRssFeed(e){
+  e.preventDefault();
+  const url=document.getElementById('rssUrl').value.trim();
+  if(!url)return;
+  apiPost('/rss/add-feed',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)}).then(()=>location.reload()).catch(err=>alert('Add feed failed: '+actionErrorMessage(err)));
+}
+function removeRssFeed(url){
+  apiPost('/rss/remove-feed',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)}).then(()=>location.reload()).catch(err=>alert('Remove feed failed: '+actionErrorMessage(err)));
+}
+function removeRssRule(name){
+  apiPost('/rss/remove-rule',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'name='+encodeURIComponent(name)}).then(()=>location.reload()).catch(err=>alert('Remove rule failed: '+actionErrorMessage(err)));
+}
+function addRssRule(e){
+  e.preventDefault();
+  var name=document.getElementById('rssRuleName').value.trim();
+  var pattern=document.getElementById('rssRulePattern').value.trim();
+  if(!name||!pattern)return;
+  var body='name='+encodeURIComponent(name)+'&pattern='+encodeURIComponent(pattern);
+  apiPost('/rss/add-rule',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(){location.reload()}).catch(function(err){alert('Add rule failed: '+actionErrorMessage(err))});
+}
 applyTheme(resolveTheme());
 applyFilter(resolveFilter());
 applyCollapseState();
@@ -2585,6 +3050,25 @@ fn app_body_html(state: &UiState) -> String {
     out.push_str(&format!(
         "<button class=\"nav-item\" type=\"button\" data-filter=\"error\"><span class=\"nav-label\"><span class=\"material-symbols-rounded\">error</span>Errors</span><span class=\"count\">{errored}</span></button>"
     ));
+    // Label filter buttons
+    {
+        let mut labels: Vec<String> = state
+            .torrents
+            .iter()
+            .filter(|t| !t.label.is_empty())
+            .map(|t| t.label.clone())
+            .collect();
+        labels.sort();
+        labels.dedup();
+        for lbl in &labels {
+            let count = state.torrents.iter().filter(|t| t.label == *lbl).count();
+            out.push_str(&format!(
+                "<button class=\"nav-item\" type=\"button\" data-filter=\"label:{}\" style=\"margin-top:2px\"><span class=\"nav-label\"><span class=\"material-symbols-rounded\">label</span>{}</span><span class=\"count\">{count}</span></button>",
+                escape_html(lbl),
+                escape_html(lbl)
+            ));
+        }
+    }
     out.push_str("</div></div>");
     out.push_str("<div class=\"panel\">");
     out.push_str("<div class=\"panel-title\">Session</div>");
@@ -2602,6 +3086,12 @@ fn app_body_html(state: &UiState) -> String {
         "<div class=\"session-row\"><span>Disk I/O</span><span class=\"session-value\">{:.1}ms / {:.1}ms</span></div>",
         state.disk_read_ms_avg, state.disk_write_ms_avg
     ));
+    if !state.proxy_label.is_empty() {
+        out.push_str(&format!(
+            "<div class=\"session-row\"><span>Proxy</span><span class=\"session-value\">{}</span></div>",
+            escape_html(&state.proxy_label)
+        ));
+    }
     out.push_str("</div>");
     out.push_str("<div class=\"limit-controls\">");
     out.push_str("<div class=\"limit-row\">");
@@ -2629,7 +3119,11 @@ fn app_body_html(state: &UiState) -> String {
     out.push_str("<div class=\"limit-label\">Seed Ratio</div>");
     out.push_str(&format!(
         "<div class=\"limit-value\" id=\"seedRatioValue\">{}</div>",
-        if state.seed_ratio > 0.0 { format!("{:.2}", state.seed_ratio) } else { "unlimited".to_string() }
+        if state.seed_ratio > 0.0 {
+            format!("{:.2}", state.seed_ratio)
+        } else {
+            "unlimited".to_string()
+        }
     ));
     out.push_str("</div>");
     out.push_str(&format!(
@@ -2638,6 +3132,65 @@ fn app_body_html(state: &UiState) -> String {
     ));
     out.push_str("</div>");
     out.push_str("</div>");
+
+    // RSS panel
+    out.push_str("<div class=\"panel\">");
+    out.push_str("<div class=\"panel-title\"><span class=\"material-symbols-rounded\" style=\"font-size:16px;vertical-align:-3px;margin-right:4px\">rss_feed</span>RSS Feeds</div>");
+    out.push_str("<form class=\"rss-form\" onsubmit=\"addRssFeed(event)\">");
+    out.push_str("<input id=\"rssUrl\" class=\"input\" placeholder=\"Feed URL\">");
+    out.push_str("<button type=\"submit\" class=\"btn primary\">Add</button>");
+    out.push_str("</form>");
+    {
+        use crate::RSS_STATE;
+        if let Some(lock) = RSS_STATE.get() {
+            if let Ok(rss_state) = lock.lock() {
+                if !rss_state.feeds.is_empty() {
+                    out.push_str("<div class=\"rss-list\">");
+                    for feed in &rss_state.feeds {
+                        let title = if feed.title.is_empty() {
+                            &feed.url
+                        } else {
+                            &feed.title
+                        };
+                        out.push_str(&format!(
+                            "<div class=\"rss-item\"><span class=\"rss-item-info\" title=\"{}\">{}</span><span class=\"rss-item-meta\">{} items</span><button class=\"remove-btn\" onclick=\"removeRssFeed('{}')\" title=\"Remove\">\u{00d7}</button></div>",
+                            escape_html(&feed.url),
+                            escape_html(title),
+                            feed.items.len(),
+                            escape_html(&feed.url),
+                        ));
+                    }
+                    out.push_str("</div>");
+                }
+                // Rules section
+                out.push_str("<div class=\"rss-section-label\">Rules</div>");
+                if !rss_state.rules.is_empty() {
+                    out.push_str("<div class=\"rss-list\">");
+                    for rule in &rss_state.rules {
+                        out.push_str(&format!(
+                            "<div class=\"rss-item\"><span class=\"rss-item-info\">{}: {}</span><button class=\"remove-btn\" onclick=\"removeRssRule('{}')\" title=\"Remove\">\u{00d7}</button></div>",
+                            escape_html(&rule.name),
+                            escape_html(&rule.pattern),
+                            escape_html(&rule.name),
+                        ));
+                    }
+                    out.push_str("</div>");
+                }
+                // Add rule form
+                out.push_str("<form class=\"rss-form\" onsubmit=\"addRssRule(event)\">");
+                out.push_str(
+                    "<input id=\"rssRuleName\" class=\"input\" placeholder=\"Rule name\">",
+                );
+                out.push_str(
+                    "<input id=\"rssRulePattern\" class=\"input\" placeholder=\"Pattern\">",
+                );
+                out.push_str("<button type=\"submit\" class=\"btn primary\">Add</button>");
+                out.push_str("</form>");
+            }
+        }
+    }
+    out.push_str("</div>");
+
     out.push_str("</aside>");
 
     out.push_str("<main class=\"torrent-list\">");
@@ -2715,9 +3268,10 @@ fn app_body_html(state: &UiState) -> String {
             };
 
             out.push_str(&format!(
-                "<section class=\"panel torrent-card\" style=\"--card-index:{card_index}\" data-status=\"{bucket}\" data-id=\"{id}\" data-info-hash=\"{info_hash}\" data-name=\"{name}\" data-paused=\"{paused}\" data-collapsed=\"true\">",
+                "<section class=\"panel torrent-card\" style=\"--card-index:{card_index}\" data-status=\"{bucket}\" data-id=\"{id}\" data-info-hash=\"{info_hash}\" data-name=\"{name}\" data-paused=\"{paused}\" data-label=\"{label}\" data-collapsed=\"true\">",
                 id = torrent.id,
-                card_index = card_index
+                card_index = card_index,
+                label = escape_html(&torrent.label)
             ));
             out.push_str("<div class=\"torrent-head\">");
             out.push_str("<div>");
@@ -2784,6 +3338,16 @@ fn app_body_html(state: &UiState) -> String {
             out.push_str(&format!(
                 "<div class=\"k\">Info hash</div><div>{info_hash}</div>"
             ));
+            {
+                let version_label = match torrent.meta_version {
+                    2 => "v2",
+                    3 => "Hybrid",
+                    _ => "v1",
+                };
+                out.push_str(&format!(
+                    "<div class=\"k\">Version</div><div>{version_label}</div>"
+                ));
+            }
             out.push_str(&format!(
                 "<div class=\"k\">Download dir</div><div>{download_dir}</div>"
             ));
@@ -2797,7 +3361,40 @@ fn app_body_html(state: &UiState) -> String {
                 "<div class=\"k\">Uploaded</div><div>{uploaded_label}</div>"
             ));
             out.push_str(&format!("<div class=\"k\">Ratio</div><div>{ratio}</div>"));
+            out.push_str(&format!(
+                "<div class=\"k\">Label</div><div class=\"inline-form\"><input class=\"label-input input\" type=\"text\" value=\"{}\" placeholder=\"none\"><button class=\"btn\" data-action=\"set-label\">Set</button></div>",
+                escape_html(&torrent.label)
+            ));
             out.push_str("</div>");
+            out.push_str("</div>");
+
+            // Peer countries panel
+            if !torrent.peer_country_counts.is_empty() {
+                out.push_str("<div class=\"subpanel\">");
+                out.push_str("<div class=\"panel-title\">Peers by Country</div>");
+                out.push_str("<div class=\"country-tags\">");
+                for (cc, count) in &torrent.peer_country_counts {
+                    let flag = crate::geoip::country_flag(cc);
+                    out.push_str(&format!(
+                        "<span class=\"country-tag\">{flag} {cc} <b>{count}</b></span>"
+                    ));
+                }
+                out.push_str("</div></div>");
+            }
+
+            // Trackers panel
+            out.push_str("<div class=\"subpanel\">");
+            out.push_str("<div class=\"panel-title\">Trackers</div>");
+            if !torrent.trackers.is_empty() {
+                for tracker in &torrent.trackers {
+                    out.push_str(&format!(
+                        "<div class=\"tracker-item\"><span>{}</span><button class=\"remove-btn\" data-action=\"remove-tracker\" data-url=\"{}\" title=\"Remove\">\u{00d7}</button></div>",
+                        escape_html(tracker),
+                        escape_html(tracker)
+                    ));
+                }
+            }
+            out.push_str("<div class=\"inline-form\"><input class=\"tracker-add-input input\" type=\"text\" placeholder=\"https://... or udp://...\"><button class=\"btn\" data-action=\"add-tracker\">Add</button></div>");
             out.push_str("</div>");
 
             out.push_str("<div class=\"subpanel\">");
@@ -2823,8 +3420,9 @@ fn app_body_html(state: &UiState) -> String {
                         id = torrent.id,
                         idx = idx
                     );
+                    let tid = torrent.id;
                     out.push_str(&format!(
-                        "<tr><td>{file_name}</td><td>{size}</td><td>{done}</td><td><div class=\"file-bar\"><div class=\"fill\" style=\"width:{file_pct_value:.2}%\"></div></div></td><td>{priority_select}</td></tr>"
+                        "<tr><td class=\"file-cell\" ondblclick=\"startRename({tid},{idx},this)\" title=\"Double-click to rename\">{file_name}</td><td>{size}</td><td>{done}</td><td><div class=\"file-bar\"><div class=\"fill\" style=\"width:{file_pct_value:.2}%\"></div></div></td><td>{priority_select}</td></tr>"
                     ));
                 }
                 out.push_str("</tbody></table>");
@@ -2929,8 +3527,30 @@ fn status_json(state: &UiState) -> String {
             ));
         }
         torrent_files_json.push(']');
+        let mut trackers_json = String::from("[");
+        for (ti, t) in torrent.trackers.iter().enumerate() {
+            if ti > 0 {
+                trackers_json.push(',');
+            }
+            trackers_json.push('"');
+            trackers_json.push_str(&escape_json(t));
+            trackers_json.push('"');
+        }
+        trackers_json.push(']');
+        let mut countries_json = String::from("[");
+        for (ci, (cc, count)) in torrent.peer_country_counts.iter().enumerate() {
+            if ci > 0 {
+                countries_json.push(',');
+            }
+            countries_json.push_str(&format!(
+                "{{\"code\":\"{}\",\"count\":{}}}",
+                escape_json(cc),
+                count
+            ));
+        }
+        countries_json.push(']');
         torrents_json.push_str(&format!(
-            "{{\"id\":{},\"name\":\"{}\",\"info_hash\":\"{}\",\"download_dir\":\"{}\",\"preallocate\":{},\"status\":\"{}\",\"total_bytes\":{},\"completed_bytes\":{},\"downloaded_bytes\":{},\"uploaded_bytes\":{},\"ratio\":{:.3},\"total_pieces\":{},\"completed_pieces\":{},\"percent\":{},\"download_rate_bps\":{:.2},\"upload_rate_bps\":{:.2},\"eta_secs\":{},\"tracker_peers\":{},\"active_peers\":{},\"paused\":{},\"last_error\":\"{}\",\"files\":{}}}",
+            "{{\"id\":{},\"name\":\"{}\",\"info_hash\":\"{}\",\"download_dir\":\"{}\",\"preallocate\":{},\"status\":\"{}\",\"total_bytes\":{},\"completed_bytes\":{},\"downloaded_bytes\":{},\"uploaded_bytes\":{},\"ratio\":{:.3},\"total_pieces\":{},\"completed_pieces\":{},\"percent\":{},\"download_rate_bps\":{:.2},\"upload_rate_bps\":{:.2},\"eta_secs\":{},\"tracker_peers\":{},\"active_peers\":{},\"paused\":{},\"last_error\":\"{}\",\"label\":\"{}\",\"trackers\":{},\"files\":{},\"peer_countries\":{}}}",
             torrent.id,
             escape_json(&torrent.name),
             escape_json(&torrent.info_hash),
@@ -2952,7 +3572,10 @@ fn status_json(state: &UiState) -> String {
             torrent.active_peers,
             torrent.paused,
             escape_json(&torrent.last_error),
-            torrent_files_json
+            escape_json(&torrent.label),
+            trackers_json,
+            torrent_files_json,
+            countries_json
         ));
     }
     torrents_json.push(']');

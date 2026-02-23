@@ -1,6 +1,7 @@
 mod bencode;
 #[cfg(feature = "dht")]
 mod dht;
+mod geoip;
 mod http;
 mod ip_filter;
 #[cfg(feature = "lpd")]
@@ -12,7 +13,10 @@ mod natpmp;
 mod peer;
 mod peer_stream;
 mod piece;
+mod proxy;
+mod rss;
 mod sha1;
+mod sha256;
 mod storage;
 mod torrent;
 mod tracker;
@@ -23,6 +27,7 @@ mod ui;
 mod upnp;
 #[cfg(feature = "utp")]
 mod utp;
+mod xml;
 
 #[cfg(not(feature = "dht"))]
 mod dht {
@@ -300,6 +305,48 @@ static SESSION_UPLOADED_BYTES: AtomicU64 = AtomicU64::new(0);
 static PEER_CONNECTED: AtomicU64 = AtomicU64::new(0);
 static PEER_DISCONNECTED: AtomicU64 = AtomicU64::new(0);
 static SEED_RATIO_BITS: AtomicU64 = AtomicU64::new(0);
+static MAX_SEED_TIME_SECS: AtomicU64 = AtomicU64::new(0);
+static SUPER_SEED: AtomicBool = AtomicBool::new(false);
+static ON_COMPLETE_SCRIPT: OnceLock<PathBuf> = OnceLock::new();
+
+#[allow(dead_code)]
+struct ThrottleGroup {
+    name: String,
+    down: Arc<RateLimiter>,
+    up: Arc<RateLimiter>,
+}
+
+static THROTTLE_GROUPS: OnceLock<Mutex<Vec<ThrottleGroup>>> = OnceLock::new();
+
+struct RatioGroup {
+    name: String,
+    ratio: f64,
+    action: String,
+}
+
+static RATIO_GROUPS: OnceLock<Mutex<Vec<RatioGroup>>> = OnceLock::new();
+
+struct ScheduleEntry {
+    interval_secs: u64,
+    command: String,
+    last_run: Instant,
+}
+
+static SCHEDULES: OnceLock<Mutex<Vec<ScheduleEntry>>> = OnceLock::new();
+static GEOIP_DB: OnceLock<geoip::GeoIpDb> = OnceLock::new();
+static RSS_STATE: OnceLock<Mutex<rss::RssState>> = OnceLock::new();
+
+struct RssPollResult {
+    url: String,
+    parsed: Result<(String, Vec<rss::FeedItem>), String>,
+}
+
+struct RssDownloadResult {
+    guid: String,
+    url: String,
+    title: String,
+    data: Result<Vec<u8>, String>,
+}
 
 #[derive(Clone)]
 enum TorrentSource {
@@ -314,6 +361,7 @@ struct TorrentRequest {
     source: TorrentSource,
     download_dir: PathBuf,
     preallocate: bool,
+    initial_label: String,
 }
 
 #[derive(Clone)]
@@ -323,6 +371,7 @@ struct SessionEntry {
     torrent_bytes: Vec<u8>,
     download_dir: PathBuf,
     preallocate: bool,
+    label: String,
 }
 
 struct SessionStore {
@@ -342,6 +391,7 @@ struct ConnectionConfig {
     encryption: EncryptionMode,
     utp: Option<utp::UtpConnector>,
     ip_filter: Option<Arc<IpFilter>>,
+    proxy: Option<proxy::ProxyConfig>,
 }
 
 #[derive(Clone)]
@@ -422,6 +472,12 @@ struct TorrentContext {
     stop_requested: Arc<AtomicBool>,
     upload_manager: Arc<UploadManager>,
     peer_tags: Arc<AtomicU64>,
+    label: Arc<Mutex<String>>,
+    trackers: Arc<Mutex<TrackerSet>>,
+    #[allow(dead_code)]
+    throttle_group: Arc<Mutex<Option<String>>>,
+    ratio_group: Arc<Mutex<Option<String>>>,
+    file_renames: Arc<Mutex<HashMap<usize, String>>>,
 }
 
 type SessionRegistry = Arc<Mutex<HashMap<[u8; 20], Arc<TorrentContext>>>>;
@@ -472,16 +528,37 @@ fn log_timestamp() -> String {
     let mut y = 1970i64;
     let mut rem = days as i64;
     loop {
-        let ylen = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
-        if rem < ylen { break; }
+        let ylen = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if rem < ylen {
+            break;
+        }
         rem -= ylen;
         y += 1;
     }
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mdays = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut mo = 0usize;
     for &ml in &mdays {
-        if rem < ml as i64 { break; }
+        if rem < ml as i64 {
+            break;
+        }
         rem -= ml as i64;
         mo += 1;
     }
@@ -718,10 +795,24 @@ impl SessionStore {
                 torrent_bytes,
                 download_dir: download_dir.to_path_buf(),
                 preallocate,
+                label: String::new(),
             },
         );
         if let Err(err) = save_session(&self.path, &guard) {
             log_warn!("session save failed: {err}");
+        }
+    }
+
+    fn set_label(&self, info_hash: [u8; 20], label: &str) {
+        let mut guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(entry) = guard.get_mut(&info_hash) {
+            entry.label = label.to_string();
+            if let Err(err) = save_session(&self.path, &guard) {
+                log_warn!("session save failed: {err}");
+            }
         }
     }
 
@@ -1056,7 +1147,7 @@ fn run() -> Result<(), String> {
         }
         // Redirect stdin to /dev/null
         if let Ok(devnull) = std::fs::File::open("/dev/null") {
-            use std::os::unix::io::{AsRawFd, FromRawFd};
+            use std::os::unix::io::AsRawFd;
             extern "C" {
                 fn dup2(oldfd: i32, newfd: i32) -> i32;
             }
@@ -1073,9 +1164,80 @@ fn run() -> Result<(), String> {
             .map_err(|err| format!("failed to write pid file: {err}"))?;
     }
 
+    // Session locking: prevent multiple instances using same data directory
+    #[cfg(unix)]
+    let _lock_file = {
+        let lock_path = args.download_dir.join(".rustorrent.lock");
+        if lock_path.exists() {
+            if let Ok(contents) = fs::read_to_string(&lock_path) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    extern "C" {
+                        fn kill(pid: i32, sig: i32) -> i32;
+                    }
+                    if unsafe { kill(pid, 0) } == 0 && pid != std::process::id() as i32 {
+                        return Err(format!(
+                            "another instance (PID {pid}) is using {}",
+                            args.download_dir.display()
+                        ));
+                    }
+                }
+            }
+        }
+        let mut f = fs::File::create(&lock_path).map_err(|e| format!("lock: {e}"))?;
+        write!(f, "{}", std::process::id()).map_err(|e| format!("lock: {e}"))?;
+        Some((f, lock_path))
+    };
+    #[cfg(not(unix))]
+    let _lock_file: Option<(fs::File, PathBuf)> = None;
+
     // Initialize seed ratio from CLI args
     if args.seed_ratio > 0.0 {
         SEED_RATIO_BITS.store(args.seed_ratio.to_bits(), Ordering::SeqCst);
+    }
+    if args.max_seed_time > 0 {
+        MAX_SEED_TIME_SECS.store(args.max_seed_time * 60, Ordering::SeqCst);
+    }
+    if let Some(script) = args.on_complete.clone() {
+        let _ = ON_COMPLETE_SCRIPT.set(script);
+    }
+    if args.super_seed {
+        SUPER_SEED.store(true, Ordering::SeqCst);
+    }
+    if !args.throttle_groups.is_empty() {
+        let groups = args
+            .throttle_groups
+            .iter()
+            .map(|(name, down, up)| ThrottleGroup {
+                name: name.clone(),
+                down: Arc::new(RateLimiter::new(*down)),
+                up: Arc::new(RateLimiter::new(*up)),
+            })
+            .collect();
+        let _ = THROTTLE_GROUPS.set(Mutex::new(groups));
+    }
+    if !args.ratio_groups.is_empty() {
+        let groups = args
+            .ratio_groups
+            .iter()
+            .map(|(name, ratio, action)| RatioGroup {
+                name: name.clone(),
+                ratio: *ratio,
+                action: action.clone(),
+            })
+            .collect();
+        let _ = RATIO_GROUPS.set(Mutex::new(groups));
+    }
+    if !args.schedules.is_empty() {
+        let entries = args
+            .schedules
+            .iter()
+            .map(|(interval, command)| ScheduleEntry {
+                interval_secs: *interval,
+                command: command.clone(),
+                last_run: Instant::now(),
+            })
+            .collect();
+        let _ = SCHEDULES.set(Mutex::new(entries));
     }
 
     let global_down = Arc::new(RateLimiter::new(args.download_rate));
@@ -1087,7 +1249,7 @@ fn run() -> Result<(), String> {
     let state = Arc::new(Mutex::new(ui::UiState::default()));
     let (cmd_tx, cmd_rx) = mpsc::channel::<ui::UiCommand>();
     if args.ui {
-        if let Err(err) = ui::start(args.ui_addr.clone(), state.clone(), Some(cmd_tx)) {
+        if let Err(err) = ui::start(args.ui_addr.clone(), state.clone(), Some(cmd_tx.clone())) {
             log_warn!("ui error: {err}");
         } else {
             log_info!("ui: http://{}", args.ui_addr);
@@ -1098,11 +1260,21 @@ fn run() -> Result<(), String> {
         ui.global_download_limit_bps = args.download_rate;
         ui.global_upload_limit_bps = args.upload_rate;
         ui.seed_ratio = args.seed_ratio;
+        ui.proxy_label = match &args.proxy {
+            Some(proxy::ProxyConfig::Socks5 { host, port }) => format!("socks5://{host}:{port}"),
+            Some(proxy::ProxyConfig::Http { host, port }) => format!("http://{host}:{port}"),
+            None => String::new(),
+        };
     });
 
     let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
-    let progress_handle = if !args.daemon {
+    let progress_handle = if !args.daemon && !args.tui {
         Some(start_console_progress(state.clone(), registry.clone()))
+    } else {
+        None
+    };
+    let tui_handle = if args.tui {
+        Some(start_tui(state.clone(), cmd_tx.clone()))
     } else {
         None
     };
@@ -1117,6 +1289,48 @@ fn run() -> Result<(), String> {
     } else {
         None
     };
+    if let Some(path) = args.geoip_db.as_ref() {
+        match geoip::GeoIpDb::load(path) {
+            Ok(db) => {
+                log_info!("geoip loaded {} entries from {}", db.len(), path.display());
+                let _ = GEOIP_DB.set(db);
+            }
+            Err(err) => {
+                log_warn!("geoip error: {err}");
+            }
+        }
+    }
+    {
+        let rss_path = args.download_dir.join(".rustorrent").join("rss.benc");
+        let mut rss_state = if rss_path.exists() {
+            rss::load_rss_state(&rss_path).unwrap_or_else(|err| {
+                log_warn!("rss load error: {err}");
+                rss::RssState::new()
+            })
+        } else {
+            rss::RssState::new()
+        };
+        for url in &args.rss_feeds {
+            if !rss_state.feeds.iter().any(|f| f.url == *url) {
+                rss_state.feeds.push(rss::RssFeed {
+                    url: url.clone(),
+                    title: String::new(),
+                    items: Vec::new(),
+                    last_poll: 0,
+                    poll_interval_secs: args.rss_interval,
+                });
+                log_info!("rss added feed: {url}");
+            }
+        }
+        for (feed_url, pattern) in &args.rss_rules {
+            rss_state.rules.push(rss::RssRule {
+                name: pattern.clone(),
+                feed_url: feed_url.clone(),
+                pattern: pattern.clone(),
+            });
+        }
+        let _ = RSS_STATE.set(Mutex::new(rss_state));
+    }
     let inbound = InboundConfig {
         encryption: args.encryption,
         ip_filter: ip_filter.clone(),
@@ -1144,6 +1358,10 @@ fn run() -> Result<(), String> {
 
     let mut queue: VecDeque<TorrentRequest> = VecDeque::new();
     let mut next_id = 1u64;
+    let (rss_poll_tx, rss_poll_rx) = mpsc::channel::<RssPollResult>();
+    let (rss_download_tx, rss_download_rx) = mpsc::channel::<RssDownloadResult>();
+    let mut rss_poll_inflight: HashSet<String> = HashSet::new();
+    let mut rss_download_inflight: HashSet<String> = HashSet::new();
     for entry in session_store.list() {
         let label = if entry.name.is_empty() {
             let short = hex(&entry.info_hash);
@@ -1156,6 +1374,7 @@ fn run() -> Result<(), String> {
             source: TorrentSource::Bytes(entry.torrent_bytes.clone()),
             download_dir: entry.download_dir.clone(),
             preallocate: entry.preallocate,
+            initial_label: entry.label.clone(),
         };
         next_id = next_id.saturating_add(1);
         enqueue_request_with_label(&mut queue, &ui_state, request, label);
@@ -1166,6 +1385,7 @@ fn run() -> Result<(), String> {
             source: TorrentSource::Magnet(link),
             download_dir: args.download_dir.clone(),
             preallocate: args.preallocate,
+            initial_label: String::new(),
         };
         next_id = next_id.saturating_add(1);
         enqueue_request(&mut queue, &ui_state, request);
@@ -1177,6 +1397,7 @@ fn run() -> Result<(), String> {
             source: TorrentSource::Path(path),
             download_dir: args.download_dir.clone(),
             preallocate: args.preallocate,
+            initial_label: String::new(),
         };
         next_id = next_id.saturating_add(1);
         enqueue_request(&mut queue, &ui_state, request);
@@ -1188,8 +1409,8 @@ fn run() -> Result<(), String> {
     let mut last_watch_scan = Instant::now();
 
     loop {
-        if let Some(watch_dir) = args.watch_dir.as_ref() {
-            if last_watch_scan.elapsed() >= Duration::from_secs(5) {
+        if !args.watch_dirs.is_empty() && last_watch_scan.elapsed() >= Duration::from_secs(5) {
+            for watch_dir in &args.watch_dirs {
                 scan_watch_dir(
                     watch_dir,
                     &mut queue,
@@ -1198,8 +1419,8 @@ fn run() -> Result<(), String> {
                     &args.download_dir,
                     args.preallocate,
                 );
-                last_watch_scan = Instant::now();
             }
+            last_watch_scan = Instant::now();
         }
 
         drain_ui_commands(
@@ -1213,6 +1434,45 @@ fn run() -> Result<(), String> {
             &global_down,
             &global_up,
         );
+
+        // Scheduled commands
+        if let Some(schedules) = SCHEDULES.get() {
+            if let Ok(mut sched) = schedules.lock() {
+                for entry in sched.iter_mut() {
+                    if entry.last_run.elapsed().as_secs() >= entry.interval_secs {
+                        execute_schedule_command(
+                            &entry.command,
+                            &global_down,
+                            &global_up,
+                            &registry,
+                        );
+                        entry.last_run = Instant::now();
+                    }
+                }
+            }
+        }
+
+        // RSS feed polling
+        schedule_rss_polls(&args, &rss_poll_tx, &mut rss_poll_inflight);
+        drain_rss_poll_results(
+            &args,
+            &rss_poll_rx,
+            &rss_download_tx,
+            &mut queue,
+            &ui_state,
+            &mut next_id,
+            &mut rss_poll_inflight,
+            &mut rss_download_inflight,
+        );
+        drain_rss_download_results(
+            &args,
+            &rss_download_rx,
+            &mut queue,
+            &ui_state,
+            &mut next_id,
+            &mut rss_download_inflight,
+        );
+
         let can_start = args.max_active_torrents == 0
             || active_torrents.load(Ordering::SeqCst) < args.max_active_torrents;
         if can_start {
@@ -1293,6 +1553,15 @@ fn run() -> Result<(), String> {
     if let Some(handle) = progress_handle {
         let _ = handle.join();
     }
+    if let Some(handle) = tui_handle {
+        let _ = handle.join();
+    }
+
+    // Clean up lock file
+    #[cfg(unix)]
+    if let Some((_, lock_path)) = _lock_file.as_ref() {
+        let _ = fs::remove_file(lock_path);
+    }
 
     Ok(())
 }
@@ -1322,6 +1591,7 @@ fn drain_ui_commands(
                         source: TorrentSource::Bytes(data),
                         download_dir: normalize_download_dir(download_dir, &args.download_dir),
                         preallocate,
+                        initial_label: String::new(),
                     };
                     if let Ok(info_hash) = info_hash_for_source(&request.source) {
                         if is_duplicate_torrent(registry, queue, session_store, info_hash) {
@@ -1354,6 +1624,7 @@ fn drain_ui_commands(
                         source: TorrentSource::Magnet(magnet),
                         download_dir: normalize_download_dir(download_dir, &args.download_dir),
                         preallocate,
+                        initial_label: String::new(),
                     };
                     if let Ok(info_hash) = info_hash_for_source(&request.source) {
                         if is_duplicate_torrent(registry, queue, session_store, info_hash) {
@@ -1440,6 +1711,21 @@ fn drain_ui_commands(
                     }
                     let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
                 }
+                ui::UiCommand::RenameFile {
+                    torrent_id,
+                    file_index,
+                    new_name,
+                    reply,
+                } => {
+                    let result = apply_file_rename(registry, torrent_id, file_index, &new_name);
+                    if let Err(err) = result.as_ref() {
+                        log_warn!("file rename error: {err}");
+                        update_ui(ui_state, |state| {
+                            state.last_error = err.clone();
+                        });
+                    }
+                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
+                }
                 ui::UiCommand::SetRateLimits {
                     download_limit_bps,
                     upload_limit_bps,
@@ -1469,6 +1755,56 @@ fn drain_ui_commands(
                         state.seed_ratio = ratio;
                     });
                     let _ = reply.send(Ok(ui::UiCommandSuccess::Ok));
+                }
+                ui::UiCommand::SetLabel {
+                    torrent_id,
+                    label,
+                    reply,
+                } => {
+                    let result =
+                        set_torrent_label(registry, ui_state, session_store, torrent_id, &label);
+                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
+                }
+                ui::UiCommand::AddTracker {
+                    torrent_id,
+                    url,
+                    reply,
+                } => {
+                    let result = add_torrent_tracker(registry, ui_state, torrent_id, &url);
+                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
+                }
+                ui::UiCommand::RemoveTracker {
+                    torrent_id,
+                    url,
+                    reply,
+                } => {
+                    let result = remove_torrent_tracker(registry, ui_state, torrent_id, &url);
+                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
+                }
+                ui::UiCommand::AddRssFeed {
+                    url,
+                    interval,
+                    reply,
+                } => {
+                    let result = rss_add_feed(&url, interval, &args.download_dir);
+                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
+                }
+                ui::UiCommand::RemoveRssFeed { url, reply } => {
+                    let result = rss_remove_feed(&url, &args.download_dir);
+                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
+                }
+                ui::UiCommand::AddRssRule {
+                    name,
+                    feed_url,
+                    pattern,
+                    reply,
+                } => {
+                    let result = rss_add_rule(&name, &feed_url, &pattern, &args.download_dir);
+                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
+                }
+                ui::UiCommand::RemoveRssRule { name, reply } => {
+                    let result = rss_remove_rule(&name, &args.download_dir);
+                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
                 }
             },
             Err(mpsc::TryRecvError::Empty) => break,
@@ -1604,7 +1940,11 @@ fn run_torrent(
         encryption: args.encryption,
         utp,
         ip_filter: ip_filter.clone(),
+        proxy: args.proxy.clone(),
     };
+    if args.proxy.is_some() {
+        log_info!("proxy: configured, disabling DHT/UTP/UDP trackers");
+    }
     let data = resolve_torrent_data(&request, args.port, dht, &connect_cfg)?;
     let meta = torrent::parse_torrent(&data).map_err(|err| format!("parse error: {err}"))?;
     let file_spans = Arc::new(build_file_spans(&meta));
@@ -1777,6 +2117,14 @@ fn run_torrent(
             torrent.paused = paused;
             torrent.last_error.clear();
             torrent.files = ui_files.clone();
+            torrent.trackers = trackers
+                .http
+                .iter()
+                .chain(trackers.udp.iter())
+                .cloned()
+                .collect();
+            torrent.label = request.initial_label.clone();
+            torrent.meta_version = meta.meta_version;
         });
     });
 
@@ -1785,6 +2133,11 @@ fn run_torrent(
     let completed_log = Arc::new(Mutex::new(Vec::new()));
     let peer_tags = Arc::new(AtomicU64::new(1));
     let upload_manager = Arc::new(UploadManager::new(UPLOAD_SLOTS));
+    let shared_trackers = Arc::new(Mutex::new(trackers.clone()));
+    let initial_renames: HashMap<usize, String> = resume_data
+        .as_ref()
+        .map(|r| r.file_renames.iter().cloned().collect())
+        .unwrap_or_default();
     let context = Arc::new(TorrentContext {
         id: request.id,
         info_hash: meta.info_hash,
@@ -1803,6 +2156,11 @@ fn run_torrent(
         stop_requested: Arc::clone(&stop_flag),
         upload_manager: Arc::clone(&upload_manager),
         peer_tags: Arc::clone(&peer_tags),
+        label: Arc::new(Mutex::new(request.initial_label.clone())),
+        trackers: Arc::clone(&shared_trackers),
+        throttle_group: Arc::new(Mutex::new(None)),
+        ratio_group: Arc::new(Mutex::new(None)),
+        file_renames: Arc::new(Mutex::new(initial_renames)),
     });
     register_session(registry, Arc::clone(&context));
     let resume_handle = start_resume_worker(
@@ -1817,6 +2175,7 @@ fn run_torrent(
         Arc::clone(&uploaded),
         Arc::clone(&peer_queue),
         Arc::clone(&stop_flag),
+        Arc::clone(&context.file_renames),
     );
     let webseed_handle = start_webseed_worker(
         web_seeds.clone(),
@@ -1941,6 +2300,7 @@ fn run_torrent(
             handles.push(handle);
         }
 
+        let mut seed_start: Option<Instant> = None;
         while !torrent_stop_requested(&stop_flag) {
             let is_complete = {
                 let p = pieces.lock().unwrap();
@@ -2022,7 +2382,8 @@ fn run_torrent(
                 };
                 log_info!("announcing to trackers...");
 
-                for tracker_url in &trackers.http {
+                let current_trackers = shared_trackers.lock().unwrap().clone();
+                for tracker_url in &current_trackers.http {
                     match tracker::announce_with_private(
                         tracker_url,
                         meta.info_hash,
@@ -2065,7 +2426,7 @@ fn run_torrent(
                     }
                 }
 
-                for tracker_url in &trackers.udp {
+                for tracker_url in &current_trackers.udp {
                     match udp_tracker::announce(
                         tracker_url,
                         meta.info_hash,
@@ -2157,6 +2518,29 @@ fn run_torrent(
                 });
             });
 
+            // Max seed time check
+            if is_complete {
+                if seed_start.is_none() {
+                    seed_start = Some(Instant::now());
+                }
+                if let Some(start) = seed_start {
+                    let max = MAX_SEED_TIME_SECS.load(Ordering::SeqCst);
+                    if max > 0 && start.elapsed().as_secs() >= max {
+                        log_info!("max seed time reached, stopping");
+                        stop_flag.store(true, Ordering::SeqCst);
+                    }
+                }
+                // Check ratio group
+                let rg = context.ratio_group.lock().unwrap().clone();
+                check_ratio_group(
+                    &rg,
+                    &context.uploaded,
+                    &context.downloaded,
+                    &stop_flag,
+                    &paused_flag,
+                );
+            }
+
             sleep_with_shutdown_or_stop(Duration::from_secs(1), &stop_flag);
         }
 
@@ -2168,8 +2552,9 @@ fn run_torrent(
             let downloaded = downloaded.load(Ordering::SeqCst);
             let uploaded = uploaded.load(Ordering::SeqCst);
             let left = total_length.saturating_sub(completed_bytes);
+            let stop_trackers = shared_trackers.lock().unwrap().clone();
             log_info!("sending tracker stopped event...");
-            for tracker_url in &trackers.http {
+            for tracker_url in &stop_trackers.http {
                 let _ = tracker::announce_with_private(
                     tracker_url,
                     meta.info_hash,
@@ -2183,7 +2568,7 @@ fn run_torrent(
                     meta.info.private,
                 );
             }
-            for tracker_url in &trackers.udp {
+            for tracker_url in &stop_trackers.udp {
                 let _ = udp_tracker::announce(
                     tracker_url,
                     meta.info_hash,
@@ -2239,6 +2624,31 @@ fn run_torrent(
         if let Some(dest) = args.move_completed.as_ref() {
             move_completed_files(&meta, &request.download_dir, dest);
         }
+        if let Some(script) = ON_COMPLETE_SCRIPT.get() {
+            let script = script.clone();
+            let torrent_name = name.clone();
+            let torrent_dir = request.download_dir.display().to_string();
+            let torrent_hash = hex(&meta.info_hash);
+            let torrent_size = meta.info.total_length();
+            thread::spawn(move || {
+                match std::process::Command::new(&script)
+                    .env("TORRENT_NAME", &torrent_name)
+                    .env("TORRENT_DIR", &torrent_dir)
+                    .env("TORRENT_HASH", &torrent_hash)
+                    .env("TORRENT_SIZE", torrent_size.to_string())
+                    .output()
+                {
+                    Ok(out) => {
+                        if !out.status.success() {
+                            log_warn!("on-complete script exited {}", out.status);
+                        }
+                    }
+                    Err(err) => {
+                        log_warn!("on-complete script error: {err}");
+                    }
+                }
+            });
+        }
     }
 
     if !meta.info.private {
@@ -2271,6 +2681,7 @@ fn resolve_torrent_data(
 
 struct MagnetMeta {
     info_hash: [u8; 20],
+    info_hash_v2: Option<[u8; 32]>,
     sources: Vec<String>,
     trackers: Vec<String>,
     web_seeds: Vec<String>,
@@ -2415,6 +2826,7 @@ fn parse_magnet(link: &str) -> Result<MagnetMeta, String> {
         .strip_prefix("magnet:?")
         .ok_or_else(|| "invalid magnet link".to_string())?;
     let mut info_hash: Option<[u8; 20]> = None;
+    let mut info_hash_v2: Option<[u8; 32]> = None;
     let mut sources = Vec::new();
     let mut trackers = Vec::new();
     let mut web_seeds = Vec::new();
@@ -2425,6 +2837,15 @@ fn parse_magnet(link: &str) -> Result<MagnetMeta, String> {
                 let lower = value.to_ascii_lowercase();
                 if let Some(rest) = lower.strip_prefix("urn:btih:") {
                     info_hash = parse_info_hash(rest);
+                } else if let Some(rest) = lower.strip_prefix("urn:btmh:") {
+                    if let Some(hash) = parse_multihash_sha256(rest) {
+                        if info_hash.is_none() {
+                            let mut truncated = [0u8; 20];
+                            truncated.copy_from_slice(&hash[..20]);
+                            info_hash = Some(truncated);
+                        }
+                        info_hash_v2 = Some(hash);
+                    }
                 }
             }
             "xs" | "as" => {
@@ -2453,6 +2874,7 @@ fn parse_magnet(link: &str) -> Result<MagnetMeta, String> {
     let info_hash = info_hash.ok_or_else(|| "magnet missing info hash".to_string())?;
     Ok(MagnetMeta {
         info_hash,
+        info_hash_v2,
         sources,
         trackers,
         web_seeds,
@@ -2483,6 +2905,27 @@ fn decode_hex_20(value: &str) -> Option<[u8; 20]> {
         out[idx] = (hi << 4) | lo;
     }
     Some(out)
+}
+
+fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (idx, chunk) in bytes.chunks_exact(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)? as u8;
+        let lo = (chunk[1] as char).to_digit(16)? as u8;
+        out[idx] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn parse_multihash_sha256(value: &str) -> Option<[u8; 32]> {
+    // Multihash format: 1220<64 hex chars>
+    // 12 = SHA-256 function code, 20 = 32 bytes (0x20) digest length
+    let rest = value.strip_prefix("1220")?;
+    decode_hex_32(rest)
 }
 
 fn decode_base32_20(value: &str) -> Option<[u8; 20]> {
@@ -3449,20 +3892,40 @@ fn build_file_spans(meta: &torrent::TorrentMeta) -> Vec<FileSpan> {
         }];
     }
 
-    let mut spans = Vec::with_capacity(meta.info.files.len());
+    let mut spans = if !meta.info.files.is_empty() {
+        Vec::with_capacity(meta.info.files.len())
+    } else {
+        Vec::with_capacity(meta.info.file_tree.len())
+    };
     let mut offset = 0u64;
-    for file in &meta.info.files {
-        let mut path = name.clone();
-        for segment in &file.path {
-            path.push('/');
-            path.push_str(&String::from_utf8_lossy(segment));
+    if !meta.info.files.is_empty() {
+        for file in &meta.info.files {
+            let mut path = name.clone();
+            for segment in &file.path {
+                path.push('/');
+                path.push_str(&String::from_utf8_lossy(segment));
+            }
+            spans.push(FileSpan {
+                path,
+                offset,
+                length: file.length,
+            });
+            offset = offset.saturating_add(file.length);
         }
-        spans.push(FileSpan {
-            path,
-            offset,
-            length: file.length,
-        });
-        offset = offset.saturating_add(file.length);
+    } else {
+        for file in &meta.info.file_tree {
+            let mut path = name.clone();
+            for segment in &file.path {
+                path.push('/');
+                path.push_str(&String::from_utf8_lossy(segment));
+            }
+            spans.push(FileSpan {
+                path,
+                offset,
+                length: file.length,
+            });
+            offset = offset.saturating_add(file.length);
+        }
     }
     spans
 }
@@ -3599,7 +4062,7 @@ fn start_webseed_worker(
                 None => break,
             };
             let expected = match p.piece_hash(index) {
-                Some(hash) => hash,
+                Some(hash) => hash.clone(),
                 None => break,
             };
             (index, length, expected)
@@ -3618,8 +4081,7 @@ fn start_webseed_worker(
                 continue;
             }
         };
-        let actual = sha1::sha1(&data);
-        if actual != expected {
+        if !verify_piece_hash(&data, &expected) {
             sleep_with_shutdown_or_stop(Duration::from_secs(1), &stop_flag);
             continue;
         }
@@ -3696,6 +4158,7 @@ fn start_resume_worker(
     uploaded: Arc<AtomicU64>,
     peer_queue: Arc<Mutex<PeerQueue>>,
     stop_flag: Arc<AtomicBool>,
+    file_renames: Arc<Mutex<HashMap<usize, String>>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut last_save = Instant::now() - RESUME_SAVE_INTERVAL;
@@ -3718,6 +4181,10 @@ fn start_resume_worker(
                     .lock()
                     .map(|queue| queue.sample(256))
                     .unwrap_or_default();
+                let renames: Vec<(usize, String)> = file_renames
+                    .lock()
+                    .map(|map| map.iter().map(|(k, v)| (*k, v.clone())).collect())
+                    .unwrap_or_default();
                 if let Ok(p) = pieces.lock() {
                     let _ = save_resume_snapshot(
                         &resume_path,
@@ -3730,6 +4197,7 @@ fn start_resume_worker(
                         downloaded,
                         uploaded,
                         peers,
+                        &renames,
                     );
                 }
                 last_save = Instant::now();
@@ -3891,6 +4359,10 @@ fn peer_worker_loop(
             break;
         }
         active_peers.fetch_add(1, Ordering::SeqCst);
+        let geo_cc = GEOIP_DB
+            .get()
+            .and_then(|db| db.lookup(addr.ip()))
+            .map(|cc| cc.to_string());
         update_ui(ui_state, |state| {
             let active_count = active_peers.load(Ordering::SeqCst);
             if state.current_id == Some(torrent_id) {
@@ -3898,6 +4370,9 @@ fn peer_worker_loop(
             }
             update_torrent_entry(state, torrent_id, |torrent| {
                 torrent.active_peers = active_count;
+                if let Some(cc) = geo_cc.as_deref() {
+                    add_peer_country(torrent, cc);
+                }
             });
         });
         log_info!("connecting to peer {addr}...");
@@ -3935,6 +4410,9 @@ fn peer_worker_loop(
             }
             update_torrent_entry(state, torrent_id, |torrent| {
                 torrent.active_peers = active_count;
+                if let Some(cc) = geo_cc.as_deref() {
+                    remove_peer_country(torrent, cc);
+                }
             });
         });
 
@@ -3982,6 +4460,7 @@ struct ResumeData {
     downloaded: u64,
     uploaded: u64,
     peers: Vec<SocketAddr>,
+    file_renames: Vec<(usize, String)>,
 }
 
 struct ResumeFileStat {
@@ -4102,8 +4581,7 @@ fn verify_piece(
     let expected = pieces
         .piece_hash(index)
         .ok_or_else(|| "missing piece hash".to_string())?;
-    let actual = sha1::sha1(target);
-    if actual == expected {
+    if verify_piece_hash(target, expected) {
         pieces
             .mark_piece_complete(index)
             .map_err(|err| format!("resume mark failed: {err}"))?;
@@ -4184,6 +4662,10 @@ fn parse_session_entries(
             _ => root.to_path_buf(),
         };
         let preallocate = dict_get_int(&items, b"preallocate").unwrap_or(0) != 0;
+        let label = match dict_get(&items, b"label") {
+            Some(Value::Bytes(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+            _ => String::new(),
+        };
         entries.insert(
             info_hash,
             SessionEntry {
@@ -4192,6 +4674,7 @@ fn parse_session_entries(
                 torrent_bytes,
                 download_dir,
                 preallocate,
+                label,
             },
         );
     }
@@ -4256,6 +4739,12 @@ fn save_session(path: &Path, entries: &HashMap<[u8; 20], SessionEntry>) -> Resul
             b"preallocate".to_vec(),
             Value::Int(if entry.preallocate { 1 } else { 0 }),
         ));
+        if !entry.label.is_empty() {
+            dict.push((
+                b"label".to_vec(),
+                Value::Bytes(entry.label.as_bytes().to_vec()),
+            ));
+        }
         list.push(Value::Dict(dict));
     }
     let value = Value::List(list);
@@ -4333,6 +4822,23 @@ fn parse_resume_data(data: &[u8]) -> Result<ResumeData, String> {
             .collect(),
         _ => Vec::new(),
     };
+    let file_renames = match dict_get(&dict, b"file_renames") {
+        Some(Value::List(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::Dict(values) => {
+                    let idx = dict_get_int(values, b"index")?;
+                    let name = match dict_get(values, b"name") {
+                        Some(Value::Bytes(bytes)) => String::from_utf8(bytes.clone()).ok()?,
+                        _ => return None,
+                    };
+                    Some((idx as usize, name))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     Ok(ResumeData {
         info_hash,
         piece_length: piece_length as u64,
@@ -4342,6 +4848,7 @@ fn parse_resume_data(data: &[u8]) -> Result<ResumeData, String> {
         downloaded,
         uploaded,
         peers,
+        file_renames,
     })
 }
 
@@ -4387,6 +4894,7 @@ fn save_resume_snapshot(
     downloaded: u64,
     uploaded: u64,
     peers: Vec<SocketAddr>,
+    file_renames: &[(usize, String)],
 ) -> Result<(), String> {
     let bitfield = build_bitfield(pieces);
     let files = collect_file_stats(file_spans, download_dir);
@@ -4400,6 +4908,7 @@ fn save_resume_snapshot(
         downloaded,
         uploaded,
         peers,
+        file_renames,
     )
 }
 
@@ -4413,6 +4922,7 @@ fn save_resume_data(
     downloaded: u64,
     uploaded: u64,
     peers: Vec<SocketAddr>,
+    file_renames: &[(usize, String)],
 ) -> Result<(), String> {
     let mut dict = Vec::new();
     dict.push((b"info_hash".to_vec(), Value::Bytes(info_hash.to_vec())));
@@ -4445,6 +4955,18 @@ fn save_resume_data(
         .map(|addr| Value::Bytes(addr.to_string().into_bytes()))
         .collect();
     dict.push((b"peers".to_vec(), Value::List(peers_list)));
+    if !file_renames.is_empty() {
+        let renames_list = file_renames
+            .iter()
+            .map(|(idx, name)| {
+                Value::Dict(vec![
+                    (b"index".to_vec(), Value::Int(*idx as i64)),
+                    (b"name".to_vec(), Value::Bytes(name.as_bytes().to_vec())),
+                ])
+            })
+            .collect();
+        dict.push((b"file_renames".to_vec(), Value::List(renames_list)));
+    }
     let data = bencode::encode(&Value::Dict(dict));
     write_atomic_file(path, &data, "resume", true)
 }
@@ -4500,11 +5022,23 @@ struct Args {
     write_cache_bytes: usize,
     sequential: bool,
     move_completed: Option<PathBuf>,
-    watch_dir: Option<PathBuf>,
     log_path: Option<PathBuf>,
     daemon: bool,
     pid_file: Option<PathBuf>,
     seed_ratio: f64,
+    max_seed_time: u64,
+    on_complete: Option<PathBuf>,
+    watch_dirs: Vec<PathBuf>,
+    super_seed: bool,
+    tui: bool,
+    proxy: Option<proxy::ProxyConfig>,
+    geoip_db: Option<PathBuf>,
+    rss_feeds: Vec<String>,
+    rss_rules: Vec<(String, String)>,
+    rss_interval: u64,
+    throttle_groups: Vec<(String, u64, u64)>,
+    ratio_groups: Vec<(String, f64, String)>,
+    schedules: Vec<(u64, String)>,
 }
 
 #[derive(Default)]
@@ -4527,6 +5061,7 @@ struct ConfigOverrides {
     torrent_download_rate: Option<u64>,
     torrent_upload_rate: Option<u64>,
     write_cache_bytes: Option<usize>,
+    geoip_db: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -4566,11 +5101,23 @@ fn parse_args() -> Result<Args, String> {
     let mut write_cache_bytes = 0usize;
     let mut sequential = false;
     let mut move_completed: Option<PathBuf> = None;
-    let mut watch_dir: Option<PathBuf> = None;
     let mut log_path: Option<PathBuf> = None;
     let mut daemon = false;
     let mut pid_file: Option<PathBuf> = None;
     let mut seed_ratio = 0.0f64;
+    let mut max_seed_time = 0u64;
+    let mut on_complete: Option<PathBuf> = None;
+    let mut watch_dirs: Vec<PathBuf> = Vec::new();
+    let mut super_seed = false;
+    let mut tui = false;
+    let mut proxy_config: Option<proxy::ProxyConfig> = None;
+    let mut geoip_path: Option<PathBuf> = None;
+    let mut rss_feeds: Vec<String> = Vec::new();
+    let mut rss_rules: Vec<(String, String)> = Vec::new();
+    let mut rss_interval = 900u64;
+    let mut throttle_groups: Vec<(String, u64, u64)> = Vec::new();
+    let mut ratio_groups: Vec<(String, f64, String)> = Vec::new();
+    let mut schedules: Vec<(u64, String)> = Vec::new();
 
     if let Some(cfg) = config_overrides.as_ref() {
         apply_overrides(
@@ -4593,6 +5140,7 @@ fn parse_args() -> Result<Args, String> {
             &mut torrent_download_rate,
             &mut torrent_upload_rate,
             &mut write_cache_bytes,
+            &mut geoip_path,
         );
     }
     apply_overrides(
@@ -4615,6 +5163,7 @@ fn parse_args() -> Result<Args, String> {
         &mut torrent_download_rate,
         &mut torrent_upload_rate,
         &mut write_cache_bytes,
+        &mut geoip_path,
     );
 
     let mut idx = 0usize;
@@ -4841,6 +5390,125 @@ fn parse_args() -> Result<Args, String> {
             idx += 2;
             continue;
         }
+        if arg == "--max-seed-time" {
+            let value = args_list
+                .get(idx + 1)
+                .ok_or_else(|| "missing value for --max-seed-time".to_string())?;
+            max_seed_time = value
+                .parse::<u64>()
+                .map_err(|_| "invalid value for --max-seed-time".to_string())?;
+            idx += 2;
+            continue;
+        }
+        if arg == "--on-complete" {
+            let value = args_list
+                .get(idx + 1)
+                .ok_or_else(|| "missing value for --on-complete".to_string())?;
+            on_complete = Some(PathBuf::from(value));
+            idx += 2;
+            continue;
+        }
+        if arg == "--super-seed" {
+            super_seed = true;
+            idx += 1;
+            continue;
+        }
+        if arg == "--proxy" {
+            let value = args_list
+                .get(idx + 1)
+                .ok_or_else(|| "missing value for --proxy".to_string())?;
+            proxy_config = Some(proxy::ProxyConfig::parse(value)?);
+            idx += 2;
+            continue;
+        }
+        if arg == "--geoip-db" {
+            let value = args_list
+                .get(idx + 1)
+                .ok_or_else(|| "missing value for --geoip-db".to_string())?;
+            geoip_path = Some(PathBuf::from(value));
+            idx += 2;
+            continue;
+        }
+        if arg == "--rss" {
+            let value = args_list
+                .get(idx + 1)
+                .ok_or_else(|| "missing value for --rss".to_string())?;
+            rss_feeds.push(value.clone());
+            idx += 2;
+            continue;
+        }
+        if arg == "--rss-rule" {
+            let value = args_list
+                .get(idx + 1)
+                .ok_or_else(|| "missing value for --rss-rule".to_string())?;
+            let (feed_url, pattern) = parse_rss_rule_arg(value)?;
+            rss_rules.push((feed_url.to_string(), pattern.to_string()));
+            idx += 2;
+            continue;
+        }
+        if arg == "--rss-interval" {
+            let value = args_list
+                .get(idx + 1)
+                .ok_or_else(|| "missing value for --rss-interval".to_string())?;
+            rss_interval = value
+                .parse::<u64>()
+                .map_err(|_| "invalid value for --rss-interval".to_string())?;
+            idx += 2;
+            continue;
+        }
+        if arg == "--tui" {
+            tui = true;
+            idx += 1;
+            continue;
+        }
+        if arg == "--throttle" {
+            let value = args_list
+                .get(idx + 1)
+                .ok_or_else(|| "missing value for --throttle".to_string())?;
+            let parts: Vec<&str> = value.splitn(3, ':').collect();
+            if parts.len() != 3 {
+                return Err("--throttle format: name:down_kbps:up_kbps".to_string());
+            }
+            let down = parts[1]
+                .parse::<u64>()
+                .map_err(|_| "invalid throttle down rate".to_string())?
+                * 1024;
+            let up = parts[2]
+                .parse::<u64>()
+                .map_err(|_| "invalid throttle up rate".to_string())?
+                * 1024;
+            throttle_groups.push((parts[0].to_string(), down, up));
+            idx += 2;
+            continue;
+        }
+        if arg == "--ratio-group" {
+            let value = args_list
+                .get(idx + 1)
+                .ok_or_else(|| "missing value for --ratio-group".to_string())?;
+            let parts: Vec<&str> = value.splitn(3, ':').collect();
+            if parts.len() != 3 {
+                return Err("--ratio-group format: name:ratio:action".to_string());
+            }
+            let ratio = parts[1]
+                .parse::<f64>()
+                .map_err(|_| "invalid ratio-group ratio".to_string())?;
+            let action = parts[2].to_string();
+            if !matches!(action.as_str(), "stop" | "pause" | "none") {
+                return Err("ratio-group action must be stop, pause, or none".to_string());
+            }
+            ratio_groups.push((parts[0].to_string(), ratio, action));
+            idx += 2;
+            continue;
+        }
+        if arg == "--schedule" {
+            let value = args_list
+                .get(idx + 1)
+                .ok_or_else(|| "missing value for --schedule".to_string())?;
+            let (interval, command) = parse_schedule_arg(value)?;
+            schedules.push((interval, command.to_string()));
+            idx += 2;
+            continue;
+        }
         if arg == "--create" {
             let source = args_list
                 .get(idx + 1)
@@ -4897,7 +5565,7 @@ fn parse_args() -> Result<Args, String> {
             let value = args_list
                 .get(idx + 1)
                 .ok_or_else(|| "missing value for --watch".to_string())?;
-            watch_dir = Some(PathBuf::from(value));
+            watch_dirs.push(PathBuf::from(value));
             idx += 2;
             continue;
         }
@@ -4925,9 +5593,15 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    if torrent_path.is_none() && magnet.is_none() && !ui && watch_dir.is_none() {
+    if torrent_path.is_none()
+        && magnet.is_none()
+        && !ui
+        && !tui
+        && watch_dirs.is_empty()
+        && rss_feeds.is_empty()
+    {
         return Err(
-            "usage: rustorrent [path.torrent] [--magnet <link>] [--config <path>] [--download-dir <dir>] [--preallocate] [--sequential] [--move-completed <dir>] [--watch <dir>] [--ui] [--ui-addr <addr>] [--retry-interval <secs>] [--numwant <n>] [--port <port>] [--encryption <disable|prefer|require>] [--no-encryption] [--utp|--no-utp] [--blocklist <path>] [--max-active <n>] [--max-peers <n>] [--max-peers-torrent <n>] [--download-rate <bps>] [--upload-rate <bps>] [--torrent-download-rate <bps>] [--torrent-upload-rate <bps>] [--write-cache <bytes>] [--log <path>] [--daemon] [--pid-file <path>] [--seed-ratio <ratio>] [--create <path> --tracker <url> --output <file>]".to_string(),
+            "usage: rustorrent [path.torrent] [--magnet <link>] [--config <path>] [--download-dir <dir>] [--preallocate] [--sequential] [--move-completed <dir>] [--watch <dir>] [--ui] [--ui-addr <addr>] [--tui] [--retry-interval <secs>] [--numwant <n>] [--port <port>] [--encryption <disable|prefer|require>] [--no-encryption] [--utp|--no-utp] [--blocklist <path>] [--max-active <n>] [--max-peers <n>] [--max-peers-torrent <n>] [--download-rate <bps>] [--upload-rate <bps>] [--torrent-download-rate <bps>] [--torrent-upload-rate <bps>] [--write-cache <bytes>] [--log <path>] [--daemon] [--pid-file <path>] [--seed-ratio <ratio>] [--max-seed-time <minutes>] [--on-complete <script>] [--super-seed] [--throttle <name:down_kbps:up_kbps>] [--ratio-group <name:ratio:action>] [--schedule <interval_secs:command>] [--rss <url>] [--rss-rule <feed_url:pattern>] [--rss-interval <secs>] [--create <path> --tracker <url> --output <file>]".to_string(),
         );
     }
     if max_peers_torrent == 0 {
@@ -4957,11 +5631,23 @@ fn parse_args() -> Result<Args, String> {
         write_cache_bytes,
         sequential,
         move_completed,
-        watch_dir,
+        watch_dirs,
         log_path,
         daemon,
         pid_file,
         seed_ratio,
+        max_seed_time,
+        on_complete,
+        super_seed,
+        tui,
+        proxy: proxy_config,
+        geoip_db: geoip_path,
+        rss_feeds,
+        rss_rules,
+        rss_interval,
+        throttle_groups,
+        ratio_groups,
+        schedules,
     })
 }
 
@@ -5002,6 +5688,35 @@ fn parse_rate(value: &str) -> Result<u64, String> {
     Ok(base.saturating_mul(multiplier))
 }
 
+fn parse_rss_rule_arg(value: &str) -> Result<(&str, &str), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("missing value for --rss-rule".to_string());
+    }
+    if let Some((feed_url, pattern)) = trimmed.rsplit_once(':') {
+        if pattern.trim().is_empty() {
+            return Err("rss rule pattern is empty".to_string());
+        }
+        Ok((feed_url, pattern))
+    } else {
+        Ok(("", trimmed))
+    }
+}
+
+fn parse_schedule_arg(value: &str) -> Result<(u64, &str), String> {
+    if let Some((interval_str, command)) = value.split_once(':') {
+        let interval = interval_str
+            .parse::<u64>()
+            .map_err(|_| "invalid schedule interval".to_string())?;
+        if interval == 0 {
+            return Err("schedule interval must be > 0".to_string());
+        }
+        Ok((interval, command))
+    } else {
+        Err("--schedule format: interval_secs:command".to_string())
+    }
+}
+
 fn apply_overrides(
     cfg: &ConfigOverrides,
     download_dir: &mut PathBuf,
@@ -5022,6 +5737,7 @@ fn apply_overrides(
     torrent_download_rate: &mut u64,
     torrent_upload_rate: &mut u64,
     write_cache_bytes: &mut usize,
+    geoip_path: &mut Option<PathBuf>,
 ) {
     if let Some(dir) = cfg.download_dir.clone() {
         *download_dir = dir;
@@ -5077,6 +5793,9 @@ fn apply_overrides(
     if let Some(value) = cfg.write_cache_bytes {
         *write_cache_bytes = value;
     }
+    if let Some(value) = cfg.geoip_db.clone() {
+        *geoip_path = Some(value);
+    }
 }
 
 fn load_config_overrides(path: &Path) -> Result<ConfigOverrides, String> {
@@ -5121,6 +5840,7 @@ fn load_config_overrides(path: &Path) -> Result<ConfigOverrides, String> {
             "torrent_download_rate" => cfg.torrent_download_rate = parse_rate(value).ok(),
             "torrent_upload_rate" => cfg.torrent_upload_rate = parse_rate(value).ok(),
             "write_cache" => cfg.write_cache_bytes = parse_rate(value).ok().map(|v| v as usize),
+            "geoip_db" | "geoip" => cfg.geoip_db = Some(PathBuf::from(value)),
             _ => return Err(format!("config line {} unknown key", line_no + 1)),
         }
     }
@@ -5202,6 +5922,14 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+fn verify_piece_hash(data: &[u8], expected: &piece::PieceHash) -> bool {
+    match expected {
+        piece::PieceHash::Sha1(h) => sha1::sha1(data) == *h,
+        piece::PieceHash::Sha256(h) => sha256::sha256(data) == *h,
+    }
+}
+
+#[derive(Clone)]
 struct TrackerSet {
     http: Vec<String>,
     udp: Vec<String>,
@@ -5342,7 +6070,26 @@ fn download_from_peer_concurrent(
         let seed = p.is_complete();
         (bits, have, seed)
     };
-    if have_pieces {
+    let super_seed_mode = seed_mode && SUPER_SEED.load(Ordering::SeqCst);
+    let mut super_seed_piece: Option<u32> = None;
+    if super_seed_mode && have_pieces {
+        // BEP 16: send HAVE for only one piece instead of full bitfield
+        let piece_count = {
+            let p = pieces.lock().unwrap();
+            p.piece_count()
+        };
+        if piece_count > 0 {
+            // Pick a random piece to advertise
+            let mut seed_val = std::process::id() as u64;
+            seed_val ^= Instant::now().elapsed().as_nanos() as u64;
+            seed_val ^= seed_val << 13;
+            seed_val ^= seed_val >> 7;
+            let idx = (seed_val % piece_count as u64) as u32;
+            peer::write_message(&mut stream, &peer::Message::Have(idx))
+                .map_err(|err| format!("super-seed have write failed: {err}"))?;
+            super_seed_piece = Some(idx);
+        }
+    } else if have_pieces {
         peer::write_message(&mut stream, &peer::Message::Bitfield(local_bitfield))
             .map_err(|err| format!("bitfield write failed: {err}"))?;
     }
@@ -5432,7 +6179,9 @@ fn download_from_peer_concurrent(
             }
 
             // Snub detection: disconnect peer if no data for 60s while unchoked
-            if !choked && !seed_mode && active_piece.is_some()
+            if !choked
+                && !seed_mode
+                && active_piece.is_some()
                 && last_piece_data.elapsed() > SNUB_TIMEOUT
             {
                 return Err("peer snubbed (no data for 60s while unchoked)".to_string());
@@ -5706,6 +6455,20 @@ fn download_from_peer_concurrent(
                                     }
                                 }
                             }
+                            // Super seed: peer redistributed our piece, advertise next
+                            if super_seed_mode {
+                                if super_seed_piece == Some(index) {
+                                    let piece_count = p.piece_count();
+                                    if piece_count > 0 {
+                                        let next = (index + 1) % piece_count as u32;
+                                        let _ = peer::write_message(
+                                            &mut stream,
+                                            &peer::Message::Have(next),
+                                        );
+                                        super_seed_piece = Some(next);
+                                    }
+                                }
+                            }
                         }
                         peer::Message::Interested => {
                             peer_interested = true;
@@ -5832,9 +6595,9 @@ fn download_from_peer_concurrent(
                                         let p = pieces.lock().unwrap();
                                         p.piece_hash(index)
                                             .ok_or_else(|| "missing piece hash".to_string())?
+                                            .clone()
                                     };
-                                    let actual = sha1::sha1(active.data());
-                                    if actual == expected {
+                                    if verify_piece_hash(active.data(), &expected) {
                                         let offset =
                                             (index as u64).saturating_mul(base_piece_length);
                                         {
@@ -6026,6 +6789,21 @@ fn download_from_peer_concurrent(
     result
 }
 
+fn bind_tcp_dual_stack(port: u16) -> Result<TcpListener, String> {
+    use std::net::Ipv6Addr;
+    let v6_addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+    match TcpListener::bind(v6_addr) {
+        Ok(listener) => {
+            log_info!("listening on [::] (dual-stack) port {port}");
+            Ok(listener)
+        }
+        Err(_) => {
+            let v4_addr = SocketAddr::from(([0, 0, 0, 0], port));
+            TcpListener::bind(v4_addr).map_err(|e| format!("bind port {port}: {e}"))
+        }
+    }
+}
+
 fn connect_peer(addr: SocketAddr, connect_cfg: &ConnectionConfig) -> Result<PeerStream, String> {
     connect_peer_for_metadata(addr, connect_cfg)
 }
@@ -6040,6 +6818,13 @@ fn connect_peer_for_metadata(
         }
     }
 
+    if let Some(proxy_cfg) = connect_cfg.proxy.as_ref() {
+        let stream = proxy::connect_through_proxy(proxy_cfg, addr, Duration::from_secs(10))
+            .map_err(|err| format!("proxy connect {addr} failed: {err}"))?;
+        let _ = stream.set_nodelay(true);
+        return Ok(PeerStream::tcp(stream));
+    }
+
     let tcp_result = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .map_err(|err| format!("connect {addr} failed: {err}"));
     if let Ok(stream) = tcp_result {
@@ -6049,10 +6834,8 @@ fn connect_peer_for_metadata(
     let tcp_err = tcp_result.err();
 
     if let Some(connector) = connect_cfg.utp.as_ref() {
-        if matches!(addr.ip(), std::net::IpAddr::V4(_)) {
-            if let Ok(stream) = connector.connect(addr) {
-                return Ok(PeerStream::utp(stream));
-            }
+        if let Ok(stream) = connector.connect(addr) {
+            return Ok(PeerStream::utp(stream));
         }
     }
 
@@ -6199,13 +6982,93 @@ fn find_context_by_id(registry: &SessionRegistry, torrent_id: u64) -> Option<Arc
     guard.values().find(|ctx| ctx.id == torrent_id).cloned()
 }
 
+fn set_torrent_label(
+    registry: &SessionRegistry,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    session_store: &Arc<SessionStore>,
+    torrent_id: u64,
+    label: &str,
+) -> Result<(), String> {
+    let context =
+        find_context_by_id(registry, torrent_id).ok_or_else(|| "torrent not found".to_string())?;
+    *context.label.lock().unwrap() = label.to_string();
+    session_store.set_label(context.info_hash, label);
+    update_ui(ui_state, |state| {
+        update_torrent_entry(state, torrent_id, |torrent| {
+            torrent.label = label.to_string();
+        });
+    });
+    Ok(())
+}
+
+fn add_torrent_tracker(
+    registry: &SessionRegistry,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    torrent_id: u64,
+    url: &str,
+) -> Result<(), String> {
+    let context =
+        find_context_by_id(registry, torrent_id).ok_or_else(|| "torrent not found".to_string())?;
+    let mut trackers = context.trackers.lock().unwrap();
+    if url.starts_with("udp://") {
+        if !trackers.udp.contains(&url.to_string()) {
+            trackers.udp.push(url.to_string());
+        }
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        if !trackers.http.contains(&url.to_string()) {
+            trackers.http.push(url.to_string());
+        }
+    } else {
+        return Err("invalid tracker URL scheme".to_string());
+    }
+    let all: Vec<String> = trackers
+        .http
+        .iter()
+        .chain(trackers.udp.iter())
+        .cloned()
+        .collect();
+    drop(trackers);
+    update_ui(ui_state, |state| {
+        update_torrent_entry(state, torrent_id, |torrent| {
+            torrent.trackers = all.clone();
+        });
+    });
+    Ok(())
+}
+
+fn remove_torrent_tracker(
+    registry: &SessionRegistry,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    torrent_id: u64,
+    url: &str,
+) -> Result<(), String> {
+    let context =
+        find_context_by_id(registry, torrent_id).ok_or_else(|| "torrent not found".to_string())?;
+    let mut trackers = context.trackers.lock().unwrap();
+    trackers.http.retain(|u| u != url);
+    trackers.udp.retain(|u| u != url);
+    let all: Vec<String> = trackers
+        .http
+        .iter()
+        .chain(trackers.udp.iter())
+        .cloned()
+        .collect();
+    drop(trackers);
+    update_ui(ui_state, |state| {
+        update_torrent_entry(state, torrent_id, |torrent| {
+            torrent.trackers = all.clone();
+        });
+    });
+    Ok(())
+}
+
 fn recheck_torrent(
     registry: &SessionRegistry,
     ui_state: &Option<Arc<Mutex<ui::UiState>>>,
     torrent_id: u64,
 ) -> Result<(), String> {
-    let context = find_context_by_id(registry, torrent_id)
-        .ok_or_else(|| "torrent not found".to_string())?;
+    let context =
+        find_context_by_id(registry, torrent_id).ok_or_else(|| "torrent not found".to_string())?;
     let pieces_arc = Arc::clone(&context.pieces);
     let storage_arc = Arc::clone(&context.storage);
     let base_piece_length = context.base_piece_length;
@@ -6467,8 +7330,7 @@ fn start_utp_listener(
 
 fn start_inbound_listener(port: u16, registry: SessionRegistry, inbound: InboundConfig) {
     thread::spawn(move || {
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        let listener = match TcpListener::bind(addr) {
+        let listener = match bind_tcp_dual_stack(port) {
             Ok(listener) => listener,
             Err(err) => {
                 log_warn!("inbound listener failed: {err}");
@@ -6550,7 +7412,21 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
         let bits = build_bitfield(&p);
         (bits, p.completed_pieces() > 0)
     };
-    if have_pieces {
+    let inbound_super_seed = have_pieces && SUPER_SEED.load(Ordering::SeqCst);
+    if inbound_super_seed {
+        // BEP 16: send single HAVE instead of full bitfield
+        let piece_count = {
+            let p = context.pieces.lock().unwrap();
+            p.piece_count()
+        };
+        if piece_count > 0 {
+            let mut sv = std::process::id() as u64 ^ peer_tag;
+            sv ^= sv << 13;
+            sv ^= sv >> 7;
+            let idx = (sv % piece_count as u64) as u32;
+            let _ = peer::write_message(&mut stream, &peer::Message::Have(idx));
+        }
+    } else if have_pieces {
         let _ = peer::write_message(&mut stream, &peer::Message::Bitfield(local_bitfield));
     }
 
@@ -6641,7 +7517,11 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
                                 log_debug!("inbound upload rejected: {err}");
                             } else {
                                 last_sent = Instant::now();
-                                check_seed_ratio(&context.uploaded, &context.downloaded, &context.stop_requested);
+                                check_seed_ratio(
+                                    &context.uploaded,
+                                    &context.downloaded,
+                                    &context.stop_requested,
+                                );
                             }
                         }
                     }
@@ -6737,6 +7617,327 @@ fn check_seed_ratio(
     }
 }
 
+fn check_ratio_group(
+    ratio_group_name: &Option<String>,
+    uploaded: &Arc<AtomicU64>,
+    downloaded: &Arc<AtomicU64>,
+    stop_flag: &Arc<AtomicBool>,
+    paused_flag: &Arc<AtomicBool>,
+) {
+    let group_name = match ratio_group_name {
+        Some(name) => name,
+        None => return,
+    };
+    let groups = match RATIO_GROUPS.get() {
+        Some(g) => g,
+        None => return,
+    };
+    let guard = match groups.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let group = match guard.iter().find(|g| g.name == *group_name) {
+        Some(g) => g,
+        None => return,
+    };
+    let up = uploaded.load(Ordering::SeqCst) as f64;
+    let down = downloaded.load(Ordering::SeqCst).max(1) as f64;
+    if up / down >= group.ratio {
+        match group.action.as_str() {
+            "stop" => {
+                stop_flag.store(true, Ordering::SeqCst);
+                log_info!(
+                    "ratio group '{}' ratio {:.2} reached, stopping",
+                    group_name,
+                    group.ratio
+                );
+            }
+            "pause" => {
+                paused_flag.store(true, Ordering::SeqCst);
+                log_info!(
+                    "ratio group '{}' ratio {:.2} reached, pausing",
+                    group_name,
+                    group.ratio
+                );
+            }
+            _ => {
+                log_info!(
+                    "ratio group '{}' ratio {:.2} reached (no action)",
+                    group_name,
+                    group.ratio
+                );
+            }
+        }
+    }
+}
+
+fn execute_schedule_command(
+    command: &str,
+    global_down: &Arc<RateLimiter>,
+    global_up: &Arc<RateLimiter>,
+    registry: &SessionRegistry,
+) {
+    if let Some(rest) = command.strip_prefix("throttle_down:") {
+        if let Ok(bps) = rest.parse::<u64>() {
+            global_down.set_limit_bps(bps);
+            log_info!("schedule: download throttle set to {bps} B/s");
+        }
+    } else if let Some(rest) = command.strip_prefix("throttle_up:") {
+        if let Ok(bps) = rest.parse::<u64>() {
+            global_up.set_limit_bps(bps);
+            log_info!("schedule: upload throttle set to {bps} B/s");
+        }
+    } else if command == "pause_all" {
+        PAUSED.store(true, Ordering::SeqCst);
+        log_info!("schedule: paused all torrents");
+    } else if command == "resume_all" {
+        PAUSED.store(false, Ordering::SeqCst);
+        log_info!("schedule: resumed all torrents");
+    } else if command == "stop_ratio_reached" {
+        if let Ok(guard) = registry.lock() {
+            for ctx in guard.values() {
+                check_seed_ratio(&ctx.uploaded, &ctx.downloaded, &ctx.stop_requested);
+            }
+        }
+        log_info!("schedule: checked seed ratios");
+    } else {
+        log_warn!("schedule: unknown command '{command}'");
+    }
+}
+
+fn rss_add_feed(url: &str, interval: u64, download_dir: &Path) -> Result<(), String> {
+    let lock = RSS_STATE.get().ok_or("rss not initialized")?;
+    let mut state = lock.lock().map_err(|_| "rss lock failed".to_string())?;
+    if state.feeds.iter().any(|f| f.url == url) {
+        return Err("feed already exists".to_string());
+    }
+    state.feeds.push(rss::RssFeed {
+        url: url.to_string(),
+        title: String::new(),
+        items: Vec::new(),
+        last_poll: 0,
+        poll_interval_secs: if interval > 0 { interval } else { 900 },
+    });
+    let rss_path = download_dir.join(".rustorrent").join("rss.benc");
+    rss::save_rss_state(&rss_path, &state)?;
+    log_info!("rss added feed: {url}");
+    Ok(())
+}
+
+fn rss_remove_feed(url: &str, download_dir: &Path) -> Result<(), String> {
+    let lock = RSS_STATE.get().ok_or("rss not initialized")?;
+    let mut state = lock.lock().map_err(|_| "rss lock failed".to_string())?;
+    let before = state.feeds.len();
+    state.feeds.retain(|f| f.url != url);
+    if state.feeds.len() == before {
+        return Err("feed not found".to_string());
+    }
+    let rss_path = download_dir.join(".rustorrent").join("rss.benc");
+    rss::save_rss_state(&rss_path, &state)?;
+    log_info!("rss removed feed: {url}");
+    Ok(())
+}
+
+fn rss_add_rule(
+    name: &str,
+    feed_url: &str,
+    pattern: &str,
+    download_dir: &Path,
+) -> Result<(), String> {
+    let lock = RSS_STATE.get().ok_or("rss not initialized")?;
+    let mut state = lock.lock().map_err(|_| "rss lock failed".to_string())?;
+    state.rules.push(rss::RssRule {
+        name: name.to_string(),
+        feed_url: feed_url.to_string(),
+        pattern: pattern.to_string(),
+    });
+    let rss_path = download_dir.join(".rustorrent").join("rss.benc");
+    rss::save_rss_state(&rss_path, &state)?;
+    log_info!("rss added rule: {name} (pattern: {pattern})");
+    Ok(())
+}
+
+fn rss_remove_rule(name: &str, download_dir: &Path) -> Result<(), String> {
+    let lock = RSS_STATE.get().ok_or("rss not initialized")?;
+    let mut state = lock.lock().map_err(|_| "rss lock failed".to_string())?;
+    let before = state.rules.len();
+    state.rules.retain(|r| r.name != name);
+    if state.rules.len() == before {
+        return Err("rule not found".to_string());
+    }
+    let rss_path = download_dir.join(".rustorrent").join("rss.benc");
+    rss::save_rss_state(&rss_path, &state)?;
+    log_info!("rss removed rule: {name}");
+    Ok(())
+}
+
+fn schedule_rss_polls(
+    args: &Args,
+    poll_tx: &mpsc::Sender<RssPollResult>,
+    inflight: &mut HashSet<String>,
+) {
+    let rss_lock = match RSS_STATE.get() {
+        Some(lock) => lock,
+        None => return,
+    };
+    let mut state = match rss_lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+
+    let now = rss::now_secs();
+    let mut due_urls = Vec::new();
+    for feed in &mut state.feeds {
+        let interval = feed.poll_interval_secs.max(1);
+        if now < feed.last_poll.saturating_add(interval) || inflight.contains(&feed.url) {
+            continue;
+        }
+        feed.last_poll = now;
+        inflight.insert(feed.url.clone());
+        due_urls.push(feed.url.clone());
+    }
+    if !due_urls.is_empty() {
+        let rss_path = args.download_dir.join(".rustorrent").join("rss.benc");
+        let _ = rss::save_rss_state(&rss_path, &state);
+    }
+    drop(state);
+
+    for url in due_urls {
+        let tx = poll_tx.clone();
+        thread::spawn(move || {
+            let parsed = match http::get(&url, 2 * 1024 * 1024) {
+                Ok(bytes) => rss::parse_feed(&bytes),
+                Err(err) => Err(err.to_string()),
+            };
+            let _ = tx.send(RssPollResult { url, parsed });
+        });
+    }
+}
+
+fn drain_rss_poll_results(
+    args: &Args,
+    poll_rx: &mpsc::Receiver<RssPollResult>,
+    download_tx: &mpsc::Sender<RssDownloadResult>,
+    queue: &mut VecDeque<TorrentRequest>,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    next_id: &mut u64,
+    poll_inflight: &mut HashSet<String>,
+    download_inflight: &mut HashSet<String>,
+) {
+    while let Ok(result) = poll_rx.try_recv() {
+        poll_inflight.remove(&result.url);
+
+        let rss_lock = match RSS_STATE.get() {
+            Some(lock) => lock,
+            None => continue,
+        };
+        let mut state = match rss_lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => continue,
+        };
+        let feed_idx = match state.feeds.iter().position(|feed| feed.url == result.url) {
+            Some(idx) => idx,
+            None => continue,
+        };
+
+        let mut download_jobs: Vec<(String, String, String)> = Vec::new();
+        let mut should_save = false;
+        match result.parsed {
+            Ok((title, items)) => {
+                if !title.is_empty() && state.feeds[feed_idx].title.is_empty() {
+                    state.feeds[feed_idx].title = title;
+                }
+                let matches =
+                    rss::match_rules(&items, &state.rules, &state.seen_guids, &result.url);
+                let mut new_guids = Vec::new();
+                for (item, rule) in &matches {
+                    if download_inflight.contains(&item.guid) {
+                        continue;
+                    }
+                    log_info!("rss match: '{}' (rule: '{}')", item.title, rule.name);
+                    new_guids.push(item.guid.clone());
+                    download_jobs.push((item.guid.clone(), item.link.clone(), item.title.clone()));
+                }
+                state.seen_guids.extend(new_guids);
+                state.feeds[feed_idx].items = items;
+                should_save = true;
+            }
+            Err(err) => {
+                log_warn!("rss poll {}: {err}", result.url);
+            }
+        }
+        if should_save {
+            let rss_path = args.download_dir.join(".rustorrent").join("rss.benc");
+            let _ = rss::save_rss_state(&rss_path, &state);
+        }
+        drop(state);
+
+        for (guid, url, title) in download_jobs {
+            if url.starts_with("magnet:?") {
+                let request = TorrentRequest {
+                    id: *next_id,
+                    source: TorrentSource::Magnet(url.clone()),
+                    download_dir: args.download_dir.clone(),
+                    preallocate: args.preallocate,
+                    initial_label: String::new(),
+                };
+                *next_id = next_id.saturating_add(1);
+                enqueue_request_with_label(queue, ui_state, request, format!("rss: {title}"));
+                log_info!("rss queued magnet: {title}");
+                continue;
+            }
+            if !download_inflight.insert(guid.clone()) {
+                continue;
+            }
+            let tx = download_tx.clone();
+            thread::spawn(move || {
+                let data = http::get(&url, 10 * 1024 * 1024).map_err(|err| err.to_string());
+                let _ = tx.send(RssDownloadResult {
+                    guid,
+                    url,
+                    title,
+                    data,
+                });
+            });
+        }
+    }
+}
+
+fn drain_rss_download_results(
+    args: &Args,
+    download_rx: &mpsc::Receiver<RssDownloadResult>,
+    queue: &mut VecDeque<TorrentRequest>,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    next_id: &mut u64,
+    download_inflight: &mut HashSet<String>,
+) {
+    while let Ok(result) = download_rx.try_recv() {
+        download_inflight.remove(&result.guid);
+        match result.data {
+            Ok(data) => {
+                let request = TorrentRequest {
+                    id: *next_id,
+                    source: TorrentSource::Bytes(data),
+                    download_dir: args.download_dir.clone(),
+                    preallocate: args.preallocate,
+                    initial_label: String::new(),
+                };
+                *next_id = next_id.saturating_add(1);
+                enqueue_request_with_label(
+                    queue,
+                    ui_state,
+                    request,
+                    format!("rss: {}", result.title),
+                );
+                log_info!("rss queued torrent: {}", result.title);
+            }
+            Err(err) => {
+                log_warn!("rss download {}: {err}", result.url);
+            }
+        }
+    }
+}
+
 fn cancel_pending<W: Write>(stream: &mut W, pending: &[PendingRequest]) -> Result<(), String> {
     for entry in pending {
         peer::write_message(
@@ -6792,6 +7993,30 @@ where
             guard.last_error = "ui update panicked".to_string();
         }
     }
+}
+
+fn add_peer_country(torrent: &mut ui::UiTorrent, cc: &str) {
+    if let Some(entry) = torrent
+        .peer_country_counts
+        .iter_mut()
+        .find(|(c, _)| c == cc)
+    {
+        entry.1 += 1;
+    } else {
+        torrent.peer_country_counts.push((cc.to_string(), 1));
+    }
+    torrent.peer_country_counts.sort_by(|a, b| b.1.cmp(&a.1));
+}
+
+fn remove_peer_country(torrent: &mut ui::UiTorrent, cc: &str) {
+    if let Some(entry) = torrent
+        .peer_country_counts
+        .iter_mut()
+        .find(|(c, _)| c == cc)
+    {
+        entry.1 = entry.1.saturating_sub(1);
+    }
+    torrent.peer_country_counts.retain(|(_, count)| *count > 0);
 }
 
 fn update_torrent_entry<F>(state: &mut ui::UiState, torrent_id: u64, update: F)
@@ -7026,6 +8251,9 @@ mod core_helpers_tests {
             url_list: Vec::new(),
             httpseeds: Vec::new(),
             info_hash: [1u8; 20],
+            info_hash_v2: None,
+            piece_layers: Vec::new(),
+            meta_version: 1,
             info: torrent::InfoDict {
                 name: b"t".to_vec(),
                 piece_length: 16,
@@ -7033,6 +8261,7 @@ mod core_helpers_tests {
                 length: Some(16),
                 files: Vec::new(),
                 private,
+                file_tree: Vec::new(),
             },
         }
     }
@@ -7060,6 +8289,33 @@ mod core_helpers_tests {
             EncryptionMode::Require
         );
         assert!(parse_encryption_mode("unknown").is_err());
+    }
+
+    #[test]
+    fn parse_rss_rule_arg_handles_feed_urls_and_pattern_only() {
+        let (feed, pattern) = parse_rss_rule_arg("http://feed.example/rss:*ubuntu*").unwrap();
+        assert_eq!(feed, "http://feed.example/rss");
+        assert_eq!(pattern, "*ubuntu*");
+
+        let (feed, pattern) = parse_rss_rule_arg("http://feed.example:8080/rss:*ubuntu*").unwrap();
+        assert_eq!(feed, "http://feed.example:8080/rss");
+        assert_eq!(pattern, "*ubuntu*");
+
+        let (feed, pattern) = parse_rss_rule_arg("*debian*").unwrap();
+        assert_eq!(feed, "");
+        assert_eq!(pattern, "*debian*");
+
+        assert!(parse_rss_rule_arg("http://feed:").is_err());
+    }
+
+    #[test]
+    fn parse_schedule_arg_rejects_zero_interval() {
+        let (interval, command) = parse_schedule_arg("60:resume_all").unwrap();
+        assert_eq!(interval, 60);
+        assert_eq!(command, "resume_all");
+        assert!(parse_schedule_arg("0:resume_all").is_err());
+        assert!(parse_schedule_arg("abc:resume_all").is_err());
+        assert!(parse_schedule_arg("60").is_err());
     }
 
     #[test]
@@ -7169,6 +8425,7 @@ mod core_helpers_tests {
             1234,
             5678,
             peers.clone(),
+            &[(0, "renamed.txt".to_string())],
         )
         .unwrap();
         let loaded = load_resume_data(&path).unwrap();
@@ -7177,6 +8434,7 @@ mod core_helpers_tests {
         assert_eq!(loaded.bitfield, bitfield);
         assert_eq!(loaded.file_priorities, priorities);
         assert_eq!(loaded.downloaded, 1234);
+        assert_eq!(loaded.file_renames, vec![(0, "renamed.txt".to_string())]);
         assert_eq!(loaded.uploaded, 5678);
         assert_eq!(loaded.peers, peers);
         let _ = fs::remove_file(&path);
@@ -7202,6 +8460,7 @@ mod core_helpers_tests {
             100,
             50,
             vec!["127.0.0.1:6881".parse().unwrap()],
+            &[],
         )
         .unwrap();
         let backup_path = sidecar_path(&path, ".bak");
@@ -7232,6 +8491,7 @@ mod core_helpers_tests {
                 torrent_bytes: b"torrent-data".to_vec(),
                 download_dir: PathBuf::from("/tmp/downloads"),
                 preallocate: true,
+                label: String::new(),
             },
         );
         save_session(&path, &entries).unwrap();
@@ -7263,6 +8523,7 @@ mod core_helpers_tests {
                 torrent_bytes: b"torrent-data".to_vec(),
                 download_dir: root.clone(),
                 preallocate: false,
+                label: String::new(),
             },
         );
         save_session(&path, &entries).unwrap();
@@ -7332,6 +8593,7 @@ mod core_helpers_tests {
             torrent_download_rate: Some(30),
             torrent_upload_rate: Some(40),
             write_cache_bytes: Some(50),
+            geoip_db: None,
         };
 
         let mut download_dir = PathBuf::from(".");
@@ -7352,6 +8614,7 @@ mod core_helpers_tests {
         let mut torrent_download_rate = 0;
         let mut torrent_upload_rate = 0;
         let mut write_cache_bytes = 0;
+        let mut geoip_path = None;
         apply_overrides(
             &cfg,
             &mut download_dir,
@@ -7372,6 +8635,7 @@ mod core_helpers_tests {
             &mut torrent_download_rate,
             &mut torrent_upload_rate,
             &mut write_cache_bytes,
+            &mut geoip_path,
         );
 
         assert_eq!(download_dir, PathBuf::from("/tmp/alt"));
@@ -7585,6 +8849,7 @@ mod local_harness_tests {
             encryption: EncryptionMode::Disable,
             utp: None,
             ip_filter: None,
+            proxy: None,
         };
         let mut stream = connect_peer_for_metadata(addr, &cfg).unwrap();
         let handshake = plaintext_handshake(&mut stream, info_hash, local_peer_id).unwrap();
@@ -7724,6 +8989,57 @@ fn apply_file_priority(
             }
         });
     });
+    Ok(())
+}
+
+fn apply_file_rename(
+    registry: &SessionRegistry,
+    torrent_id: u64,
+    file_index: usize,
+    new_name: &str,
+) -> Result<(), String> {
+    if new_name.is_empty()
+        || new_name.contains('/')
+        || new_name.contains('\\')
+        || new_name.contains('\0')
+        || new_name == "."
+        || new_name == ".."
+    {
+        return Err("invalid file name".to_string());
+    }
+    let context =
+        find_context_by_id(registry, torrent_id).ok_or_else(|| "unknown torrent".to_string())?;
+    let spans = &context.file_spans;
+    if file_index >= spans.len() {
+        return Err("file index out of range".to_string());
+    }
+    let old_rel = &spans[file_index].path;
+    let old_path = context.download_dir.join(old_rel);
+    let new_rel = if let Some(pos) = old_rel.rfind('/') {
+        format!("{}/{}", &old_rel[..pos], new_name)
+    } else {
+        new_name.to_string()
+    };
+    let new_path = context.download_dir.join(&new_rel);
+    if old_path == new_path {
+        return Ok(());
+    }
+    {
+        let mut storage = context
+            .storage
+            .lock()
+            .map_err(|_| "storage lock failed".to_string())?;
+        storage
+            .rename_file(file_index, &old_path, &new_path)
+            .map_err(|err| format!("rename failed: {err}"))?;
+    }
+    {
+        let mut renames = context
+            .file_renames
+            .lock()
+            .map_err(|_| "renames lock failed".to_string())?;
+        renames.insert(file_index, new_name.to_string());
+    }
     Ok(())
 }
 
@@ -8521,6 +9837,7 @@ fn scan_watch_dir(
             source: TorrentSource::Bytes(data),
             download_dir: download_dir.clone(),
             preallocate,
+            initial_label: String::new(),
         };
         *next_id = next_id.saturating_add(1);
         let label = path
@@ -8534,4 +9851,585 @@ fn scan_watch_dir(
             let _ = fs::rename(&path, processed_dir.join(name));
         }
     }
+}
+
+// ---- TUI (--tui) ----
+
+struct TuiState {
+    selected: usize,
+    scroll_offset: usize,
+    show_detail: bool,
+    confirm_delete: Option<u64>,
+}
+
+fn tui_terminal_size() -> (u16, u16) {
+    #[repr(C)]
+    struct Winsize {
+        ws_row: u16,
+        ws_col: u16,
+        ws_xpixel: u16,
+        ws_ypixel: u16,
+    }
+    extern "C" {
+        fn ioctl(fd: i32, request: u64, ...) -> i32;
+    }
+    #[cfg(target_os = "macos")]
+    const TIOCGWINSZ: u64 = 0x40087468;
+    #[cfg(target_os = "linux")]
+    const TIOCGWINSZ: u64 = 0x5413;
+    let mut ws = Winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe {
+        ioctl(1, TIOCGWINSZ, &mut ws as *mut Winsize);
+    }
+    (ws.ws_row, ws.ws_col)
+}
+
+fn tui_set_raw_mode() -> Option<[u8; 128]> {
+    #[cfg(target_os = "macos")]
+    const TERMIOS_SIZE: usize = 72;
+    #[cfg(target_os = "linux")]
+    const TERMIOS_SIZE: usize = 60;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    const TERMIOS_SIZE: usize = 72;
+
+    extern "C" {
+        fn tcgetattr(fd: i32, termios: *mut u8) -> i32;
+        fn tcsetattr(fd: i32, action: i32, termios: *const u8) -> i32;
+    }
+    let mut original = [0u8; 128];
+    let mut raw = [0u8; 128];
+    if unsafe { tcgetattr(0, original.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    raw[..TERMIOS_SIZE].copy_from_slice(&original[..TERMIOS_SIZE]);
+    // Clear ICANON and ECHO (both in c_lflag)
+    // c_lflag offset: macOS=16, Linux=12
+    #[cfg(target_os = "macos")]
+    const LFLAG_OFFSET: usize = 16;
+    #[cfg(target_os = "linux")]
+    const LFLAG_OFFSET: usize = 12;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    const LFLAG_OFFSET: usize = 16;
+
+    let lflag = u64::from_ne_bytes([
+        raw[LFLAG_OFFSET],
+        raw[LFLAG_OFFSET + 1],
+        raw.get(LFLAG_OFFSET + 2).copied().unwrap_or(0),
+        raw.get(LFLAG_OFFSET + 3).copied().unwrap_or(0),
+        0,
+        0,
+        0,
+        0,
+    ]) as u32;
+    // ICANON=0x100, ECHO=0x8 on macOS; ICANON=2, ECHO=8 on Linux
+    #[cfg(target_os = "macos")]
+    let new_lflag = lflag & !(0x100 | 0x8);
+    #[cfg(target_os = "linux")]
+    let new_lflag = lflag & !(0x2 | 0x8);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let new_lflag = lflag & !(0x100 | 0x8);
+
+    let bytes = new_lflag.to_ne_bytes();
+    raw[LFLAG_OFFSET..LFLAG_OFFSET + 4].copy_from_slice(&bytes);
+    // Set VMIN=1, VTIME=0 for non-blocking-ish reads
+    // c_cc offset: macOS=20, Linux=17
+    #[cfg(target_os = "macos")]
+    {
+        raw[20 + 16] = 0; // VMIN index=16 on macOS -> set to 0 for non-blocking
+        raw[20 + 17] = 1; // VTIME index=17 -> 0.1s timeout
+    }
+    #[cfg(target_os = "linux")]
+    {
+        raw[17 + 6] = 0; // VMIN
+        raw[17 + 5] = 1; // VTIME
+    }
+
+    if unsafe { tcsetattr(0, 0, raw.as_ptr()) } != 0 {
+        return None;
+    }
+    Some(original)
+}
+
+fn tui_restore_mode(original: &[u8; 128]) {
+    extern "C" {
+        fn tcsetattr(fd: i32, action: i32, termios: *const u8) -> i32;
+    }
+    unsafe {
+        tcsetattr(0, 0, original.as_ptr());
+    }
+}
+
+fn tui_read_key() -> Option<u8> {
+    extern "C" {
+        fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    }
+    let mut buf = [0u8; 1];
+    let n = unsafe { read(0, buf.as_mut_ptr(), 1) };
+    if n == 1 {
+        Some(buf[0])
+    } else {
+        None
+    }
+}
+
+fn tui_read_escape_seq() -> Vec<u8> {
+    let mut seq = Vec::new();
+    for _ in 0..4 {
+        if let Some(b) = tui_read_key() {
+            seq.push(b);
+            if b.is_ascii_alphabetic() || b == b'~' {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    seq
+}
+
+fn tui_format_bytes(value: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = value as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value}{}", UNITS[unit])
+    } else {
+        format!("{:.1}{}", size, UNITS[unit])
+    }
+}
+
+fn tui_format_rate(bps: f64) -> String {
+    if bps <= 0.0 || !bps.is_finite() {
+        return "0B/s".to_string();
+    }
+    let formatted = tui_format_bytes(bps as u64);
+    format!("{formatted}/s")
+}
+
+fn tui_progress_bar(percent: f64, width: usize) -> String {
+    let filled = ((percent / 100.0) * width as f64).round() as usize;
+    let empty = width.saturating_sub(filled);
+    let mut bar = String::with_capacity(width * 3);
+    for _ in 0..filled {
+        bar.push('\u{2588}');
+    }
+    for _ in 0..empty {
+        bar.push('\u{2591}');
+    }
+    bar
+}
+
+fn tui_status_color(status: &str) -> &'static str {
+    match status {
+        "seeding" | "complete" => "\x1b[32m", // green
+        "downloading" => "\x1b[33m",          // yellow
+        "error" => "\x1b[31m",                // red
+        "paused" => "\x1b[90m",               // gray
+        "announcing" | "loading" | "fetching metadata" => "\x1b[36m", // cyan
+        _ => "\x1b[0m",
+    }
+}
+
+fn tui_status_icon(status: &str, paused: bool) -> &'static str {
+    if paused {
+        "\u{23f8}"
+    } else {
+        match status {
+            "seeding" | "complete" => "\u{25b2}",
+            "downloading" | "announcing" => "\u{25b6}",
+            "error" => "\u{2717}",
+            _ => " ",
+        }
+    }
+}
+
+fn start_tui(
+    state: Arc<Mutex<ui::UiState>>,
+    cmd_tx: mpsc::Sender<ui::UiCommand>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let original = match tui_set_raw_mode() {
+            Some(orig) => orig,
+            None => {
+                log_warn!("tui: failed to set raw mode");
+                return;
+            }
+        };
+        // Enter alternate screen, hide cursor
+        let stdout = io::stdout();
+        {
+            let mut out = stdout.lock();
+            let _ = out.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J");
+            let _ = out.flush();
+        }
+
+        let mut tui = TuiState {
+            selected: 0,
+            scroll_offset: 0,
+            show_detail: false,
+            confirm_delete: None,
+        };
+
+        loop {
+            if shutdown_requested() {
+                break;
+            }
+
+            // Read keyboard input
+            if let Some(key) = tui_read_key() {
+                match key {
+                    b'q' | 3 => {
+                        // q or Ctrl-C
+                        SHUTDOWN.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    b'j' | b'B' => {
+                        // down (j or arrow down sequence starts with ESC)
+                        tui.selected = tui.selected.saturating_add(1);
+                        tui.confirm_delete = None;
+                    }
+                    b'k' | b'A' => {
+                        // up
+                        tui.selected = tui.selected.saturating_sub(1);
+                        tui.confirm_delete = None;
+                    }
+                    0x1b => {
+                        // ESC - start of escape sequence
+                        let seq = tui_read_escape_seq();
+                        if seq == [b'[', b'A'] {
+                            tui.selected = tui.selected.saturating_sub(1);
+                        } else if seq == [b'[', b'B'] {
+                            tui.selected = tui.selected.saturating_add(1);
+                        }
+                        tui.confirm_delete = None;
+                    }
+                    b'\r' | b'\n' => {
+                        tui.show_detail = !tui.show_detail;
+                    }
+                    b'p' => {
+                        // Pause/resume selected torrent
+                        let guard = state.lock().unwrap();
+                        if let Some(torrent) = guard.torrents.get(tui.selected) {
+                            let id = torrent.id;
+                            let paused = torrent.paused;
+                            drop(guard);
+                            let (reply_tx, _) = mpsc::channel();
+                            if paused {
+                                let _ = cmd_tx.send(ui::UiCommand::ResumeTorrent {
+                                    torrent_id: id,
+                                    reply: reply_tx,
+                                });
+                            } else {
+                                let _ = cmd_tx.send(ui::UiCommand::PauseTorrent {
+                                    torrent_id: id,
+                                    reply: reply_tx,
+                                });
+                            }
+                        }
+                    }
+                    b's' => {
+                        // Stop selected torrent
+                        let guard = state.lock().unwrap();
+                        if let Some(torrent) = guard.torrents.get(tui.selected) {
+                            let id = torrent.id;
+                            drop(guard);
+                            let (reply_tx, _) = mpsc::channel();
+                            let _ = cmd_tx.send(ui::UiCommand::StopTorrent {
+                                torrent_id: id,
+                                reply: reply_tx,
+                            });
+                        }
+                    }
+                    b'd' => {
+                        // Delete selected torrent (requires confirmation)
+                        let guard = state.lock().unwrap();
+                        if let Some(torrent) = guard.torrents.get(tui.selected) {
+                            if tui.confirm_delete == Some(torrent.id) {
+                                // Already confirming - ignore, wait for y/n
+                            } else {
+                                tui.confirm_delete = Some(torrent.id);
+                            }
+                        }
+                    }
+                    b'y' => {
+                        if let Some(id) = tui.confirm_delete.take() {
+                            let (reply_tx, _) = mpsc::channel();
+                            let _ = cmd_tx.send(ui::UiCommand::DeleteTorrent {
+                                torrent_id: id,
+                                remove_data: false,
+                                reply: reply_tx,
+                            });
+                        }
+                    }
+                    b'n' => {
+                        tui.confirm_delete = None;
+                    }
+                    b'r' => {
+                        // Recheck selected torrent
+                        let guard = state.lock().unwrap();
+                        if let Some(torrent) = guard.torrents.get(tui.selected) {
+                            let id = torrent.id;
+                            drop(guard);
+                            let (reply_tx, _) = mpsc::channel();
+                            let _ = cmd_tx.send(ui::UiCommand::RecheckTorrent {
+                                torrent_id: id,
+                                reply: reply_tx,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Render frame
+            let (rows, cols) = tui_terminal_size();
+            let cols = cols as usize;
+            let rows = rows as usize;
+            if rows < 5 || cols < 30 {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+
+            let guard = state.lock().unwrap();
+            let torrent_count = guard.torrents.len();
+            if torrent_count > 0 && tui.selected >= torrent_count {
+                tui.selected = torrent_count - 1;
+            }
+
+            // Calculate layout
+            let header_rows = 1;
+            let footer_rows = 1;
+            let detail_rows = if tui.show_detail { 6.min(rows / 3) } else { 0 };
+            let list_rows = rows.saturating_sub(header_rows + footer_rows + detail_rows);
+
+            // Adjust scroll
+            if tui.selected < tui.scroll_offset {
+                tui.scroll_offset = tui.selected;
+            }
+            if tui.selected >= tui.scroll_offset + list_rows {
+                tui.scroll_offset = tui.selected.saturating_sub(list_rows - 1);
+            }
+
+            let mut frame = String::with_capacity(cols * rows * 3);
+
+            // Header: status bar
+            frame.push_str("\x1b[H");
+            let total_down_rate: f64 = guard.torrents.iter().map(|t| t.download_rate_bps).sum();
+            let total_up_rate: f64 = guard.torrents.iter().map(|t| t.upload_rate_bps).sum();
+            let active = guard
+                .torrents
+                .iter()
+                .filter(|t| t.status == "downloading" || t.status == "seeding")
+                .count();
+            let header = format!(
+                " \x1b[1mRustorrent 0.1.0\x1b[0m  \x1b[32m\u{2193}\x1b[0m {} \x1b[36m\u{2191}\x1b[0m {}  [{}/{}]",
+                tui_format_rate(total_down_rate),
+                tui_format_rate(total_up_rate),
+                active,
+                torrent_count,
+            );
+            frame.push_str(&header);
+            let header_visible = strip_ansi_len(&header);
+            if header_visible < cols {
+                for _ in 0..(cols - header_visible) {
+                    frame.push(' ');
+                }
+            }
+
+            // Torrent list
+            for row in 0..list_rows {
+                let idx = tui.scroll_offset + row;
+                frame.push_str(&format!("\x1b[{};1H", header_rows + row + 1));
+                if idx < torrent_count {
+                    let t = &guard.torrents[idx];
+                    let selected = idx == tui.selected;
+                    let pct = if t.total_bytes > 0 {
+                        (t.completed_bytes as f64 / t.total_bytes as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    let bar_width = 10.min(cols / 5);
+                    let bar = tui_progress_bar(pct, bar_width);
+                    let icon = tui_status_icon(&t.status, t.paused);
+                    let color = tui_status_color(&t.status);
+                    let reset = "\x1b[0m";
+
+                    let right = if t.status == "seeding" || t.status == "complete" {
+                        format!("seeding \u{2191}{}", tui_format_rate(t.upload_rate_bps))
+                    } else if t.status == "downloading" {
+                        format!(
+                            "{:.0}% \u{2193}{}",
+                            pct,
+                            tui_format_rate(t.download_rate_bps)
+                        )
+                    } else {
+                        t.status.clone()
+                    };
+
+                    let name_max = cols.saturating_sub(bar_width + right.len() + 8);
+                    let name: String = if t.name.len() > name_max {
+                        t.name
+                            .chars()
+                            .take(name_max.saturating_sub(1))
+                            .collect::<String>()
+                            + "\u{2026}"
+                    } else {
+                        t.name.clone()
+                    };
+                    let name_pad = name_max.saturating_sub(name.len());
+
+                    let sel_start = if selected { "\x1b[7m" } else { "" };
+                    let sel_end = if selected { "\x1b[0m" } else { "" };
+
+                    let line = format!(
+                        "{sel_start} {icon} {color}{name}{reset}{sel_start}{:name_pad$} [{bar}] {right} {sel_end}",
+                        "",
+                        name_pad = name_pad,
+                    );
+                    frame.push_str(&line);
+                    let visible_len = strip_ansi_len(&line);
+                    if visible_len < cols {
+                        for _ in 0..(cols - visible_len) {
+                            frame.push(' ');
+                        }
+                    }
+                    if selected {
+                        frame.push_str("\x1b[0m");
+                    }
+                } else {
+                    // Empty row
+                    for _ in 0..cols {
+                        frame.push(' ');
+                    }
+                }
+            }
+
+            // Detail panel
+            if tui.show_detail && tui.selected < torrent_count {
+                let t = &guard.torrents[tui.selected];
+                let detail_start = header_rows + list_rows + 1;
+                let ratio_val = if t.downloaded_bytes > 0 {
+                    t.uploaded_bytes as f64 / t.downloaded_bytes as f64
+                } else {
+                    0.0
+                };
+                let eta = if t.eta_secs > 0 {
+                    let h = t.eta_secs / 3600;
+                    let m = (t.eta_secs % 3600) / 60;
+                    let s = t.eta_secs % 60;
+                    if h > 0 {
+                        format!("{h}h{m:02}m{s:02}s")
+                    } else {
+                        format!("{m}m{s:02}s")
+                    }
+                } else {
+                    "--:--".to_string()
+                };
+
+                let details = [
+                    format!(" Name: {}", t.name),
+                    format!(
+                        " Size: {}  Down: {}  Up: {}",
+                        tui_format_bytes(t.total_bytes),
+                        tui_format_bytes(t.downloaded_bytes),
+                        tui_format_bytes(t.uploaded_bytes)
+                    ),
+                    format!(
+                        " Ratio: {:.2}  ETA: {}  Peers: {}/{}",
+                        ratio_val, eta, t.active_peers, t.tracker_peers
+                    ),
+                    format!(" Hash: {}", t.info_hash),
+                    format!(" Dir: {}", t.download_dir),
+                    format!(" Files: {}", t.files.len()),
+                ];
+
+                for (i, detail) in details.iter().enumerate() {
+                    if i >= detail_rows {
+                        break;
+                    }
+                    frame.push_str(&format!("\x1b[{};1H\x1b[90m", detail_start + i));
+                    let truncated: String = detail.chars().take(cols).collect();
+                    frame.push_str(&truncated);
+                    let pad = cols.saturating_sub(truncated.len());
+                    for _ in 0..pad {
+                        frame.push(' ');
+                    }
+                    frame.push_str("\x1b[0m");
+                }
+            }
+
+            // Footer: keybinds
+            frame.push_str(&format!("\x1b[{};1H", rows));
+            let confirm_msg = if let Some(id) = tui.confirm_delete {
+                format!(" Delete torrent {id}? [y/n] ")
+            } else {
+                String::new()
+            };
+            if !confirm_msg.is_empty() {
+                frame.push_str("\x1b[33;1m");
+                frame.push_str(&confirm_msg);
+                let pad = cols.saturating_sub(confirm_msg.len());
+                for _ in 0..pad {
+                    frame.push(' ');
+                }
+                frame.push_str("\x1b[0m");
+            } else {
+                let footer =
+                    " [q]uit [p]ause [r]echeck [s]top [d]elete [Enter]detail [\u{2191}\u{2193}]nav";
+                frame.push_str("\x1b[7m");
+                let truncated: String = footer.chars().take(cols).collect();
+                frame.push_str(&truncated);
+                let flen = strip_ansi_len(&truncated);
+                for _ in 0..cols.saturating_sub(flen) {
+                    frame.push(' ');
+                }
+                frame.push_str("\x1b[0m");
+            }
+
+            drop(guard);
+
+            // Write frame
+            {
+                let mut out = stdout.lock();
+                let _ = out.write_all(frame.as_bytes());
+                let _ = out.flush();
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        // Restore terminal
+        {
+            let mut out = stdout.lock();
+            let _ = out.write_all(b"\x1b[?25h\x1b[?1049l");
+            let _ = out.flush();
+        }
+        tui_restore_mode(&original);
+    })
+}
+
+fn strip_ansi_len(s: &str) -> usize {
+    let mut len = 0usize;
+    let mut in_escape = false;
+    for ch in s.chars() {
+        if in_escape {
+            if ch.is_ascii_alphabetic() || ch == 'm' {
+                in_escape = false;
+            }
+        } else if ch == '\x1b' {
+            in_escape = true;
+        } else {
+            len += 1;
+        }
+    }
+    len
 }

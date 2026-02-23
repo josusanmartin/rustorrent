@@ -55,7 +55,12 @@ pub fn announce(
     numwant: u32,
 ) -> Result<TrackerResponse, Error> {
     let addr = parse_udp_url(url)?;
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    let bind_addr: &str = if addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = UdpSocket::bind(bind_addr)?;
     socket.set_read_timeout(Some(UDP_TIMEOUT))?;
     socket.set_write_timeout(Some(UDP_TIMEOUT))?;
     socket.connect(addr)?;
@@ -169,7 +174,12 @@ pub struct ScrapeResult {
 
 pub fn scrape(url: &str, info_hash: [u8; 20]) -> Result<ScrapeResult, Error> {
     let addr = parse_udp_url(url)?;
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    let bind_addr: &str = if addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = UdpSocket::bind(bind_addr)?;
     socket.set_read_timeout(Some(UDP_TIMEOUT))?;
     socket.set_write_timeout(Some(UDP_TIMEOUT))?;
     socket.connect(addr)?;

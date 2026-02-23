@@ -9,6 +9,12 @@ pub const PRIORITY_LOW: u8 = 1;
 pub const PRIORITY_NORMAL: u8 = 2;
 pub const PRIORITY_HIGH: u8 = 3;
 
+#[derive(Debug, Clone)]
+pub enum PieceHash {
+    Sha1([u8; 20]),
+    Sha256([u8; 32]),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockState {
     Missing,
@@ -19,7 +25,7 @@ pub enum BlockState {
 #[derive(Debug, Clone)]
 pub struct Piece {
     pub index: u32,
-    pub hash: [u8; 20],
+    pub hash: PieceHash,
     pub length: u32,
     blocks: Vec<BlockState>,
     priority: u8,
@@ -78,7 +84,18 @@ impl std::error::Error for Error {}
 
 impl PieceManager {
     pub fn new(meta: &TorrentMeta) -> Result<Self, Error> {
-        let piece_count = meta.info.pieces.len();
+        let use_v2 = meta.meta_version == 2;
+        let piece_hashes: Vec<PieceHash> = if use_v2 {
+            Self::build_v2_piece_hashes(meta)?
+        } else {
+            meta.info
+                .pieces
+                .iter()
+                .map(|h| PieceHash::Sha1(*h))
+                .collect()
+        };
+
+        let piece_count = piece_hashes.len();
         if piece_count == 0 {
             return Err(Error::InvalidPieces);
         }
@@ -107,7 +124,7 @@ impl PieceManager {
         }
 
         let mut pieces = Vec::with_capacity(piece_count);
-        for (index, hash) in meta.info.pieces.iter().enumerate() {
+        for (index, hash) in piece_hashes.into_iter().enumerate() {
             let length = if index + 1 == piece_count {
                 last_len as u32
             } else {
@@ -116,7 +133,7 @@ impl PieceManager {
             let blocks = block_count(length);
             pieces.push(Piece {
                 index: index as u32,
-                hash: *hash,
+                hash,
                 length,
                 blocks: vec![BlockState::Missing; blocks],
                 priority: PRIORITY_NORMAL,
@@ -131,6 +148,32 @@ impl PieceManager {
             reserved_by: vec![None; piece_count],
             sequential: false,
         })
+    }
+
+    fn build_v2_piece_hashes(meta: &TorrentMeta) -> Result<Vec<PieceHash>, Error> {
+        let piece_length = meta.info.piece_length;
+        if piece_length == 0 {
+            return Err(Error::InvalidPieceLength);
+        }
+        let mut all_hashes: Vec<PieceHash> = Vec::new();
+        for entry in &meta.info.file_tree {
+            if let Some(root) = &entry.pieces_root {
+                let layer = meta
+                    .piece_layers
+                    .iter()
+                    .find(|(key, _)| key.as_slice() == root.as_slice());
+                if let Some((_, hashes)) = layer {
+                    for h in hashes {
+                        all_hashes.push(PieceHash::Sha256(*h));
+                    }
+                } else if entry.length <= piece_length {
+                    all_hashes.push(PieceHash::Sha256(*root));
+                }
+            } else if entry.length == 0 {
+                continue;
+            }
+        }
+        Ok(all_hashes)
     }
 
     pub fn piece_count(&self) -> usize {
@@ -198,8 +241,8 @@ impl PieceManager {
         self.pieces.get(index as usize).map(|piece| piece.length)
     }
 
-    pub fn piece_hash(&self, index: u32) -> Option<[u8; 20]> {
-        self.pieces.get(index as usize).map(|piece| piece.hash)
+    pub fn piece_hash(&self, index: u32) -> Option<&PieceHash> {
+        self.pieces.get(index as usize).map(|piece| &piece.hash)
     }
 
     pub fn is_piece_complete(&self, index: u32) -> bool {
@@ -665,6 +708,9 @@ mod priority_tests {
             url_list: Vec::new(),
             httpseeds: Vec::new(),
             info_hash: [0u8; 20],
+            info_hash_v2: None,
+            piece_layers: Vec::new(),
+            meta_version: 1,
             info: InfoDict {
                 name: b"test".to_vec(),
                 piece_length: 16,
@@ -672,6 +718,7 @@ mod priority_tests {
                 length: Some(32),
                 files: Vec::new(),
                 private: false,
+                file_tree: Vec::new(),
             },
         }
     }
@@ -707,6 +754,9 @@ mod tests {
             url_list: Vec::new(),
             httpseeds: Vec::new(),
             info_hash: [0u8; 20],
+            info_hash_v2: None,
+            piece_layers: Vec::new(),
+            meta_version: 1,
             info: InfoDict {
                 name: b"dummy".to_vec(),
                 piece_length,
@@ -714,6 +764,7 @@ mod tests {
                 length: Some(total_length),
                 files: Vec::new(),
                 private: false,
+                file_tree: Vec::new(),
             },
         }
     }
