@@ -83,7 +83,27 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 cp "$BINARY_PATH" "$APP_BUNDLE/Contents/MacOS/rustorrent-bin"
-cp "$SCRIPT_DIR/rustorrent-launcher" "$APP_BUNDLE/Contents/MacOS/rustorrent"
+
+LAUNCHER_SRC="$SCRIPT_DIR/Launcher.swift"
+if [[ -f "$LAUNCHER_SRC" ]] && command -v xcrun >/dev/null 2>&1; then
+  echo "==> Building native macOS launcher"
+  if $UNIVERSAL; then
+    xcrun --sdk macosx swiftc -parse-as-library -O -target arm64-apple-macos11.0 \
+      "$LAUNCHER_SRC" -o "$BUILD_DIR/rustorrent-launcher-arm64"
+    xcrun --sdk macosx swiftc -parse-as-library -O -target x86_64-apple-macos10.13 \
+      "$LAUNCHER_SRC" -o "$BUILD_DIR/rustorrent-launcher-x86_64"
+    lipo -create \
+      "$BUILD_DIR/rustorrent-launcher-arm64" \
+      "$BUILD_DIR/rustorrent-launcher-x86_64" \
+      -output "$APP_BUNDLE/Contents/MacOS/rustorrent"
+  else
+    xcrun --sdk macosx swiftc -parse-as-library -O \
+      "$LAUNCHER_SRC" -o "$APP_BUNDLE/Contents/MacOS/rustorrent"
+  fi
+else
+  echo "==> Native launcher unavailable, using shell launcher fallback"
+  cp "$SCRIPT_DIR/rustorrent-launcher" "$APP_BUNDLE/Contents/MacOS/rustorrent"
+fi
 chmod +x "$APP_BUNDLE/Contents/MacOS/rustorrent"
 cp "$SCRIPT_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"

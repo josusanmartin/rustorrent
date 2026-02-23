@@ -1454,7 +1454,7 @@ fn status_html(state: &UiState) -> String {
         "<meta name=\"rustorrent-api-token\" content=\"{}\">",
         escape_html(api_token())
     ));
-    out.push_str("<script>try{var t=localStorage.getItem('rustorrent-theme');if(t!=='light'&&t!=='dark'){if(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches){t='light';}}if(t==='light'||t==='dark'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}</script>");
+    out.push_str("<script>try{var t=localStorage.getItem('rustorrent-theme');if(t!=='light'&&t!=='dark'){t='light';}document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>");
     out.push_str(r#"<style>
 .material-symbols-rounded{font-variation-settings:'FILL' 0,'wght' 500,'GRAD' 0,'opsz' 24;vertical-align:middle}
 :root{
@@ -1539,7 +1539,7 @@ body{
   background:var(--bg);
   -webkit-font-smoothing:antialiased;
 }
-.app{max-width:1280px;margin:0 auto;padding:16px 24px 48px}
+.app{width:100%;max-width:1600px;margin:0 auto;padding:16px 24px 48px}
 .appbar{
   position:sticky;
   top:0;
@@ -1603,8 +1603,8 @@ body{
 .btn.icon-btn .material-symbols-rounded{font-size:20px}
 :root.theme-switching,:root.theme-switching *{transition:none!important;animation:none!important}
 .layout{
-  display:grid;
-  grid-template-columns:260px minmax(0,1fr);
+  display:flex;
+  align-items:flex-start;
   gap:24px;
   margin-top:24px;
 }
@@ -1622,6 +1622,8 @@ body{
   color:var(--on-surface-var);
 }
 .sidebar{
+  flex:0 0 260px;
+  width:260px;
   position:sticky;
   top:72px;
   align-self:start;
@@ -1700,7 +1702,14 @@ body{
   transition:transform .15s ease;
 }
 .limit-slider::-webkit-slider-thumb:hover{transform:scale(1.2)}
-.torrent-list{display:flex;flex-direction:column;gap:12px}
+.torrent-list{
+  flex:1 1 0;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  min-width:0;
+  align-self:start;
+}
 .torrent-card{
   position:relative;
   padding:20px;
@@ -2005,9 +2014,13 @@ body{
 .tracker-item .remove-btn:hover{color:var(--error);background:var(--danger-cont)}
 @keyframes progressSheen{0%{transform:translateX(-100%)}100%{transform:translateX(200%)}}
 @keyframes modalFade{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:scale(1)}}
-@media(max-width:980px){
-  .layout{grid-template-columns:1fr}
-  .sidebar{position:static}
+@media(max-width:900px){
+  .layout{gap:16px}
+  .sidebar{flex-basis:240px;width:240px}
+}
+@media(max-width:520px){
+  .layout{flex-direction:column}
+  .sidebar{position:static;flex-basis:auto;width:100%}
   .torrent-grid{grid-template-columns:1fr}
   .appbar{flex-direction:column;align-items:flex-start;gap:12px}
 }
@@ -2057,11 +2070,10 @@ async function refreshApiToken(){
 }
 syncApiTokenMeta();
 function resolveTheme(){
-  let theme='dark';
+  let theme='light';
   try{
     const stored=localStorage.getItem(themeKey);
     if(stored==='light'||stored==='dark'){theme=stored;}
-    else if(window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches){theme='light';}
   }catch(e){}
   return theme;
 }
@@ -3131,7 +3143,6 @@ fn app_body_html(state: &UiState) -> String {
         (state.seed_ratio * 10.0).round() as u32
     ));
     out.push_str("</div>");
-    out.push_str("</div>");
 
     // RSS panel
     out.push_str("<div class=\"panel\">");
@@ -3219,7 +3230,7 @@ fn app_body_html(state: &UiState) -> String {
             let info_hash = escape_html(&torrent.info_hash);
             let download_dir = escape_html(&torrent.download_dir);
             let total_bytes = human_bytes(torrent.total_bytes);
-            let completed_bytes = if torrent.completed_bytes > 0 || torrent.total_pieces == 0 {
+            let mut completed_bytes = if torrent.completed_bytes > 0 || torrent.total_pieces == 0 {
                 torrent.completed_bytes
             } else {
                 torrent
@@ -3227,6 +3238,9 @@ fn app_body_html(state: &UiState) -> String {
                     .saturating_mul(torrent.completed_pieces as u64)
                     / torrent.total_pieces.max(1) as u64
             };
+            if bucket == "complete" && torrent.total_bytes > 0 {
+                completed_bytes = torrent.total_bytes;
+            }
             let completed_label = human_bytes(completed_bytes.min(torrent.total_bytes));
             let downloaded_label = human_bytes(torrent.downloaded_bytes);
             let uploaded_label = human_bytes(torrent.uploaded_bytes);
@@ -3731,6 +3745,34 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
 
+    fn torrent_list_is_inside_layout(html: &str) -> bool {
+        let mut index = 0usize;
+        let mut div_stack: Vec<&'static str> = Vec::new();
+        while let Some(start_rel) = html[index..].find('<') {
+            let start = index + start_rel;
+            let Some(end_rel) = html[start..].find('>') else {
+                break;
+            };
+            let end = start + end_rel + 1;
+            let tag = &html[start..end];
+            if tag.starts_with("<div") {
+                if tag.contains("class=\"layout\"") {
+                    div_stack.push("layout");
+                } else {
+                    div_stack.push("div");
+                }
+            } else if tag.starts_with("</div") {
+                if div_stack.pop().is_none() {
+                    return false;
+                }
+            } else if tag.starts_with("<main") && tag.contains("class=\"torrent-list\"") {
+                return div_stack.iter().any(|kind| *kind == "layout");
+            }
+            index = end;
+        }
+        false
+    }
+
     fn run_single_request(request_bytes: &[u8], cmd_tx: Option<mpsc::Sender<UiCommand>>) -> String {
         let state = Arc::new(Mutex::new(UiState::default()));
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
@@ -3868,5 +3910,53 @@ mod tests {
         assert_eq!(format_eta_secs(3661), "01:01:01");
         assert_eq!(escape_html("<a&\"'>"), "&lt;a&amp;&quot;&#39;&gt;");
         assert_eq!(escape_json("a\"b\\\n"), "a\\\"b\\\\\\n");
+    }
+
+    #[test]
+    fn desktop_layout_breakpoints_keep_two_columns_until_small_widths() {
+        let html = status_html(&UiState::default());
+        assert!(html.contains(".app{width:100%;max-width:1600px"));
+        assert!(html.contains(".layout{"));
+        assert!(html.contains("display:flex;"));
+        assert!(html.contains(".sidebar{"));
+        assert!(html.contains("flex:0 0 260px;"));
+        assert!(html.contains("width:260px;"));
+        assert!(html.contains("@media(max-width:900px){"));
+        assert!(html.contains(".layout{gap:16px}"));
+        assert!(html.contains(".sidebar{flex-basis:240px;width:240px}"));
+        assert!(html.contains("@media(max-width:520px){"));
+        assert!(html.contains(".layout{flex-direction:column}"));
+    }
+
+    #[test]
+    fn theme_defaults_to_light_without_saved_preference() {
+        let html = status_html(&UiState::default());
+        assert!(html.contains("if(t!=='light'&&t!=='dark'){t='light';}"));
+        assert!(html.contains("function resolveTheme(){"));
+        assert!(html.contains("let theme='light';"));
+    }
+
+    #[test]
+    fn torrent_list_is_nested_inside_layout_container() {
+        let html = app_body_html(&UiState::default());
+        assert!(torrent_list_is_inside_layout(&html));
+    }
+
+    #[test]
+    fn seeding_bucket_renders_full_progress_even_if_bytes_lag() {
+        let mut state = UiState::default();
+        state.torrents.push(UiTorrent {
+            id: 7,
+            name: "ubuntu.iso".to_string(),
+            status: "seeding".to_string(),
+            total_bytes: 1000,
+            completed_bytes: 998,
+            total_pieces: 10,
+            completed_pieces: 9,
+            ..UiTorrent::default()
+        });
+
+        let html = app_body_html(&state);
+        assert!(html.contains("Progress 1000 B / 1000 B (100.00%)"));
     }
 }

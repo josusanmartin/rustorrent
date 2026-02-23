@@ -2302,14 +2302,9 @@ fn run_torrent(
 
         let mut seed_start: Option<Instant> = None;
         while !torrent_stop_requested(&stop_flag) {
-            let is_complete = {
+            let (is_complete, completed_pieces, completed_bytes) = {
                 let p = pieces.lock().unwrap();
-                p.is_complete()
-            };
-
-            let completed_bytes = {
-                let p = pieces.lock().unwrap();
-                p.completed_bytes()
+                (p.is_complete(), p.completed_pieces(), p.completed_bytes())
             };
             let downloaded = downloaded.load(Ordering::SeqCst);
             let uploaded = uploaded.load(Ordering::SeqCst);
@@ -2491,6 +2486,7 @@ fn run_torrent(
                 "downloading"
             };
             update_ui(ui_state, |state| {
+                set_torrent_completion_ui(state, request.id, completed_pieces, completed_bytes);
                 if state.current_id == Some(request.id) {
                     state.tracker_peers = known_count;
                     state.paused = is_paused();
@@ -2507,6 +2503,8 @@ fn run_torrent(
                     torrent.active_peers = active_count;
                     torrent.paused = paused;
                     torrent.status = torrent_status.to_string();
+                    torrent.completed_pieces = completed_pieces;
+                    torrent.completed_bytes = completed_bytes;
                     torrent.downloaded_bytes = downloaded;
                     torrent.uploaded_bytes = uploaded;
                     torrent.download_rate_bps = down_rate;
@@ -8042,6 +8040,22 @@ where
     state.torrents.push(entry);
 }
 
+fn set_torrent_completion_ui(
+    state: &mut ui::UiState,
+    torrent_id: u64,
+    completed_pieces: usize,
+    completed_bytes: u64,
+) {
+    update_torrent_entry(state, torrent_id, |torrent| {
+        torrent.completed_pieces = completed_pieces;
+        torrent.completed_bytes = completed_bytes;
+    });
+    if state.current_id == Some(torrent_id) {
+        state.completed_pieces = completed_pieces;
+        state.completed_bytes = completed_bytes;
+    }
+}
+
 fn apply_piece_completion_ui(
     state: &mut ui::UiState,
     torrent_id: u64,
@@ -8129,6 +8143,52 @@ mod ui_progress_tests {
             .unwrap();
         assert_eq!(torrent2.completed_pieces, 3);
         assert_eq!(torrent2.completed_bytes, 216);
+        assert_eq!(state.completed_pieces, 1);
+        assert_eq!(state.completed_bytes, 100);
+    }
+
+    #[test]
+    fn completion_sync_updates_current_torrent_and_root_fields() {
+        let mut state = ui::UiState {
+            current_id: Some(2),
+            completed_pieces: 1,
+            completed_bytes: 100,
+            torrents: vec![torrent_entry(1, 1, 100), torrent_entry(2, 2, 200)],
+            ..ui::UiState::default()
+        };
+
+        set_torrent_completion_ui(&mut state, 2, 4, 400);
+
+        let torrent2 = state
+            .torrents
+            .iter()
+            .find(|torrent| torrent.id == 2)
+            .unwrap();
+        assert_eq!(torrent2.completed_pieces, 4);
+        assert_eq!(torrent2.completed_bytes, 400);
+        assert_eq!(state.completed_pieces, 4);
+        assert_eq!(state.completed_bytes, 400);
+    }
+
+    #[test]
+    fn completion_sync_does_not_mutate_root_for_non_current_torrent() {
+        let mut state = ui::UiState {
+            current_id: Some(1),
+            completed_pieces: 1,
+            completed_bytes: 100,
+            torrents: vec![torrent_entry(1, 1, 100), torrent_entry(2, 2, 200)],
+            ..ui::UiState::default()
+        };
+
+        set_torrent_completion_ui(&mut state, 2, 4, 400);
+
+        let torrent2 = state
+            .torrents
+            .iter()
+            .find(|torrent| torrent.id == 2)
+            .unwrap();
+        assert_eq!(torrent2.completed_pieces, 4);
+        assert_eq!(torrent2.completed_bytes, 400);
         assert_eq!(state.completed_pieces, 1);
         assert_eq!(state.completed_bytes, 100);
     }
