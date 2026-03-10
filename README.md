@@ -185,12 +185,29 @@ Forces the client to use TCP only. Useful if uTP causes issues with your network
 ### Tuning peer counts
 
 ```sh
+# Use presets instead of hand-tuning every peer knob
+rustorrent --peer-profile conservative ubuntu.torrent
+rustorrent --peer-profile balanced ubuntu.torrent
+rustorrent --peer-profile aggressive ubuntu.torrent
+
 # Allow more peers globally and per torrent
 rustorrent --max-peers 500 --max-peers-torrent 80 ubuntu.torrent
 
 # Limit concurrent active torrents
 rustorrent --max-active 2 file1.torrent file2.torrent file3.torrent
 ```
+
+Profiles adjust `--max-peers`, `--max-peers-torrent`, `--numwant`, and the magnet metadata peer discovery limit:
+
+| Profile | Global peers | Per torrent | Tracker `numwant` | Magnet metadata peers |
+|---------|--------------|-------------|-------------------|-----------------------|
+| `conservative` | `80` | `12` | `50` | `20` |
+| `balanced` | `200` | `30` | `200` | `80` |
+| `aggressive` | `500` | `80` | `500` | `160` |
+
+`balanced` is the default and matches the previous behavior. If you also pass `--max-peers`, `--max-peers-torrent`, or `--numwant`, those explicit flags override the preset.
+
+The web UI exposes the same setting in the Transfer panel.
 
 ### Write cache
 
@@ -221,10 +238,20 @@ rustorrent --create ./my-project \
 rustorrent --config rustorrent.conf ubuntu.torrent
 ```
 
+Example config:
+
+```ini
+peer_profile = conservative
+```
+
 Or set the environment variable:
 
 ```sh
 export RUSTORRENT_CONFIG=~/.config/rustorrent.conf
+rustorrent ubuntu.torrent
+
+# Or set the preset directly
+export RUSTORRENT_PEER_PROFILE=conservative
 rustorrent ubuntu.torrent
 ```
 
@@ -243,6 +270,8 @@ rustorrent --ui-addr 0.0.0.0:8080 ubuntu.torrent
 
 Open `http://127.0.0.1:8080` in your browser. The UI lets you add/remove torrents, see progress, manage files, and configure settings. Use `--ui-addr 0.0.0.0:8080` to make it accessible from other machines on your network.
 
+The web UI also includes a qBittorrent-style search panel. It can install raw `*.py` search plugins, run searches through qBittorrent's `nova3` runtime, and add search results back into rustorrent with one click. This requires `python3` to be available on the machine. Community plugins from the [qBittorrent unofficial search plugin wiki](https://github.com/qbittorrent/search-plugins/wiki/Unofficial-search-plugins) can be installed directly from the UI.
+
 ## All options
 
 | Flag | Default | Description |
@@ -258,6 +287,7 @@ Open `http://127.0.0.1:8080` in your browser. The UI lets you add/remove torrent
 | `--encryption <mode>` | `prefer` | `disable`, `prefer`, or `require` |
 | `--no-encryption` | | Shorthand for `--encryption disable` |
 | `--utp` / `--no-utp` | on | Enable or disable uTP |
+| `--peer-profile <name>` | `balanced` | Peer preset: `conservative`, `balanced`, or `aggressive` |
 | `--max-peers <n>` | `200` | Global peer limit |
 | `--max-peers-torrent <n>` | `30` | Per-torrent peer limit |
 | `--max-active <n>` | `4` | Max concurrent active torrents |

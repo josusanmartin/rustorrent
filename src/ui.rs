@@ -36,6 +36,10 @@ pub enum UiCommand {
         torrent_id: u64,
         reply: mpsc::Sender<UiCommandResult>,
     },
+    ArchiveTorrent {
+        torrent_id: u64,
+        reply: mpsc::Sender<UiCommandResult>,
+    },
     DeleteTorrent {
         torrent_id: u64,
         remove_data: bool,
@@ -58,6 +62,10 @@ pub enum UiCommand {
     },
     SetSeedRatio {
         ratio: f64,
+        reply: mpsc::Sender<UiCommandResult>,
+    },
+    SetPeerProfile {
+        profile: String,
         reply: mpsc::Sender<UiCommandResult>,
     },
     SetLabel {
@@ -153,7 +161,13 @@ pub struct UiState {
     pub global_download_limit_bps: u64,
     pub global_upload_limit_bps: u64,
     pub seed_ratio: f64,
+    pub peer_profile: String,
+    pub peer_profile_global_limit: usize,
+    pub peer_profile_torrent_limit: usize,
+    pub peer_profile_numwant: u32,
     pub proxy_label: String,
+    pub download_history_bps: Vec<f64>,
+    pub upload_history_bps: Vec<f64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -267,19 +281,17 @@ pub fn start(
     let listener = TcpListener::bind(&addr)?;
     let active_connections = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
-        for stream in listener.incoming() {
-            if let Ok(stream) = stream {
-                let Some(slot_guard) = try_acquire_ui_connection_slot(&active_connections) else {
-                    let _ = send_api_error_with_status(stream, 503, "ui busy");
-                    continue;
-                };
-                let state = state.clone();
-                let cmd_tx = cmd_tx.clone();
-                thread::spawn(move || {
-                    let _slot_guard = slot_guard;
-                    let _ = handle_connection(stream, state, cmd_tx);
-                });
-            }
+        for stream in listener.incoming().flatten() {
+            let Some(slot_guard) = try_acquire_ui_connection_slot(&active_connections) else {
+                let _ = send_api_error_with_status(stream, 503, "ui busy");
+                continue;
+            };
+            let state = state.clone();
+            let cmd_tx = cmd_tx.clone();
+            thread::spawn(move || {
+                let _slot_guard = slot_guard;
+                let _ = handle_connection(stream, state, cmd_tx);
+            });
         }
     });
     Ok(())
@@ -326,6 +338,7 @@ fn handle_connection(
         if path == "/torrent/pause"
             || path == "/torrent/resume"
             || path == "/torrent/stop"
+            || path == "/torrent/archive"
             || path == "/torrent/delete"
         {
             if let Err(err) = handle_torrent_action(&path, &query, &cmd_tx) {
@@ -396,6 +409,13 @@ fn handle_connection(
             }
             return send_api_ok(stream);
         }
+        if path == "/settings/peer-profile" {
+            if let Err(err) = handle_set_peer_profile(&request, &cmd_tx) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
         if path == "/torrent/set-label" {
             if let Err(err) = handle_set_label(&request, &state, &cmd_tx) {
                 update_error(&state, &err);
@@ -445,18 +465,61 @@ fn handle_connection(
             }
             return send_api_ok(stream);
         }
+        if path == "/search/install-url" {
+            if let Err(err) = handle_search_install_url(&request) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
+        if path == "/search/install-plugin" {
+            if let Err(err) = handle_search_install_plugin(&request, &query) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
+        if path == "/search/remove-plugin" {
+            if let Err(err) = handle_search_remove_plugin(&request) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
+        if path == "/search/run" {
+            if let Err(err) = handle_search_run(&request) {
+                update_error(&state, &err);
+                return send_api_error(stream, &err);
+            }
+            return send_api_ok(stream);
+        }
+        if path == "/search/add-result" {
+            let torrent_id = match handle_search_add_result(&request, &state, &cmd_tx) {
+                Ok(torrent_id) => torrent_id,
+                Err(err) => {
+                    update_error(&state, &err);
+                    return send_api_error(stream, &err);
+                }
+            };
+            return send_api_ok_with_torrent_id(stream, torrent_id);
+        }
         return send_api_error_with_status(stream, 404, "unknown endpoint");
     }
 
+    if path == "/search/status" {
+        let body = crate::search::status_json();
+        return send_json_body(stream, 200, &body);
+    }
+    if path == "/search/catalog" {
+        let refresh = query_value(&query, "refresh")
+            .map(parse_bool)
+            .unwrap_or(false);
+        let body = crate::search::catalog_json(refresh);
+        return send_json_body(stream, 200, &body);
+    }
     if path == "/rss/status" {
         let body = rss_status_json();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let _ = stream.write_all(response.as_bytes());
-        return Ok(());
+        return send_json_body(stream, 200, &body);
     }
 
     let mut guard = lock_state(&state);
@@ -951,6 +1014,113 @@ fn rss_status_json() -> String {
     out
 }
 
+fn handle_search_install_url(request: &HttpRequest) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let url = query_value(&form, "url")
+        .ok_or_else(|| "missing url".to_string())?
+        .trim()
+        .to_string();
+    if url.is_empty() {
+        return Err("empty url".to_string());
+    }
+    let _ = crate::search::install_plugin_from_url(&url)?;
+    Ok(())
+}
+
+fn handle_search_install_plugin(
+    request: &HttpRequest,
+    query: &[(String, String)],
+) -> Result<(), String> {
+    if request.body.is_empty() {
+        return Err("empty plugin upload".to_string());
+    }
+    let filename = query_value(query, "filename")
+        .ok_or_else(|| "missing filename".to_string())?
+        .to_string();
+    let _ = crate::search::install_plugin_from_bytes(&filename, &request.body)?;
+    Ok(())
+}
+
+fn handle_search_remove_plugin(request: &HttpRequest) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let module = query_value(&form, "module")
+        .ok_or_else(|| "missing module".to_string())?
+        .trim()
+        .to_string();
+    if module.is_empty() {
+        return Err("empty module".to_string());
+    }
+    crate::search::remove_plugin(&module)
+}
+
+fn handle_search_run(request: &HttpRequest) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let query = query_value(&form, "query")
+        .ok_or_else(|| "missing query".to_string())?
+        .trim()
+        .to_string();
+    let category = query_value(&form, "category").unwrap_or("all").to_string();
+    let engines = query_value(&form, "engines")
+        .unwrap_or("")
+        .split(',')
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    crate::search::start_search(&query, &category, &engines)
+}
+
+fn handle_search_add_result(
+    request: &HttpRequest,
+    state: &Arc<Mutex<UiState>>,
+    cmd_tx: &Option<mpsc::Sender<UiCommand>>,
+) -> Result<u64, String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let index = query_value(&form, "index")
+        .ok_or_else(|| "missing index".to_string())?
+        .parse::<usize>()
+        .map_err(|_| "invalid index".to_string())?;
+    let download_dir = query_value(&form, "dir").unwrap_or("").to_string();
+    let preallocate = query_value(&form, "prealloc")
+        .map(parse_bool)
+        .unwrap_or(false);
+
+    let result = crate::search::resolve_result(index)?;
+    let command_result = match result {
+        crate::search::SearchDownload::Magnet(magnet) => {
+            dispatch_command(cmd_tx, |reply| UiCommand::AddMagnet {
+                magnet,
+                download_dir,
+                preallocate,
+                reply,
+            })?
+        }
+        crate::search::SearchDownload::TorrentBytes(data) => {
+            dispatch_command(cmd_tx, |reply| UiCommand::AddTorrent {
+                data,
+                download_dir,
+                preallocate,
+                reply,
+            })?
+        }
+    };
+    let torrent_id = match command_result {
+        UiCommandSuccess::TorrentAdded { torrent_id } => torrent_id,
+        UiCommandSuccess::Ok => {
+            return Err("ui command response missing torrent id".to_string());
+        }
+    };
+
+    if let Ok(mut guard) = state.lock() {
+        guard.last_added = "search result".to_string();
+        guard.status = "queued".to_string();
+    }
+    Ok(torrent_id)
+}
+
 fn handle_rate_limits(
     request: &HttpRequest,
     state: &Arc<Mutex<UiState>>,
@@ -1008,6 +1178,20 @@ fn handle_set_seed_ratio(
         return Err("ratio must be >= 0".to_string());
     }
     dispatch_command_ok(cmd_tx, |reply| UiCommand::SetSeedRatio { ratio, reply })
+}
+
+fn handle_set_peer_profile(
+    request: &HttpRequest,
+    cmd_tx: &Option<mpsc::Sender<UiCommand>>,
+) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(&request.body);
+    let form = parse_query_pairs(&body_str);
+    let profile = query_value(&form, "profile")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "missing profile".to_string())?
+        .to_string();
+    dispatch_command_ok(cmd_tx, |reply| UiCommand::SetPeerProfile { profile, reply })
 }
 
 fn handle_set_label(
@@ -1130,12 +1314,14 @@ fn handle_torrent_action(
         Pause,
         Resume,
         Stop,
+        Archive,
         Delete { remove_data: bool },
     }
     let action = match path {
         "/torrent/pause" => TorrentActionKind::Pause,
         "/torrent/resume" => TorrentActionKind::Resume,
         "/torrent/stop" => TorrentActionKind::Stop,
+        "/torrent/archive" => TorrentActionKind::Archive,
         "/torrent/delete" => TorrentActionKind::Delete {
             remove_data: query_value(query, "data").map(parse_bool).unwrap_or(false),
         },
@@ -1145,6 +1331,7 @@ fn handle_torrent_action(
         TorrentActionKind::Pause => UiCommand::PauseTorrent { torrent_id, reply },
         TorrentActionKind::Resume => UiCommand::ResumeTorrent { torrent_id, reply },
         TorrentActionKind::Stop => UiCommand::StopTorrent { torrent_id, reply },
+        TorrentActionKind::Archive => UiCommand::ArchiveTorrent { torrent_id, reply },
         TorrentActionKind::Delete { remove_data } => UiCommand::DeleteTorrent {
             torrent_id,
             remove_data,
@@ -1532,17 +1719,26 @@ fn status_html(state: &UiState) -> String {
   --state-press:rgba(11,87,208,.12);
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{min-height:100%}
+html,body{height:100%;overflow:hidden}
 body{
   font:14px/1.5 "Inter",system-ui,-apple-system,sans-serif;
   color:var(--on-surface);
   background:var(--bg);
   -webkit-font-smoothing:antialiased;
 }
-.app{width:100%;max-width:1600px;margin:0 auto;padding:16px 24px 48px}
+.app{
+  width:100%;
+  max-width:1600px;
+  height:100svh;
+  max-height:100svh;
+  margin:0 auto;
+  padding:16px 24px 24px;
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
+}
 .appbar{
-  position:sticky;
-  top:0;
+  position:relative;
   z-index:20;
   display:flex;
   align-items:center;
@@ -1576,7 +1772,24 @@ body{
   border:1px solid var(--outline-var);
 }
 .chip .material-symbols-rounded{font-size:16px}
+.appbar-main{display:flex;align-items:center;gap:18px;min-width:0;flex:1 1 auto}
 .toolbar{display:flex;gap:8px;flex-wrap:wrap}
+.app-tabs{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.tab-btn{
+  display:inline-flex;align-items:center;gap:6px;
+  height:34px;padding:0 14px;border-radius:999px;
+  border:1px solid var(--outline-var);
+  background:transparent;color:var(--on-surface-var);
+  font:600 12px/1 "Inter",sans-serif;letter-spacing:.04em;
+  cursor:pointer;transition:background .15s ease,color .15s ease,border-color .15s ease;
+}
+.tab-btn .material-symbols-rounded{font-size:17px}
+.tab-btn:hover{background:var(--state-hover)}
+.tab-btn.active{
+  background:var(--primary-cont);
+  color:var(--on-primary-cont);
+  border-color:transparent;
+}
 .btn{
   display:inline-flex;align-items:center;gap:6px;
   height:36px;
@@ -1599,15 +1812,21 @@ body{
 .btn.danger{background:var(--danger-cont);color:var(--error)}
 .btn.ghost{background:transparent;color:var(--on-surface-var)}
 .btn.ghost:hover{background:var(--state-hover)}
+.btn.active{background:var(--primary-cont);color:var(--on-primary-cont)}
 .btn.icon-btn{width:40px;height:40px;padding:0;border-radius:20px;justify-content:center}
 .btn.icon-btn .material-symbols-rounded{font-size:20px}
 :root.theme-switching,:root.theme-switching *{transition:none!important;animation:none!important}
 .layout{
   display:flex;
-  align-items:flex-start;
+  align-items:stretch;
   gap:24px;
   margin-top:24px;
+  flex:1 1 auto;
+  min-height:0;
+  overflow:hidden;
 }
+.workspace{display:none}
+.workspace.active{display:flex}
 .panel{
   background:var(--surface);
   border:1px solid var(--outline-var);
@@ -1621,14 +1840,34 @@ body{
   letter-spacing:.1em;
   color:var(--on-surface-var);
 }
+.panel-head{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:12px;
+}
+.panel-toggle{
+  height:30px;
+  padding:0 10px;
+  border-radius:10px;
+  font-size:12px;
+  flex-shrink:0;
+}
+.transfer-panel .transfer-panel-body{margin-top:12px}
+.transfer-panel[data-collapsed="true"] .transfer-panel-body{display:none}
 .sidebar{
   flex:0 0 260px;
   width:260px;
   position:sticky;
-  top:72px;
+  top:0;
+  max-height:100%;
   align-self:start;
   display:flex;flex-direction:column;gap:16px;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  padding-right:4px;
 }
+.search-sidebar{flex-basis:340px;width:340px}
 .nav{display:flex;flex-direction:column;gap:2px;margin-top:12px}
 .nav-item{
   display:flex;align-items:center;justify-content:space-between;
@@ -1708,7 +1947,11 @@ body{
   flex-direction:column;
   gap:12px;
   min-width:0;
-  align-self:start;
+  min-height:0;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  scrollbar-gutter:stable;
+  padding-right:8px;
 }
 .torrent-card{
   position:relative;
@@ -1812,12 +2055,78 @@ body{
   grid-template-columns:1fr 1fr;
   gap:12px;
   margin-top:14px;
+  max-height:60vh;
+  overflow:auto;
+  overscroll-behavior:contain;
+  padding-right:6px;
 }
+.detail-actions{
+  grid-column:1 / -1;
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.detail-actions .btn{
+  height:32px;
+  padding:0 12px;
+  border-radius:10px;
+  font-size:12px;
+}
+.speed-panel{grid-column:1 / -1}
+.speed-chart{
+  margin-top:12px;
+  border-radius:12px;
+  border:1px solid var(--outline-var);
+  background:linear-gradient(180deg,var(--surface) 0%,var(--surface-cont) 100%);
+  padding:10px 12px 12px;
+}
+.speed-chart svg{display:block;width:100%;height:120px}
+.speed-chart-empty{
+  min-height:120px;
+  display:grid;
+  place-items:center;
+  color:var(--on-surface-var);
+  font:500 12px "Inter",sans-serif;
+}
+.speed-legend{
+  display:flex;
+  gap:14px;
+  flex-wrap:wrap;
+  margin-top:10px;
+  font:500 11px "Inter",sans-serif;
+  color:var(--on-surface-var);
+  letter-spacing:.05em;
+  text-transform:uppercase;
+}
+.speed-legend .item{display:inline-flex;align-items:center;gap:6px}
+.speed-legend .swatch{
+  width:10px;
+  height:10px;
+  border-radius:999px;
+  display:inline-block;
+}
+.speed-legend .swatch.down{background:var(--primary)}
+.speed-legend .swatch.up{background:var(--tertiary)}
 .subpanel{
   background:var(--surface-cont);
   border:1px solid var(--outline-var);
   border-radius:12px;
   padding:14px 16px;
+}
+.tracker-list{
+  margin-top:10px;
+  max-height:240px;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  padding-right:4px;
+}
+.tracker-list::-webkit-scrollbar{width:8px}
+.tracker-list::-webkit-scrollbar-thumb{
+  background:var(--outline-var);
+  border-radius:999px;
+}
+.tracker-item{
+  min-height:40px;
 }
 .kv{
   display:grid;
@@ -1988,6 +2297,200 @@ body{
   font:600 10px "Inter",sans-serif;text-transform:uppercase;
   letter-spacing:.06em;color:var(--on-surface-var);margin-top:12px;margin-bottom:4px;
 }
+.search-form{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+.search-form .input,.search-form select{height:34px;padding:0 10px;font-size:12px;border-radius:10px}
+.search-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.search-actions .btn{height:32px;padding:0 12px;font-size:12px;border-radius:10px}
+.search-warning{
+  margin-top:8px;
+  padding:12px;
+  border-radius:14px;
+  border:1px solid rgba(37,99,235,.2);
+  background:rgba(37,99,235,.08);
+}
+.search-warning-title{
+  font:700 12px "Inter",sans-serif;
+  color:var(--on-surface);
+  letter-spacing:.04em;
+  text-transform:uppercase;
+}
+.search-warning-copy{
+  margin-top:6px;
+  font-size:12px;
+  line-height:1.5;
+  color:var(--on-surface-var);
+}
+.search-warning .btn{margin-top:10px;height:32px;padding:0 12px;font-size:12px;border-radius:10px}
+.search-plugin-list{
+  max-height:150px;overflow:auto;margin-top:8px;
+  border:1px solid var(--outline-var);border-radius:10px;background:var(--surface-cont);
+}
+.search-plugin-row{
+  display:flex;align-items:flex-start;gap:8px;padding:8px 10px;
+  border-bottom:1px solid var(--outline-var);font-size:12px;
+}
+.search-plugin-row:last-child{border-bottom:none}
+.search-plugin-row input[type="checkbox"]{margin-top:2px;accent-color:var(--primary)}
+.search-plugin-meta{flex:1;min-width:0}
+.search-plugin-name{font:600 12px "Inter",sans-serif;color:var(--on-surface);display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.search-plugin-badge{
+  display:inline-flex;align-items:center;height:18px;padding:0 6px;border-radius:999px;
+  font:600 10px "Inter",sans-serif;letter-spacing:.04em;text-transform:uppercase;
+  background:var(--surface-cont-high);color:var(--on-surface-var);
+}
+.search-plugin-badge.ready{background:var(--success-cont);color:var(--success)}
+.search-plugin-url{font-size:11px;color:var(--on-surface-var);word-break:break-all;margin-top:2px}
+.search-plugin-cats{font-size:11px;color:var(--on-surface-var);margin-top:2px}
+.search-install-upload{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.search-install-upload .btn{height:32px;padding:0 12px;font-size:12px;border-radius:10px}
+.search-upload-label{position:relative;overflow:hidden}
+.search-upload-label input[type="file"]{position:absolute;inset:0;opacity:0;cursor:pointer}
+.search-catalog{margin-top:10px}
+.search-catalog-list{
+  max-height:220px;overflow:auto;
+  border:1px solid var(--outline-var);border-radius:10px;background:var(--surface-cont);
+}
+.search-recommended-list{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+  gap:10px;
+  margin-top:8px;
+}
+.search-recommended-card{
+  border:1px solid var(--outline-var);
+  border-radius:12px;
+  background:var(--surface-cont);
+  padding:12px;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.search-recommended-name{
+  font:600 13px "Inter",sans-serif;
+  color:var(--on-surface);
+  display:flex;
+  align-items:center;
+  gap:6px;
+  flex-wrap:wrap;
+}
+.search-recommended-copy{
+  font-size:11px;
+  color:var(--on-surface-var);
+  line-height:1.5;
+}
+.search-recommended-meta{
+  font-size:11px;
+  color:var(--on-surface-var);
+}
+.search-recommended-card .btn{
+  align-self:flex-start;
+  height:30px;
+  padding:0 12px;
+  font-size:12px;
+  border-radius:9px;
+}
+.search-catalog-item{
+  padding:10px;border-bottom:1px solid var(--outline-var);
+  display:flex;justify-content:space-between;gap:8px;align-items:flex-start;
+}
+.search-catalog-item:last-child{border-bottom:none}
+.search-catalog-info{flex:1;min-width:0}
+.search-catalog-name{font:600 12px "Inter",sans-serif;color:var(--on-surface)}
+.search-catalog-meta{font-size:11px;color:var(--on-surface-var);margin-top:2px}
+.search-catalog-comment{font-size:11px;color:var(--on-surface-var);margin-top:4px}
+.search-catalog-item .btn{height:28px;padding:0 10px;font-size:11px;border-radius:8px;flex-shrink:0}
+.search-alert{
+  margin-top:8px;padding:8px 10px;border-radius:10px;
+  background:var(--danger-cont);color:var(--error);font-size:12px;
+}
+.search-note{margin-top:8px;font-size:11px;color:var(--on-surface-var)}
+.search-selection-summary{
+  padding:10px 12px;border-radius:12px;
+  background:var(--surface-cont);
+  border:1px solid var(--outline-var);
+  color:var(--on-surface-var);
+  font:500 12px "Inter",sans-serif;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  flex-wrap:wrap;
+}
+.search-selection-text{min-width:0;flex:1}
+.search-panel-actions{display:flex;gap:8px;flex-wrap:wrap}
+.search-panel-actions .btn{height:32px;padding:0 12px;font-size:12px;border-radius:10px}
+.search-results-panel{min-height:0}
+.search-main-panel{display:none}
+.search-main-panel.active{display:flex;flex-direction:column;gap:12px}
+.search-plugin-manager{min-height:0}
+.search-plugin-manager-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.search-plugin-manager-copy{max-width:620px}
+.search-plugin-manager-copy .small{margin-top:6px}
+.search-plugin-manager-tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.search-plugin-manager-tools .btn{height:32px;padding:0 12px;font-size:12px;border-radius:10px}
+.search-results-grid{display:flex;flex-direction:column;gap:10px}
+.search-results-empty{font-size:12px;color:var(--on-surface-var)}
+.search-results-table-wrap{
+  overflow:auto;
+  border:1px solid var(--outline-var);
+  border-radius:14px;
+  background:var(--surface-cont);
+}
+.search-results-table{
+  width:100%;
+  border-collapse:collapse;
+  min-width:860px;
+  font:400 12px "Inter",sans-serif;
+}
+.search-results-table th,.search-results-table td{
+  padding:10px 12px;
+  border-bottom:1px solid var(--outline-var);
+  vertical-align:top;
+  text-align:left;
+}
+.search-results-table th{
+  position:sticky;
+  top:0;
+  background:var(--surface-cont-high);
+  z-index:1;
+  font:600 10px "Inter",sans-serif;
+  text-transform:uppercase;
+  letter-spacing:.06em;
+  color:var(--on-surface-var);
+  white-space:nowrap;
+}
+.search-results-table tbody tr:hover{background:rgba(127,127,127,.05)}
+.search-sort-btn{
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  border:none;
+  background:none;
+  color:inherit;
+  font:inherit;
+  letter-spacing:inherit;
+  text-transform:inherit;
+  padding:0;
+  cursor:pointer;
+}
+.search-result-title{
+  font:600 14px/1.35 "Inter",sans-serif;
+  color:var(--on-surface);
+  word-break:break-word;
+}
+.search-result-link{display:inline-block;margin-top:6px;font-size:11px;color:var(--primary);text-decoration:none;word-break:break-all}
+.search-result-link:hover{text-decoration:underline}
+.search-results-table .btn{
+  height:30px;
+  padding:0 12px;
+  font-size:12px;
+  border-radius:9px;
+  flex-shrink:0;
+}
+.search-results-table .btn.added{
+  background:#d7dbe3;border-color:#d7dbe3;color:#5c6573;
+  box-shadow:none;pointer-events:none;
+}
 .country-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .country-tag{
   display:inline-flex;align-items:center;gap:4px;padding:4px 10px;
@@ -1995,6 +2498,27 @@ body{
   border-radius:8px;font-size:12px;
 }
 .country-tag b{font-weight:700;color:var(--on-surface)}
+.toast-stack{
+  position:fixed;right:24px;bottom:24px;z-index:90;
+  display:flex;flex-direction:column;gap:10px;pointer-events:none;
+}
+.toast{
+  min-width:240px;max-width:360px;padding:12px 14px;
+  border-radius:14px;border:1px solid rgba(37,99,235,.18);
+  background:rgba(255,255,255,.96);box-shadow:0 20px 45px rgba(15,23,42,.16);
+  color:var(--on-surface);display:flex;align-items:flex-start;gap:10px;
+  opacity:0;transform:translateY(14px) scale(.98);
+  transition:opacity .22s ease,transform .26s cubic-bezier(.22,1,.36,1);
+}
+.toast.show{opacity:1;transform:translateY(0) scale(1)}
+.toast-icon{
+  width:24px;height:24px;border-radius:999px;flex:0 0 auto;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:rgba(37,99,235,.12);color:var(--primary);font-size:16px;font-weight:700;
+}
+.toast-copy{min-width:0}
+.toast-title{font:700 13px/1.2 "Inter",sans-serif;color:var(--on-surface)}
+.toast-body{margin-top:4px;font-size:12px;line-height:1.4;color:var(--on-surface-var)}
 .inline-form{display:flex;gap:6px;align-items:center;margin-top:8px}
 .inline-form .input{
   flex:1;min-width:0;height:30px;padding:0 8px;font-size:12px;border-radius:8px;
@@ -2017,20 +2541,27 @@ body{
 @media(max-width:900px){
   .layout{gap:16px}
   .sidebar{flex-basis:240px;width:240px}
+  .search-sidebar{flex-basis:300px;width:300px}
 }
 @media(max-width:520px){
   .layout{flex-direction:column}
   .sidebar{position:static;flex-basis:auto;width:100%}
   .torrent-grid{grid-template-columns:1fr}
   .appbar{flex-direction:column;align-items:flex-start;gap:12px}
+  .appbar-main{width:100%;flex-wrap:wrap}
+  .app-tabs{width:100%}
+  .tab-btn{flex:1;justify-content:center}
 }
 @media(max-width:700px){
-  .app{padding:0 16px 32px}
+  .app{padding:0 16px 16px}
   .appbar{margin:0 -16px;padding:12px 16px;border-radius:0}
   .torrent-title{font-size:16px}
   .add-prefs{flex-direction:column}
   .add-download-row{flex-direction:column}
   .torrent-stats{grid-template-columns:repeat(2,1fr)}
+  .search-result-card{flex-direction:column}
+  .toast-stack{left:16px;right:16px;bottom:16px}
+  .toast{min-width:0;max-width:none}
 }
 </style></head><body>"#);
     out.push_str("<div class=\"app\" id=\"appRoot\">");
@@ -2040,11 +2571,26 @@ body{
     out.push_str(r#"const themeKey='rustorrent-theme';
 const filterKey='rustorrent-library-filter';
 const searchKey='rustorrent-library-search';
+const mainTabKey='rustorrent-main-tab';
+const searchPluginSelectionKey='rustorrent-search-plugins';
+const searchCategoryKey='rustorrent-search-category';
+const searchSortStorageKey='rustorrent-search-sort';
 const collapsePrefix='rustorrent-collapse:';
+const panelCollapsePrefix='rustorrent-panel:';
 let pendingHtml=null;
 let activeTheme=null;
 let queuedLiveHtml=null;
 let liveRenderTimer=null;
+let searchStateCache=null;
+let searchCatalogCache=[];
+let searchPollTimer=null;
+let searchPollActive=false;
+let searchCatalogLoading=false;
+let searchCatalogFetchedAt=0;
+let activeSearchPanelView='results';
+const addedSearchResults=new Set();
+let lastSearchStartedAt=0;
+let activeSearchSort={key:'seeds',dir:'desc'};
 const liveRenderIntervalMs=450;
 const MAX_RATE_LIMIT_KBPS=102400;
 const apiTokenMeta=document.querySelector('meta[name="rustorrent-api-token"]');
@@ -2088,6 +2634,35 @@ function applyTheme(theme){
   const themeBtn=document.getElementById('themeToggle');
   if(themeBtn){themeBtn.innerHTML='<span class="material-symbols-rounded">'+(theme==='light'?'light_mode':'dark_mode')+'</span>';}
 }
+function resolveMainTab(){
+  try{
+    const value=localStorage.getItem(mainTabKey)||'library';
+    if(value==='search'){return 'search';}
+  }catch(e){}
+  return 'library';
+}
+function applyMainTab(tab){
+  const next=tab==='search'?'search':'library';
+  const tabs=Array.from(document.querySelectorAll('[data-main-tab-target]'));
+  tabs.forEach(btn=>btn.classList.toggle('active',btn.dataset.mainTabTarget===next));
+  const workspaces=Array.from(document.querySelectorAll('.workspace[data-main-tab]'));
+  workspaces.forEach(view=>view.classList.toggle('active',view.dataset.mainTab===next));
+  if(next==='search'&&searchCatalogCache.length===0&&!searchCatalogLoading){
+    loadSearchCatalog(true).catch(err=>console.warn('search catalog failed',err));
+  }
+}
+function resolveSearchPanelView(){return activeSearchPanelView;}
+function applySearchPanelView(view){
+  const next=view==='plugins'?'plugins':'results';
+  activeSearchPanelView=next;
+  const panels=Array.from(document.querySelectorAll('[data-search-view]'));
+  panels.forEach(panel=>panel.classList.toggle('active',panel.dataset.searchView===next));
+  const toggles=Array.from(document.querySelectorAll('[data-search-view-target]'));
+  toggles.forEach(btn=>btn.classList.toggle('active',btn.dataset.searchViewTarget===next));
+  if(next==='plugins'&&searchCatalogCache.length===0&&!searchCatalogLoading){
+    loadSearchCatalog(true).catch(err=>console.warn('search catalog failed',err));
+  }
+}
 function resolveFilter(){
   let filter='all';
   try{const stored=localStorage.getItem(filterKey);if(stored){filter=stored;}}catch(e){}
@@ -2118,6 +2693,16 @@ function applyFilter(filter){
   });
 }
 function collapseKey(hash){return collapsePrefix+hash;}
+function panelCollapseKey(name){return panelCollapsePrefix+name;}
+function defaultPanelCollapsed(name){return name==='transfer';}
+function isPanelCollapsed(name){
+  try{
+    const stored=localStorage.getItem(panelCollapseKey(name));
+    if(stored==='1'){return true;}
+    if(stored==='0'){return false;}
+  }catch(e){}
+  return defaultPanelCollapsed(name);
+}
 function applyCollapseState(){
   const cards=Array.from(document.querySelectorAll('.torrent-card'));
   cards.forEach(card=>{
@@ -2131,6 +2716,19 @@ function applyCollapseState(){
     card.dataset.collapsed=collapsed?'true':'false';
     const toggle=card.querySelector("[data-action='toggle-expand']");
     if(toggle){toggle.innerHTML=collapsed?'<span class="material-symbols-rounded">unfold_more</span>Expand':'<span class="material-symbols-rounded">unfold_less</span>Collapse';toggle.setAttribute('aria-expanded',collapsed?'false':'true');}
+  });
+}
+function applyPanelState(){
+  const panels=Array.from(document.querySelectorAll('[data-panel]'));
+  panels.forEach(panel=>{
+    const name=panel.dataset.panel||'';
+    const collapsed=isPanelCollapsed(name);
+    panel.dataset.collapsed=collapsed?'true':'false';
+    const toggle=panel.querySelector('[data-action="toggle-panel"]');
+    if(toggle){
+      toggle.innerHTML=collapsed?'<span class="material-symbols-rounded">unfold_more</span>Expand':'<span class="material-symbols-rounded">unfold_less</span>Collapse';
+      toggle.setAttribute('aria-expanded',collapsed?'false':'true');
+    }
   });
 }
 function syncAttributes(current,next){
@@ -2212,9 +2810,14 @@ function renderApp(html){
     morphChildren(root,tpl.content);
   }
   applyTheme(activeTheme||resolveTheme());
+  applyMainTab(resolveMainTab());
+  applySearchPanelView(resolveSearchPanelView());
   applyFilter(resolveFilter());
   applyCollapseState();
+  applyPanelState();
   updateRateLimitLabels();
+  if(searchStateCache){renderSearchStatus(searchStateCache);}
+  if(searchCatalogCache.length>0){renderSearchCatalog(searchCatalogCache);}
 }
 function scheduleLiveRender(html){
   queuedLiveHtml=html;
@@ -2296,6 +2899,31 @@ function actionErrorMessage(err){
   if(err&&err.message){return err.message;}
   return String(err||'unknown error');
 }
+function toastStack(){
+  let stack=document.querySelector('.toast-stack');
+  if(stack){return stack;}
+  stack=document.createElement('div');
+  stack.className='toast-stack';
+  document.body.appendChild(stack);
+  return stack;
+}
+function showToast(title,message){
+  const stack=toastStack();
+  const toast=document.createElement('div');
+  toast.className='toast';
+  toast.innerHTML=''
+    +'<div class="toast-icon"><span class="material-symbols-rounded" style="font-size:16px">check</span></div>'
+    +'<div class="toast-copy">'
+    +'<div class="toast-title">'+escapeHtml(title||'Done')+'</div>'
+    +(message?('<div class="toast-body">'+escapeHtml(message)+'</div>'):'')
+    +'</div>';
+  stack.appendChild(toast);
+  requestAnimationFrame(()=>toast.classList.add('show'));
+  setTimeout(()=>{
+    toast.classList.remove('show');
+    setTimeout(()=>toast.remove(),260);
+  },2600);
+}
 function showActionError(err){
   alert('Action failed: '+actionErrorMessage(err));
 }
@@ -2342,6 +2970,493 @@ async function apiPostJson(url,options){
     }catch(e){}
   }
   return {ok:true};
+}
+async function fetchJson(url){
+  const res=await fetch(url,{cache:'no-store',headers:{'Accept':'application/json'}});
+  if(!res.ok){
+    let message='HTTP '+res.status;
+    try{
+      const data=await res.json();
+      if(data&&typeof data.error==='string'&&data.error.trim()){message=data.error.trim();}
+    }catch(e){}
+    throw new Error(message);
+  }
+  return res.json();
+}
+function loadStoredSearchPlugins(){
+  try{
+    const raw=localStorage.getItem(searchPluginSelectionKey)||'[]';
+    const parsed=JSON.parse(raw);
+    if(Array.isArray(parsed)){return parsed.map(v=>String(v||'')).filter(Boolean);}
+  }catch(e){}
+  return [];
+}
+function saveStoredSearchPlugins(modules){
+  try{localStorage.setItem(searchPluginSelectionKey,JSON.stringify(modules||[]));}catch(e){}
+}
+function resolveSearchCategory(){
+  try{
+    const value=localStorage.getItem(searchCategoryKey)||'all';
+    return value||'all';
+  }catch(e){}
+  return 'all';
+}
+function saveSearchCategory(value){
+  try{localStorage.setItem(searchCategoryKey,String(value||'all'));}catch(e){}
+}
+function resolveSearchSort(){
+  try{
+    const raw=localStorage.getItem(searchSortStorageKey)||'';
+    const [key,dir]=raw.split(':');
+    if(key&&dir&&(dir==='asc'||dir==='desc')){
+      return {key:String(key),dir:String(dir)};
+    }
+  }catch(e){}
+  return {key:'seeds',dir:'desc'};
+}
+function saveSearchSort(sort){
+  try{localStorage.setItem(searchSortStorageKey,String(sort.key||'seeds')+':'+String(sort.dir||'desc'));}catch(e){}
+}
+function setSearchSort(key){
+  const nextKey=String(key||'seeds');
+  const nextDir=(activeSearchSort.key===nextKey&&activeSearchSort.dir==='desc')?'asc':'desc';
+  activeSearchSort={key:nextKey,dir:nextDir};
+  saveSearchSort(activeSearchSort);
+  renderSearchResults(searchStateCache&&Array.isArray(searchStateCache.results)?searchStateCache.results:[]);
+}
+function activeSearchPlugins(plugins){
+  const available=(Array.isArray(plugins)?plugins:[]).filter(plugin=>plugin&&plugin.healthy).map(plugin=>String(plugin.module||'')).filter(Boolean);
+  const stored=loadStoredSearchPlugins().filter(module=>available.indexOf(module)!==-1);
+  if(stored.length>0){return stored;}
+  return available;
+}
+function selectedSearchPluginsFromDom(){
+  return Array.from(document.querySelectorAll('input[data-search-plugin]'))
+    .filter(input=>input.checked&&!input.disabled)
+    .map(input=>String(input.getAttribute('data-search-plugin')||''))
+    .filter(Boolean);
+}
+function persistSearchPluginSelectionFromDom(){
+  saveStoredSearchPlugins(selectedSearchPluginsFromDom());
+}
+function recommendedCatalogModules(){
+  return ['piratebay','1337x','bitsearch','limetorrents','torlock','nyaasi','eztv','yts'];
+}
+function recommendedCatalogEntries(entries){
+  const preferred=recommendedCatalogModules();
+  const excluded=new Set(['magnetdl']);
+  const byModule=new Map();
+  const byName=new Map();
+  for(const entry of (Array.isArray(entries)?entries:[])){
+    if(!entry){continue;}
+    const module=String(entry.module||'').toLowerCase();
+    const name=String(entry.name||'').toLowerCase();
+    if(excluded.has(module)||name.includes('magnetdl')){continue;}
+    if(module){byModule.set(module,entry);}
+    if(name){byName.set(name,entry);}
+  }
+  const picked=[];
+  for(const key of preferred){
+    const normalized=String(key||'').toLowerCase();
+    const entry=byModule.get(normalized)||Array.from(byName.values()).find(item=>String(item.name||'').toLowerCase().includes(normalized));
+    if(entry&&!picked.some(item=>item.module===entry.module)){
+      picked.push(entry);
+    }
+  }
+  return picked;
+}
+function useAllReadyPlugins(){
+  const plugins=Array.isArray(searchStateCache&&searchStateCache.plugins)?searchStateCache.plugins:[];
+  const all=plugins.filter(plugin=>plugin&&plugin.healthy).map(plugin=>String(plugin.module||'')).filter(Boolean);
+  saveStoredSearchPlugins(all);
+  renderSearchStatus(searchStateCache||{plugins:plugins||[]});
+}
+function renderSearchPluginList(plugins){
+  const list=document.getElementById('searchPluginList');
+  if(!list){return;}
+  const visiblePlugins=(Array.isArray(plugins)?plugins:[]).filter(plugin=>plugin&&String(plugin.module||'')!=='__init__');
+  const selected=activeSearchPlugins(visiblePlugins);
+  saveStoredSearchPlugins(selected);
+  if(visiblePlugins.length===0){
+    list.innerHTML='<div class="rss-item"><span class="rss-item-info">No search plugins installed yet.</span></div>';
+    return;
+  }
+  list.innerHTML=visiblePlugins.map(plugin=>{
+    const module=escapeHtml(plugin.module||'');
+    const checked=selected.indexOf(plugin.module)!==-1;
+    const healthy=!!plugin.healthy;
+    const badge=healthy?'<span class="search-plugin-badge ready">Ready</span>':'<span class="search-plugin-badge">Needs fix</span>';
+    const version=plugin.version?(' v'+escapeHtml(plugin.version)):'';
+    const cats=Array.isArray(plugin.categories)&&plugin.categories.length>0?escapeHtml(plugin.categories.join(', ')):'all';
+    const url=plugin.site_url?'<div class="search-plugin-url">'+escapeHtml(plugin.site_url)+'</div>':'';
+    const reason=plugin.broken_reason?'<div class="search-plugin-cats">Issue: '+escapeHtml(plugin.broken_reason)+'</div>':'';
+    return ''
+      +'<div class="search-plugin-row">'
+      +'<input type="checkbox" data-search-plugin="'+module+'" '+(checked&&healthy?'checked ':'')+(healthy?'':'disabled ')+'>'
+      +'<div class="search-plugin-meta">'
+      +'<div class="search-plugin-name">'+escapeHtml(plugin.display_name||plugin.module||'plugin')+version+badge+'</div>'
+      +url
+      +'<div class="search-plugin-cats">Categories: '+cats+'</div>'
+      +reason
+      +'</div>'
+      +'<button class="btn ghost" type="button" data-action="search-remove-plugin" data-module="'+module+'">Remove</button>'
+      +'</div>';
+  }).join('');
+}
+function renderRecommendedCatalog(entries){
+  const container=document.getElementById('searchRecommended');
+  if(!container){return;}
+  const recommended=recommendedCatalogEntries(entries);
+  if(recommended.length===0){
+    container.innerHTML='<div class="rss-item"><span class="rss-item-info">Recommended public plugins will appear here when they are available in the live catalog.</span></div>';
+    return;
+  }
+  container.innerHTML='<div class="search-recommended-list">'+recommended.map(entry=>''
+    +'<div class="search-recommended-card">'
+    +'<div class="search-recommended-name">'+escapeHtml(entry.name||entry.module||'plugin')
+      +(entry.installed?(' <span class="search-plugin-badge'+(entry.installed_healthy?' ready':'')+'">'+(entry.installed_healthy?'Installed':'Needs fix')+'</span>'):'')
+      +'</div>'
+    +'<div class="search-recommended-copy">'+escapeHtml(entry.comment||'Popular public search source.')+'</div>'
+    +'<div class="search-recommended-meta">'+escapeHtml([entry.author||'',entry.version?('wiki v'+entry.version):'',entry.updated||''].filter(Boolean).join(' / '))+'</div>'
+    +'<button class="btn primary" type="button" data-action="search-install-catalog" data-url="'+escapeHtml(entry.download_url||'')+'">'+(entry.installed?'Update':'Install')+'</button>'
+    +'</div>'
+  ).join('')+'</div>';
+}
+function renderSearchResults(results){
+  const container=document.getElementById('searchResults');
+  if(!container){return;}
+  if(!activeSearchSort||!activeSearchSort.key){
+    activeSearchSort=resolveSearchSort();
+  }
+  if(!Array.isArray(results)||results.length===0){
+    container.innerHTML='<div class="search-results-empty"><div>Results will appear here after you search.</div><div class="small" style="margin-top:6px">Enter a query on the left, click Search, and use Manage Plugins if you want to enable or install providers.</div></div>';
+    return;
+  }
+  const sortKey=String(activeSearchSort&&activeSearchSort.key||'seeds');
+  const sortDir=String(activeSearchSort&&activeSearchSort.dir||'desc');
+  const multiplier=sortDir==='asc'?1:-1;
+  const sorted=results.slice().sort((left,right)=>{
+    const key=sortKey;
+    let cmp=0;
+    if(key==='name'){
+      cmp=String(left.name||'').localeCompare(String(right.name||''));
+    }else if(key==='plugin'){
+      cmp=String(left.plugin||left.site_url||'').localeCompare(String(right.plugin||right.site_url||''));
+    }else if(key==='size'){
+      cmp=(Number(left.size)||0)-(Number(right.size)||0);
+    }else if(key==='leech'){
+      cmp=(Number(left.leech)||0)-(Number(right.leech)||0);
+    }else if(key==='updated'){
+      cmp=(Number(left.pub_date)||0)-(Number(right.pub_date)||0);
+    }else{
+      cmp=(Number(left.seeds)||0)-(Number(right.seeds)||0);
+    }
+    if(cmp===0){
+      cmp=String(left.name||'').localeCompare(String(right.name||''));
+    }
+    return cmp*multiplier;
+  });
+  const sortIcon=(key)=>{
+    if(sortKey!==key){return 'unfold_more';}
+    return sortDir==='asc'?'arrow_upward':'arrow_downward';
+  };
+  const sortHeader=(key,label)=>'<button class="search-sort-btn" type="button" data-search-sort="'+key+'">'+label+'<span class="material-symbols-rounded" style="font-size:14px">'+sortIcon(key)+'</span></button>';
+  const formatUpdated=(value)=>{
+    const ts=Number(value)||0;
+    if(ts<=0){return '—';}
+    const date=new Date(ts*1000);
+    if(Number.isNaN(date.getTime())){return '—';}
+    return date.toLocaleDateString();
+  };
+  container.innerHTML=''
+    +'<div class="search-results-table-wrap"><table class="search-results-table">'
+    +'<thead><tr>'
+    +'<th>'+sortHeader('name','Name')+'</th>'
+    +'<th>'+sortHeader('plugin','Plugin')+'</th>'
+    +'<th>'+sortHeader('size','Size')+'</th>'
+    +'<th>'+sortHeader('seeds','Seeds')+'</th>'
+    +'<th>'+sortHeader('leech','Leech')+'</th>'
+    +'<th>'+sortHeader('updated','Updated')+'</th>'
+    +'<th>Action</th>'
+    +'</tr></thead><tbody>'
+    +sorted.map(result=>{
+      const added=addedSearchResults.has(String(result.index));
+      const pluginLabel=result.plugin?escapeHtml(result.plugin):escapeHtml(result.site_url||'plugin');
+      const size=Number(result.size);
+      const seeds=Number(result.seeds);
+      const leech=Number(result.leech);
+      const desc=result.desc_link?'<a class="search-result-link" href="'+escapeHtml(result.desc_link)+'" target="_blank" rel="noopener noreferrer">Open description</a>':'';
+      return ''
+        +'<tr>'
+        +'<td><div class="search-result-title">'+escapeHtml(result.name||'result')+'</div>'+desc+'</td>'
+        +'<td>'+pluginLabel+'</td>'
+        +'<td>'+(size>0?formatBytes(size):'size unknown')+'</td>'
+        +'<td>'+(seeds>=0?seeds:'?')+'</td>'
+        +'<td>'+(leech>=0?leech:'?')+'</td>'
+        +'<td>'+formatUpdated(result.pub_date)+'</td>'
+        +'<td><button class="btn primary'+(added?' added':'')+'" type="button" data-action="search-add-result" data-index="'+escapeHtml(String(result.index))+'" data-name="'+escapeHtml(result.name||'Search result')+'" '+(added?'disabled aria-disabled="true"':'')+'>'+(added?'Added':'Add')+'</button></td>'
+        +'</tr>';
+    }).join('')
+    +'</tbody></table></div>';
+}
+function renderSearchStatus(data){
+  searchStateCache=data||null;
+  if(!activeSearchSort||!activeSearchSort.key){
+    activeSearchSort=resolveSearchSort();
+  }
+  const startedAt=Number(data&&data.last_started_at)||0;
+  if(startedAt>0&&startedAt!==lastSearchStartedAt){
+    lastSearchStartedAt=startedAt;
+    addedSearchResults.clear();
+  }
+  const category=document.getElementById('searchCategory');
+  if(category&&category.value!==resolveSearchCategory()){category.value=resolveSearchCategory();}
+  const pluginError=document.getElementById('searchPluginError');
+  if(pluginError){
+    const message=(data&&data.plugin_error?String(data.plugin_error):'').trim();
+    pluginError.textContent=message;
+    pluginError.style.display=message?'block':'none';
+  }
+  renderSearchPluginList(data&&Array.isArray(data.plugins)?data.plugins:[]);
+  renderSearchResults(data&&Array.isArray(data.results)?data.results:[]);
+  const summary=document.getElementById('searchSelectionSummary');
+  const warning=document.getElementById('searchPluginWarning');
+  if(summary){
+    const plugins=Array.isArray(data&&data.plugins)?data.plugins:[];
+    const selected=activeSearchPlugins(plugins);
+    const healthyCount=plugins.filter(plugin=>plugin&&plugin.healthy).length;
+    let summaryHtml='';
+    if(healthyCount===0){
+      summaryHtml='<span class="search-selection-text">No ready plugins installed yet.</span>';
+    }else if(selected.length===healthyCount){
+      summaryHtml='<span class="search-selection-text">Using all '+healthyCount+' ready plugins.</span>';
+    }else{
+      summaryHtml='<span class="search-selection-text">Using '+selected.length+' of '+healthyCount+' ready plugins. Some providers are disabled in Plugins.</span>'
+        +'<button class="btn ghost" type="button" onclick="useAllReadyPlugins()">Use All</button>';
+    }
+    summary.innerHTML=summaryHtml;
+  }
+  if(warning){
+    const plugins=Array.isArray(data&&data.plugins)?data.plugins:[];
+    const healthyCount=plugins.filter(plugin=>plugin&&plugin.healthy).length;
+    if(healthyCount===0){
+      warning.style.display='block';
+      warning.innerHTML=''
+        +'<div class="search-warning-title">No Search Plugins Installed</div>'
+        +'<div class="search-warning-copy">Install at least one public plugin before searching. rustorrent does not ship with active public search providers by default.</div>'
+        +'<button class="btn primary" type="button" data-search-view-target="plugins"><span class="material-symbols-rounded">extension</span>Manage Plugins</button>';
+    }else{
+      warning.style.display='none';
+      warning.innerHTML='';
+    }
+  }
+  const queryInput=document.getElementById('searchQuery');
+  if(queryInput&&!queryInput.matches(':focus')){
+    const next=data&&typeof data.query==='string'?data.query:'';
+    if(queryInput.value!==next){queryInput.value=next;}
+  }
+  const status=document.getElementById('searchStatusText');
+  if(status){
+    let message='Enter a query on the left and click Search. Use Manage Plugins to change providers.';
+    if(data&&data.busy){message='Searching across installed plugins...';}
+    else if(data&&data.last_error){message=String(data.last_error);}
+    else if(data&&Array.isArray(data.results)&&data.results.length>0){message='Found '+data.results.length+' search results.';}
+    else if(data&&Array.isArray(data.plugins)&&data.plugins.length>0){message='Installed plugins are ready. Enter a query to search.';}
+    status.textContent=message;
+  }
+  if(!(data&&data.busy)){
+    searchPollActive=false;
+    if(searchPollTimer!==null){
+      clearTimeout(searchPollTimer);
+      searchPollTimer=null;
+    }
+  }else{
+    scheduleSearchStatusPoll(900);
+  }
+}
+async function loadSearchStatus(_forceRefresh){
+  const data=await fetchJson('/search/status');
+  renderSearchStatus(data);
+  return data;
+}
+function scheduleSearchStatusPoll(delayMs){
+  if(searchPollActive){return;}
+  if(searchPollTimer!==null){
+    clearTimeout(searchPollTimer);
+  }
+  searchPollTimer=setTimeout(()=>pumpSearchStatus().catch(err=>console.warn(err)),delayMs);
+}
+async function pumpSearchStatus(){
+  if(searchPollActive){return;}
+  searchPollActive=true;
+  if(searchPollTimer!==null){
+    clearTimeout(searchPollTimer);
+    searchPollTimer=null;
+  }
+  try{
+    while(true){
+      const data=await fetchJson('/search/status');
+      renderSearchStatus(data);
+      if(!(data&&data.busy)){break;}
+      await sleep(900);
+    }
+  }finally{
+    searchPollActive=false;
+  }
+}
+function renderSearchCatalog(entries){
+  const container=document.getElementById('searchCatalog');
+  if(!container){return;}
+  renderRecommendedCatalog(entries);
+  const meta=document.getElementById('searchCatalogMeta');
+  const filter=document.getElementById('searchCatalogFilter');
+  const search=filter?String(filter.value||'').trim().toLowerCase():'';
+  const sorted=(Array.isArray(entries)?entries:[]).slice().sort((a,b)=>{
+    const installedA=!!(a&&a.installed);
+    const installedB=!!(b&&b.installed);
+    if(installedA!==installedB){return installedA?-1:1;}
+    return String(a&&a.name||'').localeCompare(String(b&&b.name||''));
+  });
+  const filtered=sorted.filter(entry=>{
+    if(!search){return true;}
+    const haystack=[entry.name,entry.author,entry.comment,entry.version,entry.module].join(' ').toLowerCase();
+    return haystack.includes(search);
+  });
+  if(meta){
+    if(searchCatalogLoading){
+      meta.textContent='Loading latest qBittorrent unofficial plugin list...';
+    }else if(searchCatalogFetchedAt>0){
+      meta.textContent='Live list loaded from the qBittorrent unofficial search plugin wiki.';
+    }else{
+      meta.textContent='Latest unofficial qBittorrent search plugins.';
+    }
+  }
+  if(filtered.length===0){
+    container.innerHTML='<div class="rss-item"><span class="rss-item-info">'+(search?'No community plugins match that filter.':'Load the community list to install unofficial qBittorrent plugins with one click.')+'</span></div>';
+    return;
+  }
+  container.innerHTML=filtered.map(entry=>''
+    +'<div class="search-catalog-item">'
+    +'<div class="search-catalog-info">'
+    +'<div class="search-catalog-name">'+escapeHtml(entry.name||'plugin')
+      +(entry.private_site?' <span class="search-plugin-badge">Private</span>':'')
+      +(entry.installed?(' <span class="search-plugin-badge'+(entry.installed_healthy?' ready':'')+'">'+(entry.installed_healthy?'Installed':'Needs fix')+'</span>'):'')
+      +'</div>'
+    +'<div class="search-catalog-meta">'+escapeHtml([entry.author||'',entry.version?('wiki v'+entry.version):'',entry.installed&&entry.installed_version?('installed v'+entry.installed_version):'',entry.updated||'',entry.module||''].filter(Boolean).join(' / '))+'</div>'
+    +(entry.comment?'<div class="search-catalog-comment">'+escapeHtml(entry.comment)+'</div>':'')
+    +'</div>'
+    +'<button class="btn primary" type="button" data-action="search-install-catalog" data-url="'+escapeHtml(entry.download_url||'')+'">'+(entry.installed?'Update':'Install')+'</button>'
+    +'</div>'
+  ).join('');
+}
+async function loadSearchCatalog(force){
+  if(searchCatalogLoading){return {entries:searchCatalogCache};}
+  searchCatalogLoading=true;
+  renderSearchCatalog(searchCatalogCache);
+  const suffix=force?'?refresh=1':'';
+  try{
+    const data=await fetchJson('/search/catalog'+suffix);
+    searchCatalogCache=Array.isArray(data&&data.entries)?data.entries:[];
+    searchCatalogFetchedAt=Number(data&&data.fetched_at)||0;
+    renderSearchCatalog(searchCatalogCache);
+    if(data&&data.error){
+      const box=document.getElementById('searchPluginError');
+      if(box){
+        box.textContent=String(data.error);
+        box.style.display='block';
+      }
+    }
+    return data;
+  }finally{
+    searchCatalogLoading=false;
+    renderSearchCatalog(searchCatalogCache);
+  }
+}
+async function installCatalogPlugin(url){
+  if(!url){return;}
+  await apiPost('/search/install-url',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)});
+  await Promise.all([
+    loadSearchStatus(true),
+    loadSearchCatalog(true),
+  ]);
+}
+async function updateInstalledCatalogPlugins(){
+  const installed=(searchCatalogCache||[]).filter(entry=>entry&&entry.installed&&entry.download_url);
+  if(installed.length===0){
+    alert('No installed community plugins are linked to the live catalog.');
+    return;
+  }
+  for(const entry of installed){
+    await apiPost('/search/install-url',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(entry.download_url)});
+  }
+  await Promise.all([
+    loadSearchStatus(true),
+    loadSearchCatalog(true),
+  ]);
+}
+async function submitSearchQuery(e){
+  if(e){e.preventDefault();}
+  const queryInput=document.getElementById('searchQuery');
+  const categoryInput=document.getElementById('searchCategory');
+  const query=queryInput?String(queryInput.value||'').trim():'';
+  const category=categoryInput?String(categoryInput.value||'all'):'all';
+  const engines=selectedSearchPluginsFromDom();
+  if(!query){alert('Enter a search query.');return false;}
+  saveStoredSearchPlugins(engines);
+  saveSearchCategory(category);
+  addedSearchResults.clear();
+  lastSearchStartedAt=0;
+  const body='query='+encodeURIComponent(query)+'&category='+encodeURIComponent(category)+'&engines='+encodeURIComponent(engines.join(','));
+  await apiPost('/search/run',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
+  applySearchPanelView('results');
+  scheduleSearchStatusPoll(100);
+  await loadSearchStatus(false);
+  return false;
+}
+async function installSearchPluginUrl(e){
+  if(e){e.preventDefault();}
+  const input=document.getElementById('searchPluginUrl');
+  const url=input?String(input.value||'').trim():'';
+  if(!url){return false;}
+  await installCatalogPlugin(url);
+  if(input){input.value='';}
+  return false;
+}
+async function installSearchPluginFile(e){
+  const input=e&&e.target?e.target:null;
+  const file=input&&input.files&&input.files[0]?input.files[0]:null;
+  if(!file){return;}
+  const bytes=new Uint8Array(await file.arrayBuffer());
+  await apiPost('/search/install-plugin?filename='+encodeURIComponent(file.name),{headers:{'Content-Type':'text/x-python'},body:bytes});
+  if(input){input.value='';}
+  await Promise.all([
+    loadSearchStatus(true),
+    loadSearchCatalog(true),
+  ]);
+}
+async function removeSearchPlugin(module){
+  if(!module){return;}
+  const ok=confirm('Remove search plugin '+module+'?');
+  if(!ok){return;}
+  await apiPost('/search/remove-plugin',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'module='+encodeURIComponent(module)});
+  await Promise.all([
+    loadSearchStatus(true),
+    loadSearchCatalog(true),
+  ]);
+}
+async function addSearchResult(index,name){
+  const downloadDir=document.getElementById('downloadDir');
+  const preallocate=document.getElementById('preallocate');
+  const body='index='+encodeURIComponent(index)
+    +'&dir='+encodeURIComponent(downloadDir?String(downloadDir.value||'').trim():'')
+    +'&prealloc='+(preallocate&&preallocate.checked?'1':'0');
+  await apiPostJson('/search/add-result',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
+  addedSearchResults.add(String(index));
+  if(searchStateCache&&Array.isArray(searchStateCache.results)){
+    renderSearchResults(searchStateCache.results);
+  }
+  showToast('Torrent added',name||'The search result was queued in rustorrent.');
+  scheduleRefreshFallback();
 }
 function escapeHtml(value){
   return String(value||'')
@@ -2696,6 +3811,27 @@ async function waitForTorrentIdByHash(infoHash,timeoutMs){
 }
 document.addEventListener('click',e=>{
   const target=e.target;
+  const mainTabBtn=target&&target.closest('[data-main-tab-target]');
+  if(mainTabBtn){
+    const tab=mainTabBtn.dataset.mainTabTarget==='search'?'search':'library';
+    try{localStorage.setItem(mainTabKey,tab);}catch(e){}
+    applyMainTab(tab);
+    if(tab==='search'){
+      loadSearchCatalog(true).catch(showActionError);
+    }
+    return;
+  }
+  const searchViewBtn=target&&target.closest('[data-search-view-target]');
+  if(searchViewBtn){
+    const view=searchViewBtn.dataset.searchViewTarget==='plugins'?'plugins':'results';
+    applySearchPanelView(view);
+    return;
+  }
+  const searchSortBtn=target&&target.closest('[data-search-sort]');
+  if(searchSortBtn){
+    setSearchSort(searchSortBtn.dataset.searchSort||'seeds');
+    return;
+  }
   if(target&&target.closest('#themeToggle')){
     let theme=activeTheme||resolveTheme();
     theme=theme==='dark'?'light':'dark';
@@ -2710,16 +3846,40 @@ document.addEventListener('click',e=>{
   }
   const actionBtn=target.closest('[data-action]');
   if(actionBtn){
+    const action=actionBtn.dataset.action;
+    if(action==='toggle-panel'){
+      const name=actionBtn.dataset.panel||'';
+      try{
+        const collapsed=isPanelCollapsed(name);
+        localStorage.setItem(panelCollapseKey(name),collapsed?'0':'1');
+      }catch(e){}
+      applyPanelState();
+      return;
+    }
+    if(action==='search-remove-plugin'){
+      removeSearchPlugin(actionBtn.dataset.module||'').catch(showActionError);
+      return;
+    }
+    if(action==='search-install-catalog'){
+      const url=actionBtn.dataset.url||'';
+      if(!url){return;}
+      installCatalogPlugin(url).catch(showActionError);
+      return;
+    }
+    if(action==='search-add-result'){
+      addSearchResult(actionBtn.dataset.index||'',actionBtn.dataset.name||'Search result').catch(showActionError);
+      return;
+    }
     const card=actionBtn.closest('.torrent-card');
     const id=card?card.dataset.id:'';
     if(!id){return;}
-    const action=actionBtn.dataset.action;
     const paused=card.dataset.paused==='true';
-    if(action==='toggle-pause'){togglePause(id,paused).catch(showActionError);}
-    else if(action==='stop'){torrentAction('stop',id).catch(showActionError);}
-    else if(action==='delete'){confirmDelete(id,card.dataset.name||'torrent').catch(showActionError);}
-    else if(action==='open-folder'){torrentAction('open-folder',id).catch(showActionError);}
-    else if(action==='recheck'){torrentAction('recheck',id).catch(showActionError);}
+      if(action==='toggle-pause'){togglePause(id,paused).catch(showActionError);}
+      else if(action==='stop'){torrentAction('stop',id).catch(showActionError);}
+      else if(action==='archive'){torrentAction('archive',id).catch(showActionError);}
+      else if(action==='delete'){confirmDelete(id,card.dataset.name||'torrent').catch(showActionError);}
+      else if(action==='open-folder'){torrentAction('open-folder',id).catch(showActionError);}
+      else if(action==='recheck'){torrentAction('recheck',id).catch(showActionError);}
     else if(action==='toggle-expand'){toggleExpand(card);}
     else if(action==='add-tracker'){
       const input=card.querySelector('.tracker-add-input');
@@ -2745,6 +3905,10 @@ document.addEventListener('input',e=>{
     applyFilter(resolveFilter());
     return;
   }
+  if(target&&target.id==='searchCatalogFilter'){
+    renderSearchCatalog(searchCatalogCache);
+    return;
+  }
   if(target&&(target.id==='downloadLimit'||target.id==='uploadLimit')){
     updateRateLimitLabels();
   }
@@ -2756,6 +3920,14 @@ document.addEventListener('input',e=>{
 });
 document.addEventListener('change',e=>{
   const target=e.target;
+  if(target&&target.matches('input[data-search-plugin]')){
+    persistSearchPluginSelectionFromDom();
+    return;
+  }
+  if(target&&target.id==='searchCategory'){
+    saveSearchCategory(target.value||'all');
+    return;
+  }
   if(target&&(target.id==='downloadLimit'||target.id==='uploadLimit')){
     setGlobalRateLimits().catch(showActionError);
   }
@@ -2763,6 +3935,9 @@ document.addEventListener('change',e=>{
     const v=Number(target.value)/10;
     const body='ratio='+encodeURIComponent(v);
     apiPost('/settings/seed-ratio',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).catch(showActionError);
+  }
+  if(target&&target.id==='peerProfile'){
+    setPeerProfile().catch(showActionError);
   }
 });
 function toggleExpand(card){
@@ -2785,6 +3960,13 @@ async function setGlobalRateLimits(){
   updateRateLimitLabels();
   const body='download_kbps='+encodeURIComponent(downloadKbps)+'&upload_kbps='+encodeURIComponent(uploadKbps);
   await apiPost('/rate-limits',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
+}
+async function setPeerProfile(){
+  const select=document.getElementById('peerProfile');
+  if(!select){return;}
+  const profile=String(select.value||'balanced').trim().toLowerCase();
+  const body='profile='+encodeURIComponent(profile);
+  await apiPost('/settings/peer-profile',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
 }
 async function applyPostAddPlan(plan){
   if(!plan){return;}
@@ -2834,11 +4016,15 @@ async function submitAdd(){
       const torrentId=Number(addResponse&&addResponse.torrent_id);
       postPlan.torrentId=Number.isFinite(torrentId)&&torrentId>0?torrentId:null;
       closeAdd();
+      showToast(
+        'Torrent added',
+        (!startWhenAdded)
+          ? ((addDraft.name||file.name||'Torrent')+' was added and will be paused.')
+          : ((addDraft.name||file.name||'Torrent')+' was added to rustorrent.')
+      );
       scheduleRefreshFallback();
       if((postPlan.torrentId!==null||postPlan.infoHash)&&(postPlan.skipFiles.length>0||postPlan.startPaused)){
         applyPostAddPlan(postPlan).catch(err=>alert('Torrent added, but follow-up settings failed: '+actionErrorMessage(err)));
-      }else if(!startWhenAdded){
-        alert('Torrent added. Use Pause once it appears.');
       }
       return false;
     }
@@ -2848,13 +4034,19 @@ async function submitAdd(){
       const addResponse=await apiPostJson('/add-magnet',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
       const torrentId=Number(addResponse&&addResponse.torrent_id);
       closeAdd();
+      showToast(
+        'Magnet added',
+        !startWhenAdded
+          ? 'The magnet was added and will be paused after it appears.'
+          : 'The magnet was added to rustorrent.'
+      );
       scheduleRefreshFallback();
       if(!startWhenAdded){
         const plan={torrentId:Number.isFinite(torrentId)&&torrentId>0?torrentId:null,infoHash:infoHash,skipFiles:[],startPaused:true};
         if(plan.torrentId!==null||plan.infoHash){
           applyPostAddPlan(plan).catch(err=>alert('Magnet added, but auto-pause failed: '+actionErrorMessage(err)));
         }else{
-          alert('Magnet added. Pause it after metadata is available.');
+          showToast('Magnet added','Pause it after metadata is available.');
         }
       }
       return false;
@@ -2948,11 +4140,18 @@ function addRssRule(e){
   var body='name='+encodeURIComponent(name)+'&pattern='+encodeURIComponent(pattern);
   apiPost('/rss/add-rule',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(){location.reload()}).catch(function(err){alert('Add rule failed: '+actionErrorMessage(err))});
 }
+applyMainTab(resolveMainTab());
 applyTheme(resolveTheme());
+applySearchPanelView(resolveSearchPanelView());
+activeSearchSort=resolveSearchSort();
 applyFilter(resolveFilter());
 applyCollapseState();
 updateRateLimitLabels();
 renderAddReview();
+const searchCategoryInput=document.getElementById('searchCategory');
+if(searchCategoryInput){searchCategoryInput.value=resolveSearchCategory();}
+loadSearchStatus(false).catch(err=>console.warn('search status failed',err));
+loadSearchCatalog(true).catch(err=>console.warn('search catalog failed',err));
 let lastUpdateAt=Date.now();
 const source=new EventSource('/events');
 source.addEventListener('status',event=>{if(event&&event.data){applyUpdate(event.data);lastUpdateAt=Date.now();}});
@@ -2961,6 +4160,91 @@ source.onerror=()=>{console.warn('event source disconnected');};
     out.push_str("</script>");
     out.push_str("</body></html>");
     out
+}
+
+fn render_search_panel(out: &mut String) {
+    out.push_str("<div class=\"panel\">");
+    out.push_str("<div class=\"panel-title\"><span class=\"material-symbols-rounded\" style=\"font-size:16px;vertical-align:-3px;margin-right:4px\">travel_explore</span>Torrent Search</div>");
+    out.push_str("<form class=\"search-form\" onsubmit=\"submitSearchQuery(event)\">");
+    out.push_str("<input id=\"searchQuery\" class=\"input\" type=\"search\" placeholder=\"Search public torrent plugins\" autocomplete=\"off\">");
+    out.push_str("<select id=\"searchCategory\" class=\"input\">");
+    out.push_str("<option value=\"all\">All categories</option>");
+    out.push_str("<option value=\"anime\">Anime</option>");
+    out.push_str("<option value=\"books\">Books</option>");
+    out.push_str("<option value=\"games\">Games</option>");
+    out.push_str("<option value=\"movies\">Movies</option>");
+    out.push_str("<option value=\"music\">Music</option>");
+    out.push_str("<option value=\"pictures\">Pictures</option>");
+    out.push_str("<option value=\"software\">Software</option>");
+    out.push_str("<option value=\"tv\">TV</option>");
+    out.push_str("</select>");
+    out.push_str(
+        "<div id=\"searchPluginError\" class=\"search-alert\" style=\"display:none\"></div>",
+    );
+    out.push_str("<div id=\"searchSelectionSummary\" class=\"search-selection-summary\">Loading plugin selection...</div>");
+    out.push_str(
+        "<div id=\"searchPluginWarning\" class=\"search-warning\" style=\"display:none\"></div>",
+    );
+    out.push_str("<div class=\"search-panel-actions\">");
+    out.push_str("<button type=\"submit\" class=\"btn primary\">Search</button>");
+    out.push_str("</div>");
+    out.push_str("</form>");
+    out.push_str(
+        "<div class=\"search-note\">Search uses your enabled plugins. Open Plugins from the results header when you want to manage sources.</div>",
+    );
+    out.push_str("</div>");
+}
+
+fn render_search_results_panel(out: &mut String) {
+    out.push_str("<div class=\"panel search-results-panel search-main-panel active\" data-search-view=\"results\">");
+    out.push_str("<div class=\"panel-head\">");
+    out.push_str("<div><div class=\"panel-title\"><span class=\"material-symbols-rounded\" style=\"font-size:16px;vertical-align:-3px;margin-right:4px\">manage_search</span>Search Results</div>");
+    out.push_str("<div class=\"small\" id=\"searchStatusText\">Install a plugin and run a search to populate results.</div></div>");
+    out.push_str("<div class=\"search-plugin-manager-tools\">");
+    out.push_str("<button class=\"btn ghost\" type=\"button\" data-search-view-target=\"plugins\"><span class=\"material-symbols-rounded\">extension</span>Plugins</button>");
+    out.push_str("<button class=\"btn ghost panel-toggle\" type=\"button\" onclick=\"loadSearchStatus(true)\"><span class=\"material-symbols-rounded\">refresh</span>Refresh</button>");
+    out.push_str("</div>");
+    out.push_str("</div>");
+    out.push_str("<div id=\"searchResults\" class=\"search-results-grid\"><div class=\"search-results-empty\">No search results yet.</div></div>");
+    out.push_str("</div>");
+}
+
+fn render_search_plugin_manager(out: &mut String) {
+    out.push_str("<div class=\"panel search-plugin-manager search-main-panel\" data-search-view=\"plugins\">");
+    out.push_str("<div class=\"search-plugin-manager-head\">");
+    out.push_str("<div class=\"search-plugin-manager-copy\">");
+    out.push_str("<div class=\"panel-title\"><span class=\"material-symbols-rounded\" style=\"font-size:16px;vertical-align:-3px;margin-right:4px\">extension</span>Plugins</div>");
+    out.push_str("<div class=\"small\">Install, update, enable, and remove qBittorrent-compatible search plugins without leaving rustorrent.</div>");
+    out.push_str("</div>");
+    out.push_str("<div class=\"search-plugin-manager-tools\">");
+    out.push_str("<button type=\"button\" class=\"btn ghost\" onclick=\"loadSearchCatalog(true)\"><span class=\"material-symbols-rounded\">refresh</span>Reload Live List</button>");
+    out.push_str("<button type=\"button\" class=\"btn ghost\" onclick=\"updateInstalledCatalogPlugins()\"><span class=\"material-symbols-rounded\">system_update</span>Update Installed</button>");
+    out.push_str("<button type=\"button\" class=\"btn ghost\" data-search-view-target=\"results\"><span class=\"material-symbols-rounded\">close</span>Close</button>");
+    out.push_str("</div>");
+    out.push_str("</div>");
+    out.push_str("<div class=\"rss-section-label\">Recommended</div>");
+    out.push_str("<div class=\"small\">Curated public plugins that are broad, stable, and useful for general search.</div>");
+    out.push_str("<div id=\"searchRecommended\"><div class=\"rss-item\"><span class=\"rss-item-info\">Loading recommended plugins...</span></div></div>");
+    out.push_str("<div class=\"rss-section-label\">Installed plugins</div>");
+    out.push_str("<div id=\"searchPluginList\" class=\"search-plugin-list\"><div class=\"rss-item\"><span class=\"rss-item-info\">Loading search plugins...</span></div></div>");
+    out.push_str("<div class=\"search-catalog\">");
+    out.push_str("<div class=\"rss-section-label\">Community plugins</div>");
+    out.push_str("<div id=\"searchCatalogMeta\" class=\"small\" style=\"margin-top:6px\">Loading latest qBittorrent unofficial plugin list...</div>");
+    out.push_str("<input id=\"searchCatalogFilter\" class=\"input\" type=\"search\" placeholder=\"Filter community plugins\" autocomplete=\"off\" style=\"height:32px;padding:0 10px;font-size:12px\">");
+    out.push_str("<div id=\"searchCatalog\" class=\"search-catalog-list\"><div class=\"rss-item\"><span class=\"rss-item-info\">Loading latest unofficial qBittorrent plugins...</span></div></div>");
+    out.push_str("</div>");
+    out.push_str("<div class=\"rss-section-label\">Install plugin</div>");
+    out.push_str("<form class=\"rss-form\" onsubmit=\"installSearchPluginUrl(event)\">");
+    out.push_str(
+        "<input id=\"searchPluginUrl\" class=\"input\" placeholder=\"https://.../plugin.py\">",
+    );
+    out.push_str("<button type=\"submit\" class=\"btn primary\">Install</button>");
+    out.push_str("</form>");
+    out.push_str("<div class=\"search-install-upload\">");
+    out.push_str("<label class=\"btn ghost search-upload-label\">Upload .py<input id=\"searchPluginFile\" type=\"file\" accept=\".py\" onchange=\"installSearchPluginFile(event)\"></label>");
+    out.push_str("</div>");
+    out.push_str("<div class=\"search-note\">Plugins are Python scripts. Review third-party plugins before installing them.</div>");
+    out.push_str("</div>");
 }
 
 fn app_body_html(state: &UiState) -> String {
@@ -2975,6 +4259,10 @@ fn app_body_html(state: &UiState) -> String {
     let total_uploaded = human_bytes(total_uploaded_bytes);
     let download_limit_kbps = state.global_download_limit_bps / 1024;
     let upload_limit_kbps = state.global_upload_limit_bps / 1024;
+    let peer_profile = match state.peer_profile.as_str() {
+        "conservative" | "aggressive" => state.peer_profile.as_str(),
+        _ => "balanced",
+    };
     let total_tracker_peers: usize = state.torrents.iter().map(|t| t.tracker_peers).sum();
     let total_active_peers: usize = state.torrents.iter().map(|t| t.active_peers).sum();
 
@@ -2985,7 +4273,7 @@ fn app_body_html(state: &UiState) -> String {
     let mut queued = 0usize;
     let bucket_for = |torrent: &UiTorrent| -> &'static str {
         let status = torrent.status.as_str();
-        if matches!(status, "paused" | "stopped") {
+        if matches!(status, "paused" | "stopped" | "stopping") {
             return "paused";
         }
         if status == "queued" {
@@ -3013,10 +4301,18 @@ fn app_body_html(state: &UiState) -> String {
     }
 
     out.push_str("<header class=\"appbar\">");
+    out.push_str("<div class=\"appbar-main\">");
     out.push_str("<div class=\"brand\">");
-    out.push_str("<div class=\"brand-icon\"><span class=\"material-symbols-rounded\">downloading</span></div>");
+    out.push_str(
+        "<div class=\"brand-icon\"><span class=\"material-symbols-rounded\">downloading</span></div>",
+    );
     out.push_str("<div><div class=\"title\">rustorrent</div>");
     out.push_str("<div class=\"sub\">BitTorrent client</div></div>");
+    out.push_str("</div>");
+    out.push_str("<div class=\"app-tabs\">");
+    out.push_str("<button class=\"tab-btn active\" type=\"button\" data-main-tab-target=\"library\"><span class=\"material-symbols-rounded\">folder</span>Library</button>");
+    out.push_str("<button class=\"tab-btn\" type=\"button\" data-main-tab-target=\"search\"><span class=\"material-symbols-rounded\">travel_explore</span>Search</button>");
+    out.push_str("</div>");
     out.push_str("</div>");
     out.push_str("<div class=\"app-actions\">");
     out.push_str(&format!(
@@ -3034,7 +4330,7 @@ fn app_body_html(state: &UiState) -> String {
     out.push_str("</div>");
     out.push_str("</header>");
 
-    out.push_str("<div class=\"layout\">");
+    out.push_str("<div class=\"layout workspace active\" data-main-tab=\"library\">");
 
     out.push_str("<aside class=\"sidebar\">");
     out.push_str("<div class=\"panel\">");
@@ -3082,29 +4378,25 @@ fn app_body_html(state: &UiState) -> String {
         }
     }
     out.push_str("</div></div>");
-    out.push_str("<div class=\"panel\">");
-    out.push_str("<div class=\"panel-title\">Session</div>");
-    out.push_str("<div class=\"session-stats\">");
-    out.push_str(&format!("<div class=\"session-row\"><span>Downloaded</span><span class=\"session-value\">{total_downloaded}</span></div>"));
-    out.push_str(&format!("<div class=\"session-row\"><span>Uploaded</span><span class=\"session-value\">{total_uploaded}</span></div>"));
+
+    out.push_str(
+        "<div class=\"panel transfer-panel\" data-panel=\"transfer\" data-collapsed=\"true\">",
+    );
+    out.push_str("<div class=\"panel-head\">");
+    out.push_str("<div><div class=\"panel-title\">Transfer</div>");
     out.push_str(&format!(
-        "<div class=\"session-row\"><span>Peers</span><span class=\"session-value\">{total_active_peers} / {total_tracker_peers}</span></div>"
+        "<div class=\"small\" style=\"margin-top:6px\">Down {}  Up {}</div>",
+        human_rate(state.download_rate_bps),
+        human_rate(state.upload_rate_bps)
     ));
-    out.push_str(&format!(
-        "<div class=\"session-row\"><span>Connections</span><span class=\"session-value\">+{} / -{}</span></div>",
-        state.peer_connected, state.peer_disconnected
-    ));
-    out.push_str(&format!(
-        "<div class=\"session-row\"><span>Disk I/O</span><span class=\"session-value\">{:.1}ms / {:.1}ms</span></div>",
-        state.disk_read_ms_avg, state.disk_write_ms_avg
-    ));
-    if !state.proxy_label.is_empty() {
-        out.push_str(&format!(
-            "<div class=\"session-row\"><span>Proxy</span><span class=\"session-value\">{}</span></div>",
-            escape_html(&state.proxy_label)
-        ));
-    }
     out.push_str("</div>");
+    out.push_str("<button class=\"btn ghost panel-toggle\" type=\"button\" data-action=\"toggle-panel\" data-panel=\"transfer\"><span class=\"material-symbols-rounded\">unfold_more</span>Expand</button>");
+    out.push_str("</div>");
+    out.push_str("<div class=\"transfer-panel-body\">");
+    out.push_str(&render_speed_chart(
+        &state.download_history_bps,
+        &state.upload_history_bps,
+    ));
     out.push_str("<div class=\"limit-controls\">");
     out.push_str("<div class=\"limit-row\">");
     out.push_str("<div class=\"limit-label\">Max download</div>");
@@ -3142,6 +4434,57 @@ fn app_body_html(state: &UiState) -> String {
         "<input id=\"seedRatio\" class=\"limit-slider\" type=\"range\" min=\"0\" max=\"100\" step=\"1\" value=\"{}\" title=\"0 = unlimited\">",
         (state.seed_ratio * 10.0).round() as u32
     ));
+    out.push_str("<div class=\"limit-group\" style=\"margin-top:12px\">");
+    out.push_str("<div class=\"limit-label\">Peer Profile</div>");
+    out.push_str("<select id=\"peerProfile\" class=\"input\" style=\"margin-top:8px\">");
+    for (value, label) in [
+        ("conservative", "Conservative"),
+        ("balanced", "Balanced"),
+        ("aggressive", "Aggressive"),
+    ] {
+        let selected = if peer_profile == value {
+            " selected"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "<option value=\"{value}\"{selected}>{label}</option>"
+        ));
+    }
+    out.push_str("</select>");
+    out.push_str(&format!(
+        "<div class=\"small\" id=\"peerProfileSummary\" style=\"margin-top:8px\">{} global / {} per torrent / numwant {}</div>",
+        state.peer_profile_global_limit,
+        state.peer_profile_torrent_limit,
+        state.peer_profile_numwant
+    ));
+    out.push_str("</div>");
+    out.push_str("</div>");
+    out.push_str("</div>");
+
+    out.push_str("<div class=\"panel\">");
+    out.push_str("<div class=\"panel-title\">Session</div>");
+    out.push_str("<div class=\"session-stats\">");
+    out.push_str(&format!("<div class=\"session-row\"><span>Downloaded</span><span class=\"session-value\">{total_downloaded}</span></div>"));
+    out.push_str(&format!("<div class=\"session-row\"><span>Uploaded</span><span class=\"session-value\">{total_uploaded}</span></div>"));
+    out.push_str(&format!(
+        "<div class=\"session-row\"><span>Peers</span><span class=\"session-value\">{total_active_peers} / {total_tracker_peers}</span></div>"
+    ));
+    out.push_str(&format!(
+        "<div class=\"session-row\"><span>Connections</span><span class=\"session-value\">+{} / -{}</span></div>",
+        state.peer_connected, state.peer_disconnected
+    ));
+    out.push_str(&format!(
+        "<div class=\"session-row\"><span>Disk I/O</span><span class=\"session-value\">{:.1}ms / {:.1}ms</span></div>",
+        state.disk_read_ms_avg, state.disk_write_ms_avg
+    ));
+    if !state.proxy_label.is_empty() {
+        out.push_str(&format!(
+            "<div class=\"session-row\"><span>Proxy</span><span class=\"session-value\">{}</span></div>",
+            escape_html(&state.proxy_label)
+        ));
+    }
+    out.push_str("</div>");
     out.push_str("</div>");
 
     // RSS panel
@@ -3259,16 +4602,24 @@ fn app_body_html(state: &UiState) -> String {
                     "progress"
                 };
             let preallocate = if torrent.preallocate { "true" } else { "false" };
-            let paused = if torrent.paused { "true" } else { "false" };
-            let pause_label = if torrent.paused { "Resume" } else { "Pause" };
-            let pause_disabled = matches!(status_raw, "queued" | "loading" | "fetching metadata");
-            let pause_attrs = if pause_disabled {
+            let is_stopping = status_raw == "stopping";
+            let can_resume = torrent.paused || status_raw == "stopped";
+            let paused = if can_resume { "true" } else { "false" };
+            let pause_label = if can_resume { "Resume" } else { "Pause" };
+            let pause_disabled =
+                is_stopping || matches!(status_raw, "queued" | "loading" | "fetching metadata");
+            let pause_attrs = if is_stopping {
+                " disabled title=\"Torrent is stopping\""
+            } else if pause_disabled {
                 " disabled title=\"Not available while torrent is initializing\""
             } else {
                 ""
             };
-            let stop_disabled = matches!(status_raw, "loading" | "fetching metadata");
-            let stop_attrs = if stop_disabled {
+            let stop_disabled =
+                is_stopping || matches!(status_raw, "loading" | "fetching metadata");
+            let stop_attrs = if is_stopping {
+                " disabled title=\"Torrent is stopping\""
+            } else if stop_disabled {
                 " disabled title=\"Not available while metadata is loading\""
             } else {
                 ""
@@ -3294,21 +4645,18 @@ fn app_body_html(state: &UiState) -> String {
                 "<div class=\"torrent-sub\"><span class=\"status-pill {status_class}\">{status}</span><span class=\"torrent-size\">{total_bytes}</span></div>"
             ));
             out.push_str("</div>");
-            let pause_icon = if torrent.paused {
-                "play_arrow"
-            } else {
-                "pause"
-            };
+            let pause_icon = if can_resume { "play_arrow" } else { "pause" };
             out.push_str("<div class=\"torrent-actions\">");
             out.push_str(&format!(
                 "<button class=\"btn ghost\" type=\"button\" data-action=\"toggle-pause\"{pause_attrs}><span class=\"material-symbols-rounded\">{pause_icon}</span>{pause_label}</button>"
             ));
             out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"toggle-expand\"><span class=\"material-symbols-rounded\">unfold_more</span>Expand</button>");
             out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"open-folder\"><span class=\"material-symbols-rounded\">folder_open</span>Open Folder</button>");
-            out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"recheck\"><span class=\"material-symbols-rounded\">verified</span>Recheck</button>");
+            let stop_label = if is_stopping { "Stopping..." } else { "Stop" };
             out.push_str(&format!(
-                "<button class=\"btn ghost\" type=\"button\" data-action=\"stop\"{stop_attrs}><span class=\"material-symbols-rounded\">stop</span>Stop</button>"
+                "<button class=\"btn ghost\" type=\"button\" data-action=\"stop\"{stop_attrs}><span class=\"material-symbols-rounded\">stop</span>{stop_label}</button>"
             ));
+            out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"archive\"><span class=\"material-symbols-rounded\">archive</span>Archive</button>");
             out.push_str("<button class=\"btn danger\" type=\"button\" data-action=\"delete\"><span class=\"material-symbols-rounded\">delete</span>Delete</button>");
             out.push_str("</div>");
             out.push_str("</div>");
@@ -3346,6 +4694,9 @@ fn app_body_html(state: &UiState) -> String {
             out.push_str("</div>");
 
             out.push_str("<div class=\"torrent-grid\">");
+            out.push_str("<div class=\"detail-actions\">");
+            out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"recheck\"><span class=\"material-symbols-rounded\">verified</span>Recheck</button>");
+            out.push_str("</div>");
             out.push_str("<div class=\"subpanel\">");
             out.push_str("<div class=\"panel-title\">General</div>");
             out.push_str("<div class=\"kv\">");
@@ -3400,6 +4751,7 @@ fn app_body_html(state: &UiState) -> String {
             out.push_str("<div class=\"subpanel\">");
             out.push_str("<div class=\"panel-title\">Trackers</div>");
             if !torrent.trackers.is_empty() {
+                out.push_str("<div class=\"tracker-list\">");
                 for tracker in &torrent.trackers {
                     out.push_str(&format!(
                         "<div class=\"tracker-item\"><span>{}</span><button class=\"remove-btn\" data-action=\"remove-tracker\" data-url=\"{}\" title=\"Remove\">\u{00d7}</button></div>",
@@ -3407,6 +4759,7 @@ fn app_body_html(state: &UiState) -> String {
                         escape_html(tracker)
                     ));
                 }
+                out.push_str("</div>");
             }
             out.push_str("<div class=\"inline-form\"><input class=\"tracker-add-input input\" type=\"text\" placeholder=\"https://... or udp://...\"><button class=\"btn\" data-action=\"add-tracker\">Add</button></div>");
             out.push_str("</div>");
@@ -3448,6 +4801,15 @@ fn app_body_html(state: &UiState) -> String {
     }
     out.push_str("</main>");
 
+    out.push_str("</div>");
+    out.push_str("<div class=\"layout workspace search-layout\" data-main-tab=\"search\">");
+    out.push_str("<aside class=\"sidebar search-sidebar\">");
+    render_search_panel(&mut out);
+    out.push_str("</aside>");
+    out.push_str("<main class=\"torrent-list search-main\">");
+    render_search_results_panel(&mut out);
+    render_search_plugin_manager(&mut out);
+    out.push_str("</main>");
     out.push_str("</div>");
     out.push_str("<div id=\"addModal\" class=\"modal\" onclick=\"maybeClose(event)\">");
     out.push_str("<div class=\"modal-card\">");
@@ -3693,6 +5055,67 @@ fn human_rate(bps: f64) -> String {
     }
 }
 
+fn render_speed_chart(download: &[f64], upload: &[f64]) -> String {
+    let sample_count = download.len().max(upload.len());
+    let latest_down = human_rate(*download.last().unwrap_or(&0.0));
+    let latest_up = human_rate(*upload.last().unwrap_or(&0.0));
+    if sample_count < 2 {
+        return format!(
+            "<div class=\"speed-chart\"><div class=\"speed-chart-empty\">Collecting speed samples...</div><div class=\"speed-legend\"><span class=\"item\"><span class=\"swatch down\"></span>Download {latest_down}</span><span class=\"item\"><span class=\"swatch up\"></span>Upload {latest_up}</span></div></div>"
+        );
+    }
+
+    let width = 720.0;
+    let height = 120.0;
+    let pad_x = 8.0;
+    let pad_y = 10.0;
+    let plot_width = width - (pad_x * 2.0);
+    let plot_height = height - (pad_y * 2.0);
+    let max_rate = download
+        .iter()
+        .chain(upload.iter())
+        .copied()
+        .fold(0.0f64, f64::max)
+        .max(1.0);
+
+    let mut grid = String::new();
+    for idx in 0..=3 {
+        let y = pad_y + (plot_height / 3.0) * idx as f64;
+        grid.push_str(&format!(
+            "<line x1=\"{pad_x:.1}\" y1=\"{y:.1}\" x2=\"{x2:.1}\" y2=\"{y:.1}\" stroke=\"rgba(116,119,127,0.25)\" stroke-width=\"1\" />",
+            x2 = width - pad_x
+        ));
+    }
+
+    let build_points = |values: &[f64]| -> String {
+        if values.is_empty() {
+            return String::new();
+        }
+        let start = sample_count.saturating_sub(values.len());
+        let denom = sample_count.saturating_sub(1).max(1) as f64;
+        let mut out = String::new();
+        for (idx, value) in values.iter().enumerate() {
+            let x = pad_x + ((start + idx) as f64 / denom) * plot_width;
+            let normalized = (*value / max_rate).clamp(0.0, 1.0);
+            let y = pad_y + (1.0 - normalized) * plot_height;
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&format!("{x:.1},{y:.1}"));
+        }
+        out
+    };
+
+    let max_label = human_rate(max_rate);
+    format!(
+        "<div class=\"speed-chart\"><svg viewBox=\"0 0 {width:.0} {height:.0}\" preserveAspectRatio=\"none\" aria-label=\"transfer speed chart\"><text x=\"{label_x:.1}\" y=\"{label_y:.1}\" fill=\"currentColor\" opacity=\"0.65\" font-size=\"10\" text-anchor=\"end\">{max_label}</text>{grid}<polyline fill=\"none\" stroke=\"var(--primary)\" stroke-width=\"2.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" points=\"{down_points}\" /><polyline fill=\"none\" stroke=\"var(--tertiary)\" stroke-width=\"2.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" points=\"{up_points}\" /></svg><div class=\"speed-legend\"><span class=\"item\"><span class=\"swatch down\"></span>Download {latest_down}</span><span class=\"item\"><span class=\"swatch up\"></span>Upload {latest_up}</span></div></div>",
+        label_x = width - pad_x,
+        label_y = pad_y - 2.0,
+        down_points = build_points(download),
+        up_points = build_points(upload),
+    )
+}
+
 fn format_eta_secs(secs: u64) -> String {
     if secs == 0 {
         return "--:--".to_string();
@@ -3756,7 +5179,7 @@ mod tests {
             let end = start + end_rel + 1;
             let tag = &html[start..end];
             if tag.starts_with("<div") {
-                if tag.contains("class=\"layout\"") {
+                if tag.contains("class=\"layout\"") || tag.contains("class=\"layout ") {
                     div_stack.push("layout");
                 } else {
                     div_stack.push("div");
@@ -3766,7 +5189,7 @@ mod tests {
                     return false;
                 }
             } else if tag.starts_with("<main") && tag.contains("class=\"torrent-list\"") {
-                return div_stack.iter().any(|kind| *kind == "layout");
+                return div_stack.contains(&"layout");
             }
             index = end;
         }
@@ -3857,6 +5280,59 @@ mod tests {
     }
 
     #[test]
+    fn archive_action_dispatches_archive_command() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>();
+        let command_thread = thread::spawn(move || {
+            let cmd = cmd_rx.recv().expect("receive archive command");
+            match cmd {
+                UiCommand::ArchiveTorrent { torrent_id, reply } => {
+                    assert_eq!(torrent_id, 7);
+                    let _ = reply.send(Ok(UiCommandSuccess::Ok));
+                }
+                _ => panic!("expected archive torrent command"),
+            }
+        });
+
+        let host = "127.0.0.1:19005";
+        let request = format!(
+            "POST /torrent/archive?id=7 HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nX-Rustorrent-Token: {}\r\nContent-Length: 0\r\n\r\n",
+            api_token()
+        );
+        let response = run_single_request(request.as_bytes(), Some(cmd_tx));
+        command_thread.join().expect("join archive command thread");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"ok\":true"));
+    }
+
+    #[test]
+    fn peer_profile_setting_dispatches_command() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>();
+        let command_thread = thread::spawn(move || {
+            let cmd = cmd_rx.recv().expect("receive peer profile command");
+            match cmd {
+                UiCommand::SetPeerProfile { profile, reply } => {
+                    assert_eq!(profile, "aggressive");
+                    let _ = reply.send(Ok(UiCommandSuccess::Ok));
+                }
+                _ => panic!("expected set peer profile command"),
+            }
+        });
+
+        let host = "127.0.0.1:19006";
+        let body = "profile=aggressive";
+        let request = format!(
+            "POST /settings/peer-profile HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nX-Rustorrent-Token: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+            api_token(),
+            body.len(),
+            body
+        );
+        let response = run_single_request(request.as_bytes(), Some(cmd_tx));
+        command_thread.join().expect("join peer profile command");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"ok\":true"));
+    }
+
+    #[test]
     fn split_path_query_and_percent_decode_work() {
         let (path, query) = split_path_query("/add?name=hello+world&x=%2Ftmp&empty=");
         assert_eq!(path, "/add");
@@ -3915,12 +5391,17 @@ mod tests {
     #[test]
     fn desktop_layout_breakpoints_keep_two_columns_until_small_widths() {
         let html = status_html(&UiState::default());
-        assert!(html.contains(".app{width:100%;max-width:1600px"));
+        assert!(html.contains(".app{"));
+        assert!(html.contains("max-width:1600px;"));
+        assert!(html.contains("height:100svh;"));
         assert!(html.contains(".layout{"));
-        assert!(html.contains("display:flex;"));
+        assert!(html.contains("flex:1 1 auto;"));
+        assert!(html.contains("overflow:hidden;"));
         assert!(html.contains(".sidebar{"));
         assert!(html.contains("flex:0 0 260px;"));
         assert!(html.contains("width:260px;"));
+        assert!(html.contains(".torrent-list{"));
+        assert!(html.contains("overflow-y:auto;"));
         assert!(html.contains("@media(max-width:900px){"));
         assert!(html.contains(".layout{gap:16px}"));
         assert!(html.contains(".sidebar{flex-basis:240px;width:240px}"));
@@ -3943,6 +5424,15 @@ mod tests {
     }
 
     #[test]
+    fn search_ui_renders_separate_main_tab_workspace() {
+        let html = app_body_html(&UiState::default());
+        assert!(html.contains("data-main-tab-target=\"library\""));
+        assert!(html.contains("data-main-tab-target=\"search\""));
+        assert!(html.contains("data-main-tab=\"library\""));
+        assert!(html.contains("data-main-tab=\"search\""));
+    }
+
+    #[test]
     fn seeding_bucket_renders_full_progress_even_if_bytes_lag() {
         let mut state = UiState::default();
         state.torrents.push(UiTorrent {
@@ -3958,5 +5448,82 @@ mod tests {
 
         let html = app_body_html(&state);
         assert!(html.contains("Progress 1000 B / 1000 B (100.00%)"));
+    }
+
+    #[test]
+    fn stopped_torrent_renders_resume_action() {
+        let mut state = UiState::default();
+        state.torrents.push(UiTorrent {
+            id: 9,
+            name: "bugonia".to_string(),
+            status: "stopped".to_string(),
+            ..UiTorrent::default()
+        });
+
+        let html = app_body_html(&state);
+        assert!(html.contains("data-paused=\"true\""));
+        assert!(html.contains("play_arrow</span>Resume"));
+    }
+
+    #[test]
+    fn stopping_torrent_disables_stop_and_pause_actions() {
+        let mut state = UiState::default();
+        state.torrents.push(UiTorrent {
+            id: 10,
+            name: "ubuntu.iso".to_string(),
+            status: "stopping".to_string(),
+            ..UiTorrent::default()
+        });
+
+        let html = app_body_html(&state);
+        assert!(html.contains("status-paused\">stopping"));
+        assert!(html.contains("Stopping...</button>"));
+        assert!(html.contains("title=\"Torrent is stopping\""));
+    }
+
+    #[test]
+    fn transfer_panel_renders_archive_recheck_and_speed_chart() {
+        let mut state = UiState {
+            download_history_bps: vec![1024.0, 2048.0, 4096.0],
+            upload_history_bps: vec![256.0, 512.0, 768.0],
+            peer_profile: "balanced".to_string(),
+            peer_profile_global_limit: 200,
+            peer_profile_torrent_limit: 30,
+            peer_profile_numwant: 200,
+            ..UiState::default()
+        };
+        state.torrents.push(UiTorrent {
+            id: 12,
+            name: "ubuntu.iso".to_string(),
+            status: "downloading".to_string(),
+            ..UiTorrent::default()
+        });
+
+        let html = app_body_html(&state);
+        assert_eq!(html.matches("data-action=\"recheck\"").count(), 1);
+        assert!(html.contains("data-action=\"archive\""));
+        assert!(html.contains("data-panel=\"transfer\""));
+        assert!(html.contains("data-collapsed=\"true\""));
+        assert!(html.contains("aria-label=\"transfer speed chart\""));
+        assert!(html.contains("data-action=\"toggle-panel\""));
+        assert!(html.contains("id=\"peerProfile\""));
+        assert!(html.contains("Peer Profile"));
+    }
+
+    #[test]
+    fn search_shell_keeps_plugin_panel_hidden_by_default_and_includes_toast_assets() {
+        let html = status_html(&UiState::default());
+        assert!(html.contains(".search-main-panel{display:none}"));
+        assert!(
+            html.contains(".search-main-panel.active{display:flex;flex-direction:column;gap:12px}")
+        );
+        assert!(html.contains(".search-results-panel{min-height:0}"));
+        assert!(html.contains(".search-plugin-manager{min-height:0}"));
+        assert!(!html.contains(".search-results-panel{display:flex"));
+        assert!(!html.contains(".search-plugin-manager{display:flex"));
+        assert!(html.contains(".toast-stack{"));
+        assert!(html.contains("function showToast("));
+        assert!(html.contains("function setSearchSort("));
+        assert!(html.contains("id=\"searchPluginWarning\""));
     }
 }
