@@ -225,7 +225,7 @@ mod tests {
 }
 
 fn is_digit(b: u8) -> bool {
-    b'0' <= b && b <= b'9'
+    b.is_ascii_digit()
 }
 
 #[cfg(test)]

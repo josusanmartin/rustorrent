@@ -58,6 +58,7 @@ pub struct PieceBuffer {
 }
 
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum Error {
     InvalidPieceLength,
     InvalidPieces,
@@ -301,7 +302,7 @@ impl PieceManager {
     }
 
     pub fn bitfield_len(&self) -> usize {
-        (self.pieces.len() + 7) / 8
+        self.pieces.len().div_ceil(8)
     }
 
     pub fn apply_peer_bitfield(&mut self, bitfield: &[u8]) -> Result<(), Error> {
@@ -510,7 +511,7 @@ impl PieceManager {
             .pieces
             .get_mut(index as usize)
             .ok_or(Error::InvalidPiece)?;
-        if begin % BLOCK_LEN != 0 {
+        if !begin.is_multiple_of(BLOCK_LEN) {
             return Err(Error::InvalidBlock);
         }
         let block_index = (begin / BLOCK_LEN) as usize;
@@ -545,7 +546,7 @@ impl PieceManager {
             .pieces
             .get_mut(index as usize)
             .ok_or(Error::InvalidPiece)?;
-        if begin % BLOCK_LEN != 0 {
+        if !begin.is_multiple_of(BLOCK_LEN) {
             return Err(Error::InvalidBlock);
         }
         let block_index = (begin / BLOCK_LEN) as usize;
@@ -599,7 +600,7 @@ impl PieceBuffer {
     }
 
     pub fn add_block(&mut self, begin: u32, block: &[u8]) -> Result<bool, Error> {
-        if begin % BLOCK_LEN != 0 {
+        if !begin.is_multiple_of(BLOCK_LEN) {
             return Err(Error::InvalidBlock);
         }
         let block_index = (begin / BLOCK_LEN) as usize;
@@ -635,7 +636,7 @@ impl PieceBuffer {
 }
 
 fn block_count(length: u32) -> usize {
-    ((length as u64 + BLOCK_LEN as u64 - 1) / BLOCK_LEN as u64) as usize
+    (length as u64).div_ceil(BLOCK_LEN as u64) as usize
 }
 
 fn bitfield_has(bitfield: &[u8], index: usize) -> bool {
@@ -653,9 +654,7 @@ impl Piece {
     }
 
     fn has_missing(&self) -> bool {
-        self.blocks
-            .iter()
-            .any(|state| *state == BlockState::Missing)
+        self.blocks.contains(&BlockState::Missing)
     }
 
     fn remaining_blocks(&self) -> usize {
@@ -850,8 +849,8 @@ mod tests {
             manager.mark_block_complete(0, 0, 8),
             Err(Error::InvalidBlock)
         ));
-        assert_eq!(manager.mark_block_complete(0, 0, 16 * 1024).unwrap(), true);
-        assert_eq!(manager.mark_block_complete(0, 0, 16 * 1024).unwrap(), false);
+        assert!(manager.mark_block_complete(0, 0, 16 * 1024).unwrap());
+        assert!(!manager.mark_block_complete(0, 0, 16 * 1024).unwrap());
     }
 
     #[test]
@@ -859,8 +858,8 @@ mod tests {
         let mut buffer = PieceBuffer::new(2, BLOCK_LEN + 4).unwrap();
         let first = vec![1u8; BLOCK_LEN as usize];
         let second = vec![2u8; 4];
-        assert_eq!(buffer.add_block(0, &first).unwrap(), false);
-        assert_eq!(buffer.add_block(BLOCK_LEN, &second).unwrap(), true);
+        assert!(!buffer.add_block(0, &first).unwrap());
+        assert!(buffer.add_block(BLOCK_LEN, &second).unwrap());
         assert!(buffer.is_complete());
         assert_eq!(&buffer.data()[BLOCK_LEN as usize..], second.as_slice());
     }

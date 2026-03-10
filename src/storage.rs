@@ -39,19 +39,10 @@ pub fn metrics_snapshot() -> StorageMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct StorageOptions {
     pub preallocate: bool,
     pub write_cache_bytes: usize,
-}
-
-impl Default for StorageOptions {
-    fn default() -> Self {
-        Self {
-            preallocate: false,
-            write_cache_bytes: 0,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -123,6 +114,7 @@ impl Storage {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&layout.path)?;
             if options.preallocate {
                 file.set_len(layout.length)?;

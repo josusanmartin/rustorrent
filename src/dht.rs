@@ -417,41 +417,39 @@ fn dht_thread(bind_port: u16, cmd_rx: mpsc::Receiver<Command>) {
         }
 
         let mut buf = [0u8; 1500];
-        match socket.recv_from(&mut buf) {
-            Ok((n, addr)) => {
-                if let Ok(Value::Dict(dict)) = bencode::parse(&buf[..n]) {
-                    if let Some(Value::Bytes(y)) = dict_get(&dict, b"y") {
-                        match y.as_slice() {
-                            b"r" => handle_response(
-                                &dict,
-                                &addr,
-                                &mut rt,
-                                &mut pending,
-                                &socket,
-                                &node_id,
-                                &mut peer_store,
-                                &torrents,
-                            ),
-                            b"q" => handle_query(
-                                &dict,
-                                &addr,
-                                &socket,
-                                &node_id,
-                                &secret,
-                                &mut rt,
-                                &mut peer_store,
-                                &torrents,
-                            ),
-                            _ => {}
-                        }
+        if let Ok((n, addr)) = socket.recv_from(&mut buf) {
+            if let Ok(Value::Dict(dict)) = bencode::parse(&buf[..n]) {
+                if let Some(Value::Bytes(y)) = dict_get(&dict, b"y") {
+                    match y.as_slice() {
+                        b"r" => handle_response(
+                            &dict,
+                            &addr,
+                            &mut rt,
+                            &mut pending,
+                            &socket,
+                            &node_id,
+                            &mut peer_store,
+                            &torrents,
+                        ),
+                        b"q" => handle_query(
+                            &dict,
+                            &addr,
+                            &socket,
+                            &node_id,
+                            &secret,
+                            &mut rt,
+                            &mut peer_store,
+                            &torrents,
+                        ),
+                        _ => {}
                     }
                 }
             }
-            Err(_) => {}
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_response(
     dict: &[(Vec<u8>, Value)],
     addr: &SocketAddr,
@@ -522,6 +520,7 @@ fn handle_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_query(
     dict: &[(Vec<u8>, Value)],
     addr: &SocketAddr,

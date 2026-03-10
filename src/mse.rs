@@ -10,12 +10,15 @@ pub enum CryptoMode {
     Rc4,
 }
 
+pub type AcceptOutcome = (CryptoMode, Option<CipherState>, [u8; 20], Vec<u8>);
+
 pub struct CipherState {
     enc: Rc4,
     dec: Rc4,
 }
 
 impl CipherState {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(enc_key: &[u8], dec_key: &[u8]) -> Self {
         let mut enc = Rc4::new(enc_key);
         let mut dec = Rc4::new(dec_key);
@@ -195,7 +198,7 @@ pub fn accept<RW: Read + Write>(
     info_hashes: &[[u8; 20]],
     first_byte: u8,
     allow_plain: bool,
-) -> Result<(CryptoMode, Option<CipherState>, [u8; 20], Vec<u8>), String> {
+) -> Result<AcceptOutcome, String> {
     // Read Ya (first byte already consumed)
     let mut peer_pub = [0u8; 96];
     peer_pub[0] = first_byte;

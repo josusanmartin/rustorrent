@@ -4,6 +4,10 @@ use crate::bencode::{self, Value};
 use crate::sha1;
 use crate::sha256;
 
+type DictEntries = Vec<(Vec<u8>, Value)>;
+type InfoSpan = Option<(usize, usize)>;
+type PieceLayerHashes = Vec<(Vec<u8>, Vec<[u8; 32]>)>;
+
 #[derive(Debug)]
 pub struct TorrentMeta {
     pub announce: Option<Vec<u8>>,
@@ -14,8 +18,9 @@ pub struct TorrentMeta {
     pub httpseeds: Vec<Vec<u8>>,
     pub info: InfoDict,
     pub info_hash: [u8; 20],
+    #[allow(dead_code)]
     pub info_hash_v2: Option<[u8; 32]>,
-    pub piece_layers: Vec<(Vec<u8>, Vec<[u8; 32]>)>,
+    pub piece_layers: PieceLayerHashes,
     pub meta_version: u8,
 }
 
@@ -142,7 +147,7 @@ pub fn parse_torrent(data: &[u8]) -> Result<TorrentMeta, Error> {
     })
 }
 
-fn parse_top_dict(data: &[u8]) -> Result<(Vec<(Vec<u8>, Value)>, Option<(usize, usize)>), Error> {
+fn parse_top_dict(data: &[u8]) -> Result<(DictEntries, InfoSpan), Error> {
     if data.first() != Some(&b'd') {
         return Err(Error::InvalidType("top-level dictionary"));
     }
@@ -352,7 +357,7 @@ fn parse_file_tree_recursive(
     Ok(())
 }
 
-fn parse_piece_layers(value: &Value) -> Result<Vec<(Vec<u8>, Vec<[u8; 32]>)>, Error> {
+fn parse_piece_layers(value: &Value) -> Result<PieceLayerHashes, Error> {
     let dict = as_dict(value)?;
     let mut layers = Vec::new();
     for (key, value) in dict {

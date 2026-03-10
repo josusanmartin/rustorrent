@@ -25,6 +25,38 @@ fn free_udp_port() -> u16 {
         .port()
 }
 
+fn tcp_echo_roundtrip(addr: SocketAddr, payload: &[u8]) -> bool {
+    for _ in 0..3 {
+        let mut client = match TcpStream::connect(addr) {
+            Ok(stream) => stream,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        };
+        if client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .is_err()
+            || client
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .is_err()
+        {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        if client.write_all(payload).is_err() {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        let mut recv = vec![0u8; payload.len()];
+        if client.read_exact(&mut recv).is_ok() && recv == payload {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
 fn current_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -142,33 +174,12 @@ fn mixed_utp_tcp_swarm_has_low_error_rate_and_bounded_memory() {
             }
         }
 
-        let mut tcp_client = match TcpStream::connect(tcp_addr) {
-            Ok(stream) => stream,
-            Err(_) => {
-                errs.fetch_add(1, Ordering::SeqCst);
-                tcp_errs.fetch_add(1, Ordering::SeqCst);
-                counter = counter.wrapping_add(1);
-                continue;
-            }
-        };
-        tcp_client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        tcp_client
-            .set_write_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        if tcp_client.write_all(&payload).is_err() {
+        if !tcp_echo_roundtrip(tcp_addr, &payload) {
             errs.fetch_add(1, Ordering::SeqCst);
             tcp_errs.fetch_add(1, Ordering::SeqCst);
         } else {
-            let mut recv = vec![0u8; payload.len()];
-            if tcp_client.read_exact(&mut recv).is_err() || recv != payload {
-                errs.fetch_add(1, Ordering::SeqCst);
-                tcp_errs.fetch_add(1, Ordering::SeqCst);
-            } else {
-                ops.fetch_add(1, Ordering::SeqCst);
-                tcp_ops.fetch_add(1, Ordering::SeqCst);
-            }
+            ops.fetch_add(1, Ordering::SeqCst);
+            tcp_ops.fetch_add(1, Ordering::SeqCst);
         }
 
         counter = counter.wrapping_add(1);

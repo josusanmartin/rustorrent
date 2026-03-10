@@ -112,7 +112,7 @@ pub fn country_flag(cc: &str) -> String {
     let bytes = cc.as_bytes();
     let a = bytes[0].to_ascii_uppercase();
     let b = bytes[1].to_ascii_uppercase();
-    if !(b'A'..=b'Z').contains(&a) || !(b'A'..=b'Z').contains(&b) {
+    if !a.is_ascii_uppercase() || !b.is_ascii_uppercase() {
         return String::new();
     }
     let c1 = char::from_u32(0x1F1E6 + (a - b'A') as u32).unwrap_or('?');

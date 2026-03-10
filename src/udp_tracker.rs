@@ -43,6 +43,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn announce(
     url: &str,
     info_hash: [u8; 20],
@@ -140,7 +141,7 @@ pub fn announce(
     let _leechers = u32::from_be_bytes([response[12], response[13], response[14], response[15]]);
     let _seeders = u32::from_be_bytes([response[16], response[17], response[18], response[19]]);
 
-    if (n - RESPONSE_HEADER_LEN) % 6 != 0 {
+    if !(n - RESPONSE_HEADER_LEN).is_multiple_of(6) {
         return Err(Error::InvalidPeers);
     }
     let mut peers = Vec::with_capacity((n - RESPONSE_HEADER_LEN) / 6);
@@ -169,6 +170,7 @@ const ACTION_SCRAPE: u32 = 2;
 pub struct ScrapeResult {
     pub seeders: u32,
     pub leechers: u32,
+    #[allow(dead_code)]
     pub completed: u32,
 }
 

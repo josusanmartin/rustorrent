@@ -74,6 +74,7 @@ impl From<bencode::Error> for Error {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn announce(
     announce_url: &str,
     info_hash: [u8; 20],
@@ -99,6 +100,7 @@ pub fn announce(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn announce_with_private(
     announce_url: &str,
     info_hash: [u8; 20],
@@ -251,9 +253,9 @@ fn connect_stream(parsed: &ParsedUrl) -> Result<TrackerStream, Error> {
     let stream = match stream {
         Some(stream) => stream,
         None => {
-            return Err(Error::Io(last_err.unwrap_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::Other, "connect failed")
-            })));
+            return Err(Error::Io(
+                last_err.unwrap_or_else(|| std::io::Error::other("connect failed")),
+            ));
         }
     };
     stream.set_read_timeout(Some(TRACKER_IO_TIMEOUT))?;
@@ -284,6 +286,7 @@ fn append_query(path: &str, query: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_query(
     info_hash: [u8; 20],
     peer_id: [u8; 20],
@@ -544,7 +547,7 @@ fn parse_peers(value: &Value) -> Result<Vec<SocketAddr>, Error> {
 }
 
 fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddr>, Error> {
-    if bytes.len() % 6 != 0 {
+    if !bytes.len().is_multiple_of(6) {
         return Err(Error::InvalidPeers);
     }
     let mut peers = Vec::with_capacity(bytes.len() / 6);
@@ -565,7 +568,7 @@ fn parse_peers6(value: &Value) -> Result<Vec<SocketAddr>, Error> {
 }
 
 fn parse_compact_peers6(bytes: &[u8]) -> Result<Vec<SocketAddr>, Error> {
-    if bytes.len() % 18 != 0 {
+    if !bytes.len().is_multiple_of(18) {
         return Err(Error::InvalidPeers);
     }
     let mut peers = Vec::with_capacity(bytes.len() / 18);
@@ -621,6 +624,7 @@ fn dict_get_int(dict: &[(Vec<u8>, Value)], key: &[u8]) -> Option<u64> {
 pub struct ScrapeResult {
     pub seeders: u32,
     pub leechers: u32,
+    #[allow(dead_code)]
     pub completed: u32,
 }
 

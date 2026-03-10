@@ -75,6 +75,7 @@ impl UtpListener {
 }
 
 pub struct UtpStream {
+    #[allow(dead_code)]
     addr: SocketAddr,
     send_tx: mpsc::Sender<SendRequest>,
     recv_rx: mpsc::Receiver<Vec<u8>>,
@@ -84,6 +85,7 @@ pub struct UtpStream {
 }
 
 impl UtpStream {
+    #[allow(dead_code)]
     pub fn peer_addr(&self) -> SocketAddr {
         self.addr
     }
@@ -146,7 +148,7 @@ impl Write for UtpStream {
                     written += chunk.len();
                 }
                 Ok(Err(err)) => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, err));
+                    return Err(std::io::Error::other(err));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     return Err(std::io::Error::new(
@@ -329,137 +331,133 @@ fn utp_loop(
             conns.remove(&key);
         }
 
-        match socket.recv_from(&mut buf) {
-            Ok((n, addr)) => {
-                if n < UTP_HEADER_LEN {
-                    continue;
-                }
-                let (ty, conn_id, seq, ack, payload) = parse_packet(&buf[..n]);
-                if ty == TYPE_SYN {
-                    let recv_id = conn_id;
-                    let send_id = conn_id.wrapping_add(1);
-                    let (send_tx, send_rx) = mpsc::channel();
-                    let (recv_tx, recv_rx) = mpsc::channel();
-                    let stream = UtpStream {
-                        addr,
-                        send_tx,
-                        recv_rx,
-                        read_buf: VecDeque::new(),
-                        read_timeout: None,
-                        write_timeout: None,
-                    };
-                    let conn = ConnState {
-                        addr,
-                        send_id,
-                        recv_id: Some(recv_id),
-                        seq: next_u16(),
-                        recv_seq: seq,
-                        state: ConnStatus::Connected,
-                        inflight: VecDeque::new(),
-                        cwnd: INITIAL_CWND,
-                        send_rx,
-                        recv_tx,
-                        last_seen: Instant::now(),
-                        connect_started: Instant::now(),
-                        connect_resp: None,
-                        connect_stream: None,
-                    };
-                    let state_pkt = build_packet(TYPE_STATE, send_id, conn.seq, seq, &[]);
-                    let _ = socket.send_to(&state_pkt, addr);
-                    let _ = accept_tx.send(stream);
-                    conns.insert((addr, recv_id), conn);
-                    continue;
-                }
+        if let Ok((n, addr)) = socket.recv_from(&mut buf) {
+            if n < UTP_HEADER_LEN {
+                continue;
+            }
+            let (ty, conn_id, seq, ack, payload) = parse_packet(&buf[..n]);
+            if ty == TYPE_SYN {
+                let recv_id = conn_id;
+                let send_id = conn_id.wrapping_add(1);
+                let (send_tx, send_rx) = mpsc::channel();
+                let (recv_tx, recv_rx) = mpsc::channel();
+                let stream = UtpStream {
+                    addr,
+                    send_tx,
+                    recv_rx,
+                    read_buf: VecDeque::new(),
+                    read_timeout: None,
+                    write_timeout: None,
+                };
+                let conn = ConnState {
+                    addr,
+                    send_id,
+                    recv_id: Some(recv_id),
+                    seq: next_u16(),
+                    recv_seq: seq,
+                    state: ConnStatus::Connected,
+                    inflight: VecDeque::new(),
+                    cwnd: INITIAL_CWND,
+                    send_rx,
+                    recv_tx,
+                    last_seen: Instant::now(),
+                    connect_started: Instant::now(),
+                    connect_resp: None,
+                    connect_stream: None,
+                };
+                let state_pkt = build_packet(TYPE_STATE, send_id, conn.seq, seq, &[]);
+                let _ = socket.send_to(&state_pkt, addr);
+                let _ = accept_tx.send(stream);
+                conns.insert((addr, recv_id), conn);
+                continue;
+            }
 
-                let key = (addr, conn_id);
-                if !conns.contains_key(&key) && ty == TYPE_STATE {
-                    let mut match_key = None;
-                    for (conn_key, conn) in conns.iter() {
-                        if conn_key.0 != addr {
-                            continue;
+            let key = (addr, conn_id);
+            if !conns.contains_key(&key) && ty == TYPE_STATE {
+                let mut match_key = None;
+                for (conn_key, conn) in conns.iter() {
+                    if conn_key.0 != addr {
+                        continue;
+                    }
+                    if conn.state == ConnStatus::SynSent && conn.send_id.wrapping_add(1) == conn_id
+                    {
+                        match_key = Some(*conn_key);
+                        break;
+                    }
+                }
+                if let Some(old_key) = match_key {
+                    if let Some(mut conn) = conns.remove(&old_key) {
+                        let recv_id = conn_id;
+                        conn.recv_id = Some(recv_id);
+                        conn.state = ConnStatus::Connected;
+                        conn.recv_seq = seq;
+                        if let Some(resp) = conn.connect_resp.take() {
+                            if let Some(stream) = conn.connect_stream.take() {
+                                let _ = resp.send(Ok(stream));
+                            } else {
+                                let _ = resp.send(Err("utp connect failed".to_string()));
+                            }
                         }
-                        if conn.state == ConnStatus::SynSent
-                            && conn.send_id.wrapping_add(1) == conn_id
-                        {
-                            match_key = Some(*conn_key);
+                        let new_key = (addr, recv_id);
+                        conns.insert(new_key, conn);
+                    }
+                }
+                continue;
+            }
+
+            let conn = match conns.get_mut(&key) {
+                Some(conn) => conn,
+                None => continue,
+            };
+            conn.last_seen = Instant::now();
+
+            match ty {
+                TYPE_STATE => {
+                    // ACK received: remove all packets with seq <= ack
+                    let mut acked = false;
+                    while let Some(front) = conn.inflight.front() {
+                        if front.seq == ack || is_seq_before_or_equal(front.seq, ack) {
+                            let pkt = conn.inflight.pop_front().unwrap();
+                            let _ = pkt.resp.send(Ok(()));
+                            acked = true;
+                        } else {
                             break;
                         }
                     }
-                    if let Some(old_key) = match_key {
-                        if let Some(mut conn) = conns.remove(&old_key) {
-                            let recv_id = conn_id;
-                            conn.recv_id = Some(recv_id);
-                            conn.state = ConnStatus::Connected;
-                            conn.recv_seq = seq;
-                            if let Some(resp) = conn.connect_resp.take() {
-                                if let Some(stream) = conn.connect_stream.take() {
-                                    let _ = resp.send(Ok(stream));
-                                } else {
-                                    let _ = resp.send(Err("utp connect failed".to_string()));
-                                }
-                            }
-                            let new_key = (addr, recv_id);
-                            conns.insert(new_key, conn);
-                        }
+                    if acked && conn.cwnd < MAX_CWND {
+                        conn.cwnd += 1; // Additive increase
                     }
-                    continue;
                 }
-
-                let conn = match conns.get_mut(&key) {
-                    Some(conn) => conn,
-                    None => continue,
-                };
-                conn.last_seen = Instant::now();
-
-                match ty {
-                    TYPE_STATE => {
-                        // ACK received: remove all packets with seq <= ack
-                        let mut acked = false;
-                        while let Some(front) = conn.inflight.front() {
-                            if front.seq == ack || is_seq_before_or_equal(front.seq, ack) {
-                                let pkt = conn.inflight.pop_front().unwrap();
-                                let _ = pkt.resp.send(Ok(()));
-                                acked = true;
-                            } else {
-                                break;
-                            }
-                        }
-                        if acked && conn.cwnd < MAX_CWND {
-                            conn.cwnd += 1; // Additive increase
-                        }
+                TYPE_DATA => {
+                    if seq == conn.recv_seq.wrapping_add(1) || conn.recv_seq == seq {
+                        conn.recv_seq = seq;
+                        let _ = conn.recv_tx.send(payload.to_vec());
                     }
-                    TYPE_DATA => {
-                        if seq == conn.recv_seq.wrapping_add(1) || conn.recv_seq == seq {
-                            conn.recv_seq = seq;
-                            let _ = conn.recv_tx.send(payload.to_vec());
-                        }
-                        let state_pkt =
-                            build_packet(TYPE_STATE, conn.send_id, conn.seq, conn.recv_seq, &[]);
-                        let _ = socket.send_to(&state_pkt, conn.addr);
-                    }
-                    TYPE_FIN => {
-                        drain_inflight_err(conn, "utp closed");
-                        if let Some(resp) = conn.connect_resp.take() {
-                            let _ = resp.send(Err("utp closed".to_string()));
-                        }
-                        conn.connect_stream.take();
-                        conn.state = ConnStatus::Closed;
-                        let state_pkt =
-                            build_packet(TYPE_STATE, conn.send_id, conn.seq, conn.recv_seq, &[]);
-                        let _ = socket.send_to(&state_pkt, conn.addr);
-                    }
-                    TYPE_RESET => {
-                        drain_inflight_err(conn, "utp reset");
-                        if let Some(resp) = conn.connect_resp.take() {
-                            let _ = resp.send(Err("utp reset".to_string()));
-                        }
-                        conn.connect_stream.take();
-                        conn.state = ConnStatus::Closed;
-                    }
-                    _ => {}
+                    let state_pkt =
+                        build_packet(TYPE_STATE, conn.send_id, conn.seq, conn.recv_seq, &[]);
+                    let _ = socket.send_to(&state_pkt, conn.addr);
                 }
+                TYPE_FIN => {
+                    drain_inflight_err(conn, "utp closed");
+                    if let Some(resp) = conn.connect_resp.take() {
+                        let _ = resp.send(Err("utp closed".to_string()));
+                    }
+                    conn.connect_stream.take();
+                    conn.state = ConnStatus::Closed;
+                    let state_pkt =
+                        build_packet(TYPE_STATE, conn.send_id, conn.seq, conn.recv_seq, &[]);
+                    let _ = socket.send_to(&state_pkt, conn.addr);
+                }
+                TYPE_RESET => {
+                    drain_inflight_err(conn, "utp reset");
+                    if let Some(resp) = conn.connect_resp.take() {
+                        let _ = resp.send(Err("utp reset".to_string()));
+                    }
+                    conn.connect_stream.take();
+                    conn.state = ConnStatus::Closed;
+                }
+                _ => {}
             }
-            Err(_) => {}
         }
     }
 }
@@ -503,8 +501,7 @@ fn timestamp() -> u32 {
     use std::sync::OnceLock;
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = EPOCH.get_or_init(Instant::now);
-    let micros = epoch.elapsed().as_micros() as u32;
-    micros
+    epoch.elapsed().as_micros() as u32
 }
 
 fn next_u16() -> u16 {
