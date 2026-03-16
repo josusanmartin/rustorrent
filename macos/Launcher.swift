@@ -1,13 +1,20 @@
 import AppKit
 import Foundation
 import UniformTypeIdentifiers
+import WebKit
 
 @main
-final class RustorrentLauncher: NSObject, NSApplicationDelegate {
+final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, NSToolbarDelegate {
     private let uiPort = 9473
     private let maxUiWaitAttempts = 150
     private let openUiOnLaunchKey = "open_ui_on_launch"
     private let downloadDirectoryKey = "download_directory"
+
+    private let toolbarIdentifier = NSToolbar.Identifier("RustorrentToolbar")
+    private let toolbarAddItemIdentifier = NSToolbarItem.Identifier("RustorrentToolbarAdd")
+    private let toolbarRefreshItemIdentifier = NSToolbarItem.Identifier("RustorrentToolbarRefresh")
+    private let toolbarDownloadsItemIdentifier = NSToolbarItem.Identifier("RustorrentToolbarDownloads")
+    private let toolbarPreferencesItemIdentifier = NSToolbarItem.Identifier("RustorrentToolbarPreferences")
 
     private var backendProcess: Process?
     private var backendOwned = false
@@ -21,6 +28,11 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
     private var preferencesWindow: NSWindow?
     private var openUiCheckbox: NSButton?
     private var downloadDirField: NSTextField?
+    private var mainWindow: NSWindow?
+    private var webView: WKWebView?
+    private var lastLoadedURL: URL?
+    private var statusItem: NSStatusItem?
+    private lazy var dockMenu: NSMenu = makeQuickMenu()
 
     static func main() {
         let app = NSApplication.shared
@@ -31,19 +43,21 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        prepareLauncherLogIfNeeded()
+        log("application did finish launching")
         buildMenus()
+        buildStatusItem()
         collectStartupTorrentFiles(from: CommandLine.arguments)
         openUiWhenReady = openUiOnLaunchEnabled() || !pendingTorrentFiles.isEmpty
-
-        if isUiReachable(timeout: 0.8) {
-            flushPendingTorrents()
-            if openUiWhenReady {
-                openWebUi()
-            }
-        } else {
-            startBackendIfNeeded()
-            waitForUiReady()
+        if openUiWhenReady {
+            showMainWindow()
+            loadPlaceholderPage(
+                title: "Starting Rustorrent",
+                message: "Launching the local engine and loading the built-in interface."
+            )
         }
+
+        scheduleUiBootstrap(timeout: 0.8)
 
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -52,8 +66,13 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
         false
     }
 
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        dockMenu
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         openUiWhenReady = true
+        showMainWindow()
         openWebUi()
         return true
     }
@@ -61,17 +80,17 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
         enqueueTorrentFiles(from: filenames)
         openUiWhenReady = true
-        if isUiReachable(timeout: 0.6) {
-            flushPendingTorrents()
-            openWebUi()
-        } else {
-            startBackendIfNeeded()
-            waitForUiReady()
-        }
+        showMainWindow()
+        loadPlaceholderPage(
+            title: "Adding Torrent",
+            message: "Waiting for the local interface so the torrent can be handed off."
+        )
+        scheduleUiBootstrap(timeout: 0.6)
         sender.reply(toOpenOrPrint: .success)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        log("application will terminate")
         uiReadyTimer?.invalidate()
         uiReadyTimer = nil
 
@@ -111,7 +130,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
         window.contentView = content
 
         let openUi = NSButton(
-            checkboxWithTitle: "Open Web UI when launching Rustorrent",
+            checkboxWithTitle: "Open Rustorrent window when launching",
             target: self,
             action: #selector(toggleOpenUiOnLaunch(_:))
         )
@@ -133,7 +152,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
         chooseDir.frame = NSRect(x: 450, y: 94, width: 90, height: 30)
         content.addSubview(chooseDir)
 
-        let launchNow = NSButton(title: "Launch UI Now", target: self, action: #selector(openWebUiFromMenu))
+        let launchNow = NSButton(title: "Open Window", target: self, action: #selector(openWebUiFromMenu))
         launchNow.frame = NSRect(x: 20, y: 48, width: 120, height: 30)
         content.addSubview(launchNow)
 
@@ -157,11 +176,25 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
     @objc
     private func openWebUiFromMenu() {
         openUiWhenReady = true
-        if isUiReachable(timeout: 0.6) {
-            openWebUi()
+        showMainWindow()
+        loadPlaceholderPage(
+            title: "Opening Rustorrent",
+            message: "Preparing the built-in interface."
+        )
+        scheduleUiBootstrap(timeout: 0.6)
+    }
+
+    @objc
+    private func reloadCurrentWindow() {
+        if isUiReachable(timeout: 0.3) {
+            showMainWindow()
+            if let webView, webView.url != nil {
+                webView.reload()
+            } else {
+                openWebUi()
+            }
         } else {
-            startBackendIfNeeded()
-            waitForUiReady()
+            openWebUiFromMenu()
         }
     }
 
@@ -188,13 +221,12 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
             guard response == .OK else { return }
             self.pendingTorrentFiles.append(contentsOf: panel.urls)
             self.openUiWhenReady = true
-            if self.isUiReachable(timeout: 0.6) {
-                self.flushPendingTorrents()
-                self.openWebUi()
-            } else {
-                self.startBackendIfNeeded()
-                self.waitForUiReady()
-            }
+            self.showMainWindow()
+            self.loadPlaceholderPage(
+                title: "Adding Torrent",
+                message: "Preparing the local interface and queueing the selected files."
+            )
+            self.scheduleUiBootstrap(timeout: 0.6)
         }
     }
 
@@ -256,7 +288,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
 
         appMenu.addItem(NSMenuItem.separator())
 
-        let launchUi = NSMenuItem(title: "Launch Web UI", action: #selector(openWebUiFromMenu), keyEquivalent: "l")
+        let launchUi = NSMenuItem(title: "Show Window", action: #selector(openWebUiFromMenu), keyEquivalent: "l")
         launchUi.target = self
         launchUi.keyEquivalentModifierMask = [.command]
         appMenu.addItem(launchUi)
@@ -329,7 +361,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
 
         fileMenu.addItem(NSMenuItem.separator())
 
-        let fileLaunch = NSMenuItem(title: "Launch Web UI", action: #selector(openWebUiFromMenu), keyEquivalent: "l")
+        let fileLaunch = NSMenuItem(title: "Show Window", action: #selector(openWebUiFromMenu), keyEquivalent: "l")
         fileLaunch.target = self
         fileLaunch.keyEquivalentModifierMask = [.command]
         fileMenu.addItem(fileLaunch)
@@ -364,6 +396,193 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
         let help = NSMenuItem(title: "Rustorrent Help", action: #selector(openHelpFromMenu), keyEquivalent: "?")
         help.target = self
         helpMenu.addItem(help)
+    }
+
+    private func scheduleUiBootstrap(timeout: TimeInterval) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let reachable = self.isUiReachable(timeout: timeout)
+            DispatchQueue.main.async {
+                if reachable {
+                    self.flushPendingTorrents()
+                    if self.openUiWhenReady {
+                        self.openWebUi()
+                    }
+                } else {
+                    self.startBackendIfNeeded()
+                    self.waitForUiReady()
+                }
+            }
+        }
+    }
+
+    private func buildStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = item.button {
+            button.image = NSImage(
+                systemSymbolName: "arrow.down.circle",
+                accessibilityDescription: "Rustorrent"
+            )
+            button.image?.isTemplate = true
+            button.toolTip = "Rustorrent"
+        }
+        item.menu = makeQuickMenu()
+        statusItem = item
+    }
+
+    private func makeQuickMenu() -> NSMenu {
+        let menu = NSMenu()
+
+        let showWindow = NSMenuItem(title: "Show Window", action: #selector(openWebUiFromMenu), keyEquivalent: "")
+        showWindow.target = self
+        menu.addItem(showWindow)
+
+        let addTorrent = NSMenuItem(title: "Add Torrent File…", action: #selector(addTorrentFileFromMenu), keyEquivalent: "")
+        addTorrent.target = self
+        menu.addItem(addTorrent)
+
+        let openDownloads = NSMenuItem(title: "Open Downloads", action: #selector(openDownloadsFromMenu), keyEquivalent: "")
+        openDownloads.target = self
+        menu.addItem(openDownloads)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let preferences = NSMenuItem(title: "Preferences…", action: #selector(showPreferencesWindow), keyEquivalent: "")
+        preferences.target = self
+        menu.addItem(preferences)
+
+        let refresh = NSMenuItem(title: "Reload", action: #selector(reloadCurrentWindow), keyEquivalent: "")
+        refresh.target = self
+        menu.addItem(refresh)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let quit = NSMenuItem(title: "Quit Rustorrent", action: #selector(quitFromMenu), keyEquivalent: "")
+        quit.target = self
+        menu.addItem(quit)
+        return menu
+    }
+
+    private func createMainWindowIfNeeded() {
+        guard mainWindow == nil else { return }
+        log("creating main window")
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1240, height: 860),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.center()
+        window.title = "Rustorrent"
+        window.minSize = NSSize(width: 960, height: 640)
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        if #available(macOS 11.0, *) {
+            window.toolbarStyle = .unifiedCompact
+        }
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        let toolbar = NSToolbar(identifier: toolbarIdentifier)
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = false
+        toolbar.autosavesConfiguration = false
+        window.toolbar = toolbar
+
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        let webView = WKWebView(frame: window.contentView?.bounds ?? .zero, configuration: configuration)
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
+        webView.autoresizingMask = [.width, .height]
+        webView.setValue(false, forKey: "drawsBackground")
+        window.contentView = webView
+
+        mainWindow = window
+        self.webView = webView
+    }
+
+    private func showMainWindow() {
+        createMainWindowIfNeeded()
+        log("showing main window")
+        mainWindow?.orderFrontRegardless()
+        mainWindow?.makeKey()
+        mainWindow?.makeMain()
+        mainWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func loadPlaceholderPage(title: String, message: String, isError: Bool = false) {
+        createMainWindowIfNeeded()
+        let accent = isError ? "#b3261e" : "#0b57d0"
+        let background = isError ? "#fff8f6" : "#f6f8fb"
+        let border = isError ? "#f2b8b5" : "#d3e3fd"
+        let html = """
+        <!doctype html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <style>
+        :root { color-scheme: light; }
+        body {
+          margin: 0;
+          font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+          background: #eef2f7;
+          color: #1f2937;
+          display: grid;
+          place-items: center;
+          min-height: 100vh;
+        }
+        .card {
+          width: min(520px, calc(100vw - 48px));
+          border-radius: 24px;
+          border: 1px solid \(border);
+          background: \(background);
+          box-shadow: 0 20px 50px rgba(15, 23, 42, 0.12);
+          padding: 28px 28px 24px;
+        }
+        .title {
+          margin: 0;
+          font-size: 24px;
+          font-weight: 700;
+          letter-spacing: -0.02em;
+          color: \(accent);
+        }
+        .copy {
+          margin-top: 10px;
+          font-size: 15px;
+          line-height: 1.6;
+          color: #475467;
+        }
+        .pulse {
+          width: 12px;
+          height: 12px;
+          border-radius: 999px;
+          background: \(accent);
+          box-shadow: 0 0 0 rgba(11, 87, 208, 0.4);
+          animation: pulse 1.6s infinite;
+          margin-bottom: 16px;
+        }
+        @keyframes pulse {
+          0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(11, 87, 208, 0.35); }
+          70% { transform: scale(1); box-shadow: 0 0 0 16px rgba(11, 87, 208, 0); }
+          100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(11, 87, 208, 0); }
+        }
+        </style>
+        </head>
+        <body>
+          <div class="card">
+            <div class="pulse"></div>
+            <h1 class="title">\(escapeHTML(title))</h1>
+            <div class="copy">\(escapeHTML(message))</div>
+          </div>
+        </body>
+        </html>
+        """
+        webView?.loadHTMLString(html, baseURL: nil)
     }
 
     private func refreshPreferencesControls() {
@@ -415,8 +634,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
             if !FileManager.default.fileExists(atPath: logFile.path) {
                 FileManager.default.createFile(atPath: logFile.path, contents: nil)
             }
-            logHandle = try FileHandle(forWritingTo: logFile)
-            logHandle?.seekToEndOfFile()
+            prepareLauncherLogIfNeeded()
         } catch {
             presentFatalError(
                 title: "Rustorrent Startup Failed",
@@ -467,6 +685,11 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
         backendOwned = false
         cachedApiToken = nil
         if !isUiReachable(timeout: 0.4) {
+            loadPlaceholderPage(
+                title: "Rustorrent Stopped",
+                message: "The local engine exited with status \(proc.terminationStatus). Relaunch the window to try again.",
+                isError: true
+            )
             presentFatalError(
                 title: "Rustorrent Stopped",
                 text: "The background process exited with status \(proc.terminationStatus)."
@@ -486,17 +709,25 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
             }
             self.uiWaitAttempts += 1
             if self.isUiReachable(timeout: 0.6) {
+                self.log("ui reachable after \(self.uiWaitAttempts) attempts")
                 timer.invalidate()
                 self.uiReadyTimer = nil
                 self.flushPendingTorrents()
                 if self.openUiWhenReady {
+                    self.showMainWindow()
                     self.openWebUi()
                 }
                 return
             }
             if self.uiWaitAttempts >= self.maxUiWaitAttempts {
+                self.log("ui failed to become ready within timeout")
                 timer.invalidate()
                 self.uiReadyTimer = nil
+                self.loadPlaceholderPage(
+                    title: "Rustorrent UI Timeout",
+                    message: "The local interface did not become ready in time. Try relaunching the window.",
+                    isError: true
+                )
                 self.presentFatalError(
                     title: "Rustorrent UI Timeout",
                     text: "The local web UI did not become ready in time."
@@ -512,6 +743,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
         if pendingTorrentFiles.isEmpty {
             return
         }
+        log("flushing \(pendingTorrentFiles.count) pending torrents")
         var remaining: [URL] = []
         for file in pendingTorrentFiles {
             if !postTorrentFile(file) {
@@ -576,11 +808,13 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
 
     private func openWebUi() {
         let url = uiBaseURL()
-        if !NSWorkspace.shared.open(url) {
-            let opener = Process()
-            opener.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            opener.arguments = [url.absoluteString]
-            try? opener.run()
+        showMainWindow()
+        log("opening ui url \(url.absoluteString)")
+        if lastLoadedURL != url {
+            webView?.load(URLRequest(url: url))
+            lastLoadedURL = url
+        } else {
+            webView?.reload()
         }
     }
 
@@ -670,6 +904,26 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func prepareLauncherLogIfNeeded() {
+        if logHandle != nil {
+            return
+        }
+        let logFile = launcherLogFileURL()
+        do {
+            try FileManager.default.createDirectory(
+                at: logFile.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            if !FileManager.default.fileExists(atPath: logFile.path) {
+                FileManager.default.createFile(atPath: logFile.path, contents: nil)
+            }
+            logHandle = try FileHandle(forWritingTo: logFile)
+            logHandle?.seekToEndOfFile()
+        } catch {
+            // Fall back to no-op logging if file setup fails.
+        }
+    }
+
     private func isoTimestamp() -> String {
         let fmt = ISO8601DateFormatter()
         fmt.formatOptions = [.withInternetDateTime]
@@ -712,5 +966,113 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".rustorrent", isDirectory: true)
             .appendingPathComponent("launcher.log")
+    }
+
+    private func escapeHTML(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&#39;")
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        return false
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [
+            toolbarAddItemIdentifier,
+            toolbarRefreshItemIdentifier,
+            toolbarDownloadsItemIdentifier,
+            toolbarPreferencesItemIdentifier,
+            .flexibleSpace,
+            .space,
+        ]
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [
+            toolbarAddItemIdentifier,
+            .flexibleSpace,
+            toolbarRefreshItemIdentifier,
+            toolbarDownloadsItemIdentifier,
+            toolbarPreferencesItemIdentifier,
+        ]
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+        item.target = self
+
+        switch itemIdentifier {
+        case toolbarAddItemIdentifier:
+            item.label = "Add Torrent"
+            item.paletteLabel = item.label
+            item.toolTip = "Add a .torrent file"
+            item.image = NSImage(systemSymbolName: "plus.circle", accessibilityDescription: item.label)
+            item.action = #selector(addTorrentFileFromMenu)
+        case toolbarRefreshItemIdentifier:
+            item.label = "Reload"
+            item.paletteLabel = item.label
+            item.toolTip = "Reload the Rustorrent window"
+            item.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: item.label)
+            item.action = #selector(reloadCurrentWindow)
+        case toolbarDownloadsItemIdentifier:
+            item.label = "Downloads"
+            item.paletteLabel = item.label
+            item.toolTip = "Open the download directory"
+            item.image = NSImage(systemSymbolName: "folder", accessibilityDescription: item.label)
+            item.action = #selector(openDownloadsFromMenu)
+        case toolbarPreferencesItemIdentifier:
+            item.label = "Preferences"
+            item.paletteLabel = item.label
+            item.toolTip = "Open Rustorrent preferences"
+            item.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: item.label)
+            item.action = #selector(showPreferencesWindow)
+        default:
+            return nil
+        }
+        return item
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.allow)
+            return
+        }
+
+        let isLocalUI = (url.scheme == "http" || url.scheme == "https")
+            && url.host == "127.0.0.1"
+            && (url.port ?? uiPort) == uiPort
+        if isLocalUI || url.scheme == "about" {
+            decisionHandler(.allow)
+            return
+        }
+
+        NSWorkspace.shared.open(url)
+        decisionHandler(.cancel)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        if let url = navigationAction.request.url {
+            NSWorkspace.shared.open(url)
+        }
+        return nil
     }
 }

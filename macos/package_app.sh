@@ -24,6 +24,8 @@ fi
 UNIVERSAL=false
 CREATE_DMG=false
 OUTPUT_DIR="$PROJECT_DIR/target/macos-app/dist"
+SIGN_IDENTITY="${APP_SIGN_IDENTITY:-}"
+NOTARY_PROFILE="${APP_NOTARY_PROFILE:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -115,6 +117,21 @@ fi
 # Avoid leaking host metadata into shared archives.
 xattr -cr "$APP_BUNDLE" 2>/dev/null || true
 
+if [[ -n "$SIGN_IDENTITY" ]]; then
+  echo "==> Code signing app bundle"
+  codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime \
+    "$APP_BUNDLE/Contents/MacOS/rustorrent-bin"
+  codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime \
+    "$APP_BUNDLE/Contents/MacOS/rustorrent"
+  if [[ -d "$APP_BUNDLE/Contents/Resources" ]]; then
+    find "$APP_BUNDLE/Contents/Resources" -type f -print0 | while IFS= read -r -d '' file; do
+      codesign --force --sign "$SIGN_IDENTITY" --timestamp "$file" || true
+    done
+  fi
+  codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime \
+    "$APP_BUNDLE"
+fi
+
 ARTIFACT_BASE="${APP_NAME}-${VERSION}-${ARCH_TAG}"
 ZIP_PATH="$OUTPUT_DIR/${ARTIFACT_BASE}.app.zip"
 rm -f "$ZIP_PATH"
@@ -145,6 +162,26 @@ if $CREATE_DMG; then
   rm -rf "$DMG_TEMP"
   echo "DMG artifact: $DMG_PATH"
   echo "DMG size: $(du -h "$DMG_PATH" | cut -f1)"
+
+  if [[ -n "$SIGN_IDENTITY" ]]; then
+    echo "==> Code signing DMG artifact"
+    codesign --force --sign "$SIGN_IDENTITY" --timestamp "$DMG_PATH"
+  fi
+fi
+
+if [[ -n "$NOTARY_PROFILE" ]]; then
+  SUBMIT_TARGET="$ZIP_PATH"
+  if $CREATE_DMG; then
+    SUBMIT_TARGET="$DMG_PATH"
+  fi
+  echo "==> Submitting for notarization using keychain profile '$NOTARY_PROFILE'"
+  xcrun notarytool submit "$SUBMIT_TARGET" --keychain-profile "$NOTARY_PROFILE" --wait
+  echo "==> Stapling app bundle"
+  xcrun stapler staple "$APP_BUNDLE"
+  if $CREATE_DMG; then
+    echo "==> Stapling DMG artifact"
+    xcrun stapler staple "$DMG_PATH"
+  fi
 fi
 
 echo ""
