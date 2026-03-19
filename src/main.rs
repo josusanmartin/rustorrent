@@ -278,7 +278,8 @@ const LOW_PEER_THRESHOLD: usize = 8;
 const UPLOAD_SLOTS: usize = 4;
 const UNCHOKE_INTERVAL: Duration = Duration::from_secs(10);
 const OPTIMISTIC_UNCHOKE_INTERVAL: Duration = Duration::from_secs(30);
-const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const METADATA_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const TRANSFER_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PEER_RETRIES: u32 = 6;
 const PEER_RETRY_BASE_SECS: u64 = 1;
 const NO_PEER_REANNOUNCE_SECS: u64 = 5;
@@ -7398,17 +7399,25 @@ fn bind_tcp_dual_stack(port: u16) -> Result<TcpListener, String> {
 }
 
 fn connect_peer(addr: SocketAddr, connect_cfg: &ConnectionConfig) -> Result<PeerStream, String> {
-    connect_peer_for_metadata(addr, connect_cfg)
+    connect_peer_with_timeout(addr, connect_cfg, TRANSFER_PEER_CONNECT_TIMEOUT)
 }
 
-fn connect_tcp_stream(addr: SocketAddr) -> Result<TcpStream, String> {
-    TcpStream::connect_timeout(&addr, PEER_CONNECT_TIMEOUT)
+fn connect_tcp_stream(addr: SocketAddr, timeout: Duration) -> Result<TcpStream, String> {
+    TcpStream::connect_timeout(&addr, timeout)
         .map_err(|err| format!("connect {addr} failed: {err}"))
 }
 
 fn connect_peer_for_metadata(
     addr: SocketAddr,
     connect_cfg: &ConnectionConfig,
+) -> Result<PeerStream, String> {
+    connect_peer_with_timeout(addr, connect_cfg, METADATA_PEER_CONNECT_TIMEOUT)
+}
+
+fn connect_peer_with_timeout(
+    addr: SocketAddr,
+    connect_cfg: &ConnectionConfig,
+    tcp_timeout: Duration,
 ) -> Result<PeerStream, String> {
     if let Some(filter) = connect_cfg.ip_filter.as_ref() {
         if filter.is_blocked(addr.ip()) {
@@ -7430,7 +7439,7 @@ fn connect_peer_for_metadata(
     {
         let tx = tx.clone();
         thread::spawn(move || {
-            let result = connect_tcp_stream(addr).map(|stream| {
+            let result = connect_tcp_stream(addr, tcp_timeout).map(|stream| {
                 let _ = stream.set_nodelay(true);
                 PeerStream::tcp(stream)
             });
@@ -8700,6 +8709,40 @@ fn push_speed_sample(history: &mut Vec<f64>, value: f64) {
     }
 }
 
+fn aggregate_session_rates(state: &ui::UiState) -> (f64, f64) {
+    let download = state.torrents.iter().map(|torrent| torrent.download_rate_bps).sum();
+    let upload = state.torrents.iter().map(|torrent| torrent.upload_rate_bps).sum();
+    (download, upload)
+}
+
+#[cfg(test)]
+mod session_rate_tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_session_rates_sums_all_torrent_rates() {
+        let state = ui::UiState {
+            torrents: vec![
+                ui::UiTorrent {
+                    download_rate_bps: 2_000_000.0,
+                    upload_rate_bps: 100_000.0,
+                    ..ui::UiTorrent::default()
+                },
+                ui::UiTorrent {
+                    download_rate_bps: 1_500_000.0,
+                    upload_rate_bps: 250_000.0,
+                    ..ui::UiTorrent::default()
+                },
+            ],
+            ..ui::UiState::default()
+        };
+
+        let (download, upload) = aggregate_session_rates(&state);
+        assert_eq!(download, 3_500_000.0);
+        assert_eq!(upload, 350_000.0);
+    }
+}
+
 fn set_torrent_completion_ui(
     state: &mut ui::UiState,
     torrent_id: u64,
@@ -8952,6 +8995,7 @@ mod core_helpers_tests {
     use super::*;
     use std::collections::HashMap;
     use std::fs;
+    use std::io::Cursor;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(label: &str) -> PathBuf {
@@ -9028,6 +9072,59 @@ mod core_helpers_tests {
             ratio_group: Arc::new(Mutex::new(None)),
             file_renames: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    #[test]
+    fn handle_upload_request_writes_piece_and_updates_counters() {
+        let root = temp_path("upload-request");
+        fs::create_dir_all(&root).unwrap();
+        SESSION_UPLOADED_BYTES.store(0, Ordering::SeqCst);
+
+        let context = make_test_context(31, &root);
+        let block = b"abcdefghijklmnop";
+        {
+            let mut storage = context.storage.lock().unwrap();
+            storage.write_at(0, block).unwrap();
+        }
+        {
+            let mut pieces = context.pieces.lock().unwrap();
+            pieces.mark_piece_complete(0).unwrap();
+        }
+        context.upload_manager.register(99);
+
+        let mut out = Vec::new();
+        handle_upload_request(
+            &mut out,
+            &context.pieces,
+            &context.storage,
+            context.base_piece_length,
+            0,
+            0,
+            block.len() as u32,
+            &context.limits,
+            &context.uploaded,
+            &context.upload_manager,
+            99,
+        )
+        .unwrap();
+
+        let mut cursor = Cursor::new(out);
+        let message = peer::read_message(&mut cursor).unwrap();
+        assert_eq!(
+            message,
+            peer::Message::Piece {
+                index: 0,
+                begin: 0,
+                block: block.to_vec(),
+            }
+        );
+        assert_eq!(context.uploaded.load(Ordering::SeqCst), block.len() as u64);
+        assert_eq!(
+            SESSION_UPLOADED_BYTES.load(Ordering::SeqCst),
+            block.len() as u64
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -10721,9 +10818,9 @@ fn start_console_progress(
                 .unwrap_or((0, 0));
             snapshot.downloaded_bytes = downloaded_bytes;
 
-            let (mut line, speed_bps, eta_secs) = download_stats.render_line(&snapshot);
+            let (mut line, _speed_bps, eta_secs) = download_stats.render_line(&snapshot);
             upload_stats.update_speed(uploaded_bytes);
-            let upload_speed = upload_stats.current_speed();
+            let _upload_speed = upload_stats.current_speed();
             if line.len() < download_stats.last_line_len {
                 line.push_str(&" ".repeat(download_stats.last_line_len - line.len()));
             }
@@ -10745,8 +10842,9 @@ fn start_console_progress(
                 0.0
             };
             if let Ok(mut guard) = state.lock() {
-                guard.download_rate_bps = speed_bps;
-                guard.upload_rate_bps = upload_speed;
+                let (session_download_rate, session_upload_rate) = aggregate_session_rates(&guard);
+                guard.download_rate_bps = session_download_rate;
+                guard.upload_rate_bps = session_upload_rate;
                 guard.eta_secs = eta_secs;
                 guard.paused = is_paused();
                 guard.downloaded_bytes = downloaded_bytes;
@@ -10757,8 +10855,8 @@ fn start_console_progress(
                 guard.peer_disconnected = PEER_DISCONNECTED.load(Ordering::SeqCst);
                 guard.disk_read_ms_avg = read_ms;
                 guard.disk_write_ms_avg = write_ms;
-                push_speed_sample(&mut guard.download_history_bps, speed_bps);
-                push_speed_sample(&mut guard.upload_history_bps, upload_speed);
+                push_speed_sample(&mut guard.download_history_bps, session_download_rate);
+                push_speed_sample(&mut guard.upload_history_bps, session_upload_rate);
             }
 
             sleep_with_shutdown(Duration::from_secs(1));
