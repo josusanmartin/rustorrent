@@ -51,7 +51,7 @@ pub fn initiate<RW: Read + Write>(
     info_hash: [u8; 20],
     allow_plain: bool,
     initial_payload: &[u8],
-) -> Result<(CryptoMode, Option<CipherState>), String> {
+) -> Result<(CryptoMode, Option<CipherState>, Vec<u8>), String> {
     // Step 1: Send Ya (96 bytes, no padding)
     let (priv_key, pub_key) = dh_generate();
     let pub_bytes = to_fixed_bytes(&pub_key, 96);
@@ -177,6 +177,11 @@ pub fn initiate<RW: Read + Write>(
         vec![]
     };
     let pad_to_skip = pad_d_len.saturating_sub(leftover.len());
+    let buffered_after_pad = if leftover.len() > pad_d_len {
+        leftover[pad_d_len..].to_vec()
+    } else {
+        Vec::new()
+    };
     if pad_to_skip > 0 {
         let mut pad = vec![0u8; pad_to_skip];
         stream
@@ -187,10 +192,10 @@ pub fn initiate<RW: Read + Write>(
 
     if crypto_select & 0x02 != 0 {
         let cipher = CipherState { enc, dec };
-        return Ok((CryptoMode::Rc4, Some(cipher)));
+        return Ok((CryptoMode::Rc4, Some(cipher), buffered_after_pad));
     }
     if allow_plain && crypto_select & 0x01 != 0 {
-        return Ok((CryptoMode::Plaintext, None));
+        return Ok((CryptoMode::Plaintext, None, buffered_after_pad));
     }
     Err("mse crypto selection failed".to_string())
 }
@@ -233,6 +238,7 @@ pub fn accept<RW: Read + Write>(
     let mut scan_buf = Vec::with_capacity(540);
     let max_scan = 532; // 512 max PadA + 20 hash
     let mut chunk = [0u8; 512];
+    let req1_offset;
     'req1_scan: loop {
         let n = stream
             .read(&mut chunk)
@@ -249,6 +255,7 @@ pub fn accept<RW: Read + Write>(
         };
         for pos in search_start..scan_buf.len().saturating_sub(19) {
             if scan_buf[pos..pos + 20] == hash_req1 {
+                req1_offset = pos;
                 break 'req1_scan;
             }
         }
@@ -257,11 +264,24 @@ pub fn accept<RW: Read + Write>(
         }
     }
 
+    let mut buffered = scan_buf[req1_offset + 20..].to_vec();
+    let mut read_exact_buffered = |out: &mut [u8]| -> Result<(), String> {
+        let take = out.len().min(buffered.len());
+        if take > 0 {
+            out[..take].copy_from_slice(&buffered[..take]);
+            buffered.drain(..take);
+        }
+        if take < out.len() {
+            stream
+                .read_exact(&mut out[take..])
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(())
+    };
+
     // Read XOR'd hash (20 bytes)
     let mut xor_buf = [0u8; 20];
-    stream
-        .read_exact(&mut xor_buf)
-        .map_err(|err| err.to_string())?;
+    read_exact_buffered(&mut xor_buf)?;
     let hash_req2 = xor_hash(&xor_buf, &hash_req3);
     let info_hash = match find_info_hash(info_hashes, &hash_req2) {
         Some(hash) => hash,
@@ -277,9 +297,7 @@ pub fn accept<RW: Read + Write>(
 
     // Read and decrypt: VC (8) + crypto_provide (4) + len(PadC) (2)
     let mut enc_header = [0u8; 14];
-    stream
-        .read_exact(&mut enc_header)
-        .map_err(|err| err.to_string())?;
+    read_exact_buffered(&mut enc_header)?;
     dec.apply(&mut enc_header);
 
     // Verify VC (first 8 bytes should be zeros)
@@ -297,22 +315,20 @@ pub fn accept<RW: Read + Write>(
             return Err("mse PadC too large".to_string());
         }
         let mut pad = vec![0u8; pad_c_len];
-        stream.read_exact(&mut pad).map_err(|err| err.to_string())?;
+        read_exact_buffered(&mut pad)?;
         dec.apply(&mut pad);
     }
 
     // Read len(IA) (2 bytes)
     let mut ia_len_buf = [0u8; 2];
-    stream
-        .read_exact(&mut ia_len_buf)
-        .map_err(|err| err.to_string())?;
+    read_exact_buffered(&mut ia_len_buf)?;
     dec.apply(&mut ia_len_buf);
     let ia_len = u16::from_be_bytes(ia_len_buf) as usize;
 
     // Read IA (initial payload = peer's BT handshake)
     let mut ia = vec![0u8; ia_len];
     if ia_len > 0 {
-        stream.read_exact(&mut ia).map_err(|err| err.to_string())?;
+        read_exact_buffered(&mut ia)?;
         dec.apply(&mut ia);
     }
 
@@ -482,6 +498,8 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
+    use crate::peer_stream::PeerStream;
+
     #[test]
     fn xor_and_key_derivation_are_consistent() {
         let a = [0xAAu8; 20];
@@ -559,22 +577,19 @@ mod tests {
             assert_eq!(&inbound, b"ping");
         });
 
-        let mut client = TcpStream::connect(addr).unwrap();
-        let (mode, mut cipher) = initiate(&mut client, info_hash, false, initial_payload).unwrap();
+        let mut client = PeerStream::tcp(TcpStream::connect(addr).unwrap());
+        let (mode, cipher, buffered) = initiate(&mut client, info_hash, false, initial_payload).unwrap();
         assert!(matches!(mode, CryptoMode::Rc4));
+        if let Some(cipher) = cipher {
+            client.enable_encryption(cipher);
+        }
+        client.prepend_read_buffer(buffered);
 
         let mut inbound = [0u8; 4];
         client.read_exact(&mut inbound).unwrap();
-        if let Some(c) = cipher.as_mut() {
-            c.decrypt(&mut inbound);
-        }
         assert_eq!(&inbound, b"pong");
 
-        let mut outbound = b"ping".to_vec();
-        if let Some(c) = cipher.as_mut() {
-            c.encrypt(&mut outbound);
-        }
-        client.write_all(&outbound).unwrap();
+        client.write_all(b"ping").unwrap();
         server.join().unwrap();
     }
 }
