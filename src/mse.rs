@@ -114,21 +114,29 @@ pub fn initiate<RW: Read + Write>(
         dec_preview.apply(&mut vc_pattern);
     }
 
-    // Read byte-by-byte and search for the VC pattern
+    // Read in chunks and search for the VC pattern
     let mut scan_buf = Vec::with_capacity(528);
     let max_scan = 520; // 512 max PadB + 8 VC
     let vc_offset;
-    loop {
-        let mut byte = [0u8; 1];
-        stream
-            .read_exact(&mut byte)
+    let mut chunk = [0u8; 512];
+    'vc_scan: loop {
+        let n = stream
+            .read(&mut chunk)
             .map_err(|err| format!("mse vc scan: {err}"))?;
-        scan_buf.push(byte[0]);
-        if scan_buf.len() >= 8 {
-            let start = scan_buf.len() - 8;
-            if scan_buf[start..] == vc_pattern {
-                vc_offset = start;
-                break;
+        if n == 0 {
+            return Err("mse vc scan: unexpected eof".to_string());
+        }
+        scan_buf.extend_from_slice(&chunk[..n]);
+        // Check all new positions where the pattern could start
+        let search_start = if scan_buf.len() - n < 8 {
+            0
+        } else {
+            scan_buf.len() - n - 7 // pattern could straddle the boundary
+        };
+        for pos in search_start..scan_buf.len().saturating_sub(7) {
+            if scan_buf[pos..pos + 8] == vc_pattern {
+                vc_offset = pos;
+                break 'vc_scan;
             }
         }
         if scan_buf.len() > max_scan {
@@ -224,16 +232,24 @@ pub fn accept<RW: Read + Write>(
     // Scan for HASH('req1', S) in stream (skip PadA from peer)
     let mut scan_buf = Vec::with_capacity(540);
     let max_scan = 532; // 512 max PadA + 20 hash
-    loop {
-        let mut byte = [0u8; 1];
-        stream
-            .read_exact(&mut byte)
+    let mut chunk = [0u8; 512];
+    'req1_scan: loop {
+        let n = stream
+            .read(&mut chunk)
             .map_err(|err| format!("mse req1 scan: {err}"))?;
-        scan_buf.push(byte[0]);
-        if scan_buf.len() >= 20 {
-            let start = scan_buf.len() - 20;
-            if scan_buf[start..] == hash_req1 {
-                break;
+        if n == 0 {
+            return Err("mse req1 scan: unexpected eof".to_string());
+        }
+        scan_buf.extend_from_slice(&chunk[..n]);
+        // Check all new positions where the pattern could start
+        let search_start = if scan_buf.len() - n < 20 {
+            0
+        } else {
+            scan_buf.len() - n - 19 // pattern could straddle the boundary
+        };
+        for pos in search_start..scan_buf.len().saturating_sub(19) {
+            if scan_buf[pos..pos + 20] == hash_req1 {
+                break 'req1_scan;
             }
         }
         if scan_buf.len() > max_scan {

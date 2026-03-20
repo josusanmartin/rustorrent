@@ -35,3 +35,10 @@ path = "fuzz_targets/http_tracker_parsers.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "storage_paths"
+path = "fuzz_targets/storage_paths.rs"
+test = false
+doc = false
+bench = false

@@ -57,6 +57,13 @@ impl PeerStream {
         }
     }
 
+    pub fn tcp_stream(&self) -> Option<&TcpStream> {
+        match &self.inner {
+            PeerStreamInner::Tcp(stream) => Some(stream),
+            _ => None,
+        }
+    }
+
     pub fn enable_encryption(&mut self, cipher: CipherState) {
         self.cipher = Some(cipher);
     }

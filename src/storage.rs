@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -5,6 +6,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+#[cfg(unix)]
+use std::fs::DirBuilder;
 
 use crate::torrent::TorrentMeta;
 
@@ -73,6 +77,8 @@ pub enum Error {
     InvalidFiles,
     InvalidLength,
     OutOfBounds,
+    SymlinkNotAllowed,
+    InsufficientDiskSpace,
 }
 
 impl fmt::Display for Error {
@@ -84,6 +90,8 @@ impl fmt::Display for Error {
             Error::InvalidFiles => write!(f, "invalid file list"),
             Error::InvalidLength => write!(f, "invalid length"),
             Error::OutOfBounds => write!(f, "read/write out of bounds"),
+            Error::SymlinkNotAllowed => write!(f, "symlinks are not allowed in torrent paths"),
+            Error::InsufficientDiskSpace => write!(f, "insufficient disk space"),
         }
     }
 }
@@ -107,17 +115,17 @@ impl Storage {
         for layout in layouts {
             if let Some(parent) = layout.path.parent() {
                 if !parent.as_os_str().is_empty() {
-                    fs::create_dir_all(parent)?;
+                    create_dir_secure(parent)?;
                 }
             }
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&layout.path)?;
+            let file = open_file_no_follow(&layout.path, true)?;
             if options.preallocate {
-                file.set_len(layout.length)?;
+                if let Err(err) = file.set_len(layout.length) {
+                    if err.raw_os_error() == Some(28) {
+                        return Err(Error::InsufficientDiskSpace);
+                    }
+                    return Err(Error::Io(err));
+                }
             }
             entries.push(FileEntry {
                 offset: layout.offset,
@@ -275,11 +283,30 @@ impl Storage {
         if self.write_cache.is_empty() {
             return Ok(());
         }
-        let mut entries = Vec::new();
-        std::mem::swap(&mut entries, &mut self.write_cache);
+        let mut pending = Vec::new();
+        std::mem::swap(&mut pending, &mut self.write_cache);
         self.write_cache_bytes = 0;
-        for entry in entries {
-            self.write_direct(entry.offset, &entry.data)?;
+        let mut synced_files: HashSet<usize> = HashSet::new();
+        for (idx, entry) in pending.iter().enumerate() {
+            if let Err(err) = self.write_direct(entry.offset, &entry.data) {
+                let remaining = pending.split_off(idx);
+                let remaining_bytes: usize = remaining.iter().map(|e| e.data.len()).sum();
+                self.write_cache = remaining;
+                self.write_cache_bytes = remaining_bytes;
+                return Err(err);
+            }
+            for (fi, fe) in self.entries.iter().enumerate() {
+                let entry_end = entry.offset.saturating_add(entry.data.len() as u64);
+                let fe_end = fe.offset + fe.length;
+                if entry.offset < fe_end && entry_end > fe.offset {
+                    synced_files.insert(fi);
+                }
+            }
+        }
+        for fi in synced_files {
+            if let Some(fe) = self.entries.get(fi) {
+                let _ = fe.file.sync_data();
+            }
         }
         Ok(())
     }
@@ -296,12 +323,48 @@ impl Storage {
         self.flush_cache()?;
         if let Some(parent) = new_path.parent() {
             if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
+                create_dir_secure(parent)?;
             }
         }
         fs::rename(old_path, new_path)?;
-        let file = OpenOptions::new().read(true).write(true).open(new_path)?;
+        let file = open_file_no_follow(new_path, false)?;
         self.entries[file_index].file = file;
+        Ok(())
+    }
+}
+
+fn open_file_no_follow(path: &Path, create: bool) -> Result<File, Error> {
+    if path.symlink_metadata().map(|m| m.is_symlink()).unwrap_or(false) {
+        return Err(Error::SymlinkNotAllowed);
+    }
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).truncate(false);
+    if create {
+        opts.create(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NOFOLLOW: i32 = 0x0100;
+        opts.custom_flags(O_NOFOLLOW);
+        opts.mode(0o644);
+    }
+    opts.open(path).map_err(Error::Io)
+}
+
+fn create_dir_secure(path: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(path)?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)?;
         Ok(())
     }
 }

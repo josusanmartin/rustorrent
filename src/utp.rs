@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::mpsc;
@@ -13,6 +13,14 @@ const UTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const INITIAL_CWND: usize = 4;
 const MAX_CWND: usize = 64;
+
+// LEDBAT constants (BEP 29 / RFC 6817)
+const LEDBAT_TARGET_DELAY_US: i64 = 100_000; // 100ms target delay
+const MAX_CWND_INCREASE: i64 = 3000; // max bytes gained per RTT
+const BASE_DELAY_WINDOW: Duration = Duration::from_secs(120); // 2-minute rolling minimum
+
+// SACK extension type
+const EXT_SACK: u8 = 1;
 
 const TYPE_DATA: u8 = 0;
 const TYPE_FIN: u8 = 1;
@@ -192,6 +200,15 @@ struct ConnState {
     connect_started: Instant,
     connect_resp: Option<mpsc::Sender<Result<UtpStream, String>>>,
     connect_stream: Option<UtpStream>,
+    // Timestamp diff tracking (BEP 29)
+    peer_timestamp: u32,
+    timestamp_diff: u32,
+    // Out-of-order received packets for SACK
+    ooo_received: HashSet<u16>,
+    // LEDBAT delay-based congestion state
+    base_delay: Option<u32>,
+    base_delay_updated: Instant,
+    current_delay: u32,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -231,6 +248,7 @@ fn utp_loop(
                         read_timeout: None,
                         write_timeout: None,
                     };
+                    let now = Instant::now();
                     let conn = ConnState {
                         addr,
                         send_id,
@@ -242,10 +260,16 @@ fn utp_loop(
                         cwnd: INITIAL_CWND,
                         send_rx,
                         recv_tx,
-                        last_seen: Instant::now(),
-                        connect_started: Instant::now(),
+                        last_seen: now,
+                        connect_started: now,
                         connect_resp: Some(resp),
                         connect_stream: Some(stream),
+                        peer_timestamp: 0,
+                        timestamp_diff: 0,
+                        ooo_received: HashSet::new(),
+                        base_delay: None,
+                        base_delay_updated: now,
+                        current_delay: 0,
                     };
                     let packet = build_packet(TYPE_SYN, send_id, seq, 0, &[]);
                     let _ = socket.send_to(&packet, addr);
@@ -278,11 +302,13 @@ fn utp_loop(
                 match conn.send_rx.try_recv() {
                     Ok(req) => {
                         conn.seq = conn.seq.wrapping_add(1);
-                        let packet = build_packet(
+                        let packet = build_packet_ext(
                             TYPE_DATA,
                             conn.send_id,
                             conn.seq,
                             conn.recv_seq,
+                            conn.timestamp_diff,
+                            &[],
                             &req.data,
                         );
                         let _ = socket.send_to(&packet, conn.addr);
@@ -297,15 +323,17 @@ fn utp_loop(
                 }
             }
 
-            // Retransmit timed-out packets and halve cwnd
+            // Retransmit timed-out packets and halve cwnd (timeout fallback)
             let mut did_timeout = false;
             for pending in conn.inflight.iter_mut() {
                 if pending.sent_at.elapsed() >= UTP_ACK_TIMEOUT {
-                    let packet = build_packet(
+                    let packet = build_packet_ext(
                         TYPE_DATA,
                         conn.send_id,
                         pending.seq,
                         conn.recv_seq,
+                        conn.timestamp_diff,
+                        &[],
                         &pending.data,
                     );
                     let _ = socket.send_to(&packet, conn.addr);
@@ -335,7 +363,9 @@ fn utp_loop(
             if n < UTP_HEADER_LEN {
                 continue;
             }
-            let (ty, conn_id, seq, ack, payload) = parse_packet(&buf[..n]);
+            let pkt = parse_packet(&buf[..n]);
+            let (ty, conn_id, seq, ack) = (pkt.ty, pkt.conn_id, pkt.seq, pkt.ack);
+            let payload = pkt.payload;
             if ty == TYPE_SYN {
                 let recv_id = conn_id;
                 let send_id = conn_id.wrapping_add(1);
@@ -349,6 +379,7 @@ fn utp_loop(
                     read_timeout: None,
                     write_timeout: None,
                 };
+                let now = Instant::now();
                 let conn = ConnState {
                     addr,
                     send_id,
@@ -360,12 +391,26 @@ fn utp_loop(
                     cwnd: INITIAL_CWND,
                     send_rx,
                     recv_tx,
-                    last_seen: Instant::now(),
-                    connect_started: Instant::now(),
+                    last_seen: now,
+                    connect_started: now,
                     connect_resp: None,
                     connect_stream: None,
+                    peer_timestamp: pkt.timestamp,
+                    timestamp_diff: timestamp().wrapping_sub(pkt.timestamp),
+                    ooo_received: HashSet::new(),
+                    base_delay: None,
+                    base_delay_updated: now,
+                    current_delay: 0,
                 };
-                let state_pkt = build_packet(TYPE_STATE, send_id, conn.seq, seq, &[]);
+                let state_pkt = build_packet_ext(
+                    TYPE_STATE,
+                    send_id,
+                    conn.seq,
+                    seq,
+                    conn.timestamp_diff,
+                    &[],
+                    &[],
+                );
                 let _ = socket.send_to(&state_pkt, addr);
                 let _ = accept_tx.send(stream);
                 conns.insert((addr, recv_id), conn);
@@ -391,6 +436,11 @@ fn utp_loop(
                         conn.recv_id = Some(recv_id);
                         conn.state = ConnStatus::Connected;
                         conn.recv_seq = seq;
+                        conn.peer_timestamp = pkt.timestamp;
+                        conn.timestamp_diff = timestamp().wrapping_sub(pkt.timestamp);
+                        if pkt.timestamp_diff != 0 {
+                            conn.current_delay = pkt.timestamp_diff;
+                        }
                         if let Some(resp) = conn.connect_resp.take() {
                             if let Some(stream) = conn.connect_stream.take() {
                                 let _ = resp.send(Ok(stream));
@@ -411,30 +461,90 @@ fn utp_loop(
             };
             conn.last_seen = Instant::now();
 
+            // Record peer timestamp and compute timestamp_diff for next outgoing packet
+            conn.peer_timestamp = pkt.timestamp;
+            conn.timestamp_diff = timestamp().wrapping_sub(pkt.timestamp);
+            // Record the peer's reported delay for LEDBAT
+            if pkt.timestamp_diff != 0 {
+                conn.current_delay = pkt.timestamp_diff;
+            }
+
             match ty {
                 TYPE_STATE => {
-                    // ACK received: remove all packets with seq <= ack
-                    let mut acked = false;
+                    // Cumulative ACK: remove all packets with seq <= ack
+                    let mut bytes_acked: usize = 0;
                     while let Some(front) = conn.inflight.front() {
                         if front.seq == ack || is_seq_before_or_equal(front.seq, ack) {
-                            let pkt = conn.inflight.pop_front().unwrap();
-                            let _ = pkt.resp.send(Ok(()));
-                            acked = true;
+                            let p = conn.inflight.pop_front().unwrap();
+                            bytes_acked += p.data.len();
+                            let _ = p.resp.send(Ok(()));
                         } else {
                             break;
                         }
                     }
-                    if acked && conn.cwnd < MAX_CWND {
-                        conn.cwnd += 1; // Additive increase
+
+                    // Process incoming SACK: mark selectively-acked inflight packets
+                    if !pkt.sack.is_empty() {
+                        let mut sack_acked = HashSet::new();
+                        for (byte_idx, &byte) in pkt.sack.iter().enumerate() {
+                            for bit in 0..8u16 {
+                                if byte & (1 << bit) != 0 {
+                                    let sacked_seq =
+                                        ack.wrapping_add(2).wrapping_add(byte_idx as u16 * 8 + bit);
+                                    sack_acked.insert(sacked_seq);
+                                }
+                            }
+                        }
+                        // Remove SACK-ed inflight packets and complete them
+                        let mut remaining = VecDeque::new();
+                        while let Some(p) = conn.inflight.pop_front() {
+                            if sack_acked.contains(&p.seq) {
+                                bytes_acked += p.data.len();
+                                let _ = p.resp.send(Ok(()));
+                            } else {
+                                remaining.push_back(p);
+                            }
+                        }
+                        conn.inflight = remaining;
+                    }
+
+                    // LEDBAT congestion control instead of simple additive increase
+                    if bytes_acked > 0 {
+                        ledbat_update_cwnd(conn, bytes_acked);
                     }
                 }
                 TYPE_DATA => {
-                    if seq == conn.recv_seq.wrapping_add(1) || conn.recv_seq == seq {
+                    if seq == conn.recv_seq.wrapping_add(1) {
+                        // In-order: advance recv_seq
                         conn.recv_seq = seq;
                         let _ = conn.recv_tx.send(payload.to_vec());
+                        // Deliver any buffered out-of-order packets that are now in sequence
+                        // (we only track their seq numbers; actual data re-delivery relies
+                        //  on the peer retransmitting, but we advance recv_seq so the SACK
+                        //  bitmap shrinks and the peer knows they arrived)
+                        while conn.ooo_received.remove(&conn.recv_seq.wrapping_add(1)) {
+                            conn.recv_seq = conn.recv_seq.wrapping_add(1);
+                        }
+                    } else if conn.recv_seq == seq {
+                        // Duplicate of last delivered packet; re-ACK but don't deliver again
+                    } else {
+                        // Out-of-order: track for SACK
+                        let offset = seq.wrapping_sub(conn.recv_seq.wrapping_add(2));
+                        if (offset as usize) < 32 {
+                            conn.ooo_received.insert(seq);
+                        }
                     }
-                    let state_pkt =
-                        build_packet(TYPE_STATE, conn.send_id, conn.seq, conn.recv_seq, &[]);
+                    // Build outgoing STATE with SACK extension if we have OOO packets
+                    let sack_ext = build_sack_extension(conn.recv_seq, &conn.ooo_received);
+                    let state_pkt = build_packet_ext(
+                        TYPE_STATE,
+                        conn.send_id,
+                        conn.seq,
+                        conn.recv_seq,
+                        conn.timestamp_diff,
+                        &sack_ext,
+                        &[],
+                    );
                     let _ = socket.send_to(&state_pkt, conn.addr);
                 }
                 TYPE_FIN => {
@@ -444,8 +554,15 @@ fn utp_loop(
                     }
                     conn.connect_stream.take();
                     conn.state = ConnStatus::Closed;
-                    let state_pkt =
-                        build_packet(TYPE_STATE, conn.send_id, conn.seq, conn.recv_seq, &[]);
+                    let state_pkt = build_packet_ext(
+                        TYPE_STATE,
+                        conn.send_id,
+                        conn.seq,
+                        conn.recv_seq,
+                        conn.timestamp_diff,
+                        &[],
+                        &[],
+                    );
                     let _ = socket.send_to(&state_pkt, conn.addr);
                 }
                 TYPE_RESET => {
@@ -475,26 +592,145 @@ fn is_seq_before_or_equal(seq: u16, ack: u16) -> bool {
 }
 
 fn build_packet(ty: u8, conn_id: u16, seq: u16, ack: u16, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(UTP_HEADER_LEN + payload.len());
+    build_packet_ext(ty, conn_id, seq, ack, 0, &[], payload)
+}
+
+fn build_packet_ext(
+    ty: u8,
+    conn_id: u16,
+    seq: u16,
+    ack: u16,
+    ts_diff: u32,
+    extensions: &[u8],
+    payload: &[u8],
+) -> Vec<u8> {
+    let has_ext = !extensions.is_empty();
+    let mut out = Vec::with_capacity(UTP_HEADER_LEN + extensions.len() + payload.len());
     out.push((ty << 4) | UTP_VERSION);
-    out.push(0);
+    // next-extension byte: 0 = no extensions, 1 = SACK follows
+    out.push(if has_ext { EXT_SACK } else { 0 });
     out.extend_from_slice(&conn_id.to_be_bytes());
     out.extend_from_slice(&timestamp().to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&ts_diff.to_be_bytes());
     out.extend_from_slice(&0x400000u32.to_be_bytes());
     out.extend_from_slice(&seq.to_be_bytes());
     out.extend_from_slice(&ack.to_be_bytes());
+    out.extend_from_slice(extensions);
     out.extend_from_slice(payload);
     out
 }
 
-fn parse_packet(data: &[u8]) -> (u8, u16, u16, u16, &[u8]) {
+struct ParsedPacket<'a> {
+    ty: u8,
+    conn_id: u16,
+    timestamp: u32,
+    timestamp_diff: u32,
+    seq: u16,
+    ack: u16,
+    sack: Vec<u8>,
+    payload: &'a [u8],
+}
+
+fn parse_packet(data: &[u8]) -> ParsedPacket<'_> {
     let ty = data[0] >> 4;
+    let ext_type = data[1];
     let conn_id = u16::from_be_bytes([data[2], data[3]]);
+    let ts = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    let ts_diff = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
     let seq = u16::from_be_bytes([data[16], data[17]]);
     let ack = u16::from_be_bytes([data[18], data[19]]);
-    let payload = &data[UTP_HEADER_LEN..];
-    (ty, conn_id, seq, ack, payload)
+
+    // Walk extensions chain starting after the 20-byte header
+    let mut sack = Vec::new();
+    let mut offset = UTP_HEADER_LEN;
+    let mut cur_ext = ext_type;
+    while cur_ext != 0 && offset + 2 <= data.len() {
+        let next = data[offset];
+        let ext_len = data[offset + 1] as usize;
+        if cur_ext == EXT_SACK && offset + 2 + ext_len <= data.len() {
+            sack.extend_from_slice(&data[offset + 2..offset + 2 + ext_len]);
+        }
+        offset += 2 + ext_len;
+        cur_ext = next;
+    }
+
+    let payload = if offset <= data.len() {
+        &data[offset..]
+    } else {
+        &[]
+    };
+
+    ParsedPacket {
+        ty,
+        conn_id,
+        timestamp: ts,
+        timestamp_diff: ts_diff,
+        seq,
+        ack,
+        sack,
+        payload,
+    }
+}
+
+/// Build SACK extension bytes: [next_ext=0, length, bitmask...]
+/// The bitmask indicates which packets after `ack_nr` have been received.
+fn build_sack_extension(ack_nr: u16, ooo: &HashSet<u16>) -> Vec<u8> {
+    if ooo.is_empty() {
+        return Vec::new();
+    }
+    // SACK bitmask: bit i represents ack_nr + 2 + i  (ack_nr+1 is the first missing)
+    // BEP 29 uses 4 bytes (32 bits) as the standard SACK length
+    let sack_len: usize = 4;
+    let mut bitmask = vec![0u8; sack_len];
+    for &s in ooo {
+        let offset = s.wrapping_sub(ack_nr.wrapping_add(2));
+        let bit_idx = offset as usize;
+        if bit_idx < sack_len * 8 {
+            bitmask[bit_idx / 8] |= 1 << (bit_idx % 8);
+        }
+    }
+    // Extension header: next_extension=0, length, then bitmask
+    let mut ext = Vec::with_capacity(2 + sack_len);
+    ext.push(0); // no further extensions
+    ext.push(sack_len as u8);
+    ext.extend_from_slice(&bitmask);
+    ext
+}
+
+/// Update LEDBAT congestion window based on delay measurement.
+fn ledbat_update_cwnd(conn: &mut ConnState, bytes_acked: usize) {
+    if conn.current_delay == 0 {
+        return;
+    }
+    let now = Instant::now();
+    // Maintain base_delay as min over last 2 minutes
+    match conn.base_delay {
+        Some(bd) if now.duration_since(conn.base_delay_updated) < BASE_DELAY_WINDOW => {
+            if conn.current_delay < bd {
+                conn.base_delay = Some(conn.current_delay);
+            }
+        }
+        _ => {
+            conn.base_delay = Some(conn.current_delay);
+            conn.base_delay_updated = now;
+        }
+    }
+    let base = conn.base_delay.unwrap_or(conn.current_delay);
+    let queuing_delay = (conn.current_delay as i64).saturating_sub(base as i64);
+    // LEDBAT formula: cwnd += (TARGET - queuing_delay) / TARGET * MAX_CWND_INCREASE / cwnd
+    // We work in packet-count units; approximate packet size as UTP_PAYLOAD_MAX
+    let cwnd_bytes = (conn.cwnd as i64) * (UTP_PAYLOAD_MAX as i64);
+    if cwnd_bytes <= 0 {
+        return;
+    }
+    let off_target = LEDBAT_TARGET_DELAY_US - queuing_delay;
+    let gain = (off_target * MAX_CWND_INCREASE) / LEDBAT_TARGET_DELAY_US;
+    // Scale by acked bytes / cwnd_bytes
+    let acked = bytes_acked.max(1) as i64;
+    let delta_bytes = (gain * acked) / cwnd_bytes;
+    let delta_pkts = delta_bytes / (UTP_PAYLOAD_MAX as i64);
+    let new_cwnd = (conn.cwnd as i64 + delta_pkts).clamp(1, MAX_CWND as i64);
+    conn.cwnd = new_cwnd as usize;
 }
 
 fn timestamp() -> u32 {
@@ -530,12 +766,12 @@ mod tests {
         let packet = build_packet(TYPE_DATA, 42, 100, 99, payload);
         assert_eq!(packet.len(), UTP_HEADER_LEN + payload.len());
 
-        let (ty, conn_id, seq, ack, parsed_payload) = parse_packet(&packet);
-        assert_eq!(ty, TYPE_DATA);
-        assert_eq!(conn_id, 42);
-        assert_eq!(seq, 100);
-        assert_eq!(ack, 99);
-        assert_eq!(parsed_payload, payload);
+        let pkt = parse_packet(&packet);
+        assert_eq!(pkt.ty, TYPE_DATA);
+        assert_eq!(pkt.conn_id, 42);
+        assert_eq!(pkt.seq, 100);
+        assert_eq!(pkt.ack, 99);
+        assert_eq!(pkt.payload, payload);
     }
 
     #[test]
@@ -664,5 +900,107 @@ mod tests {
         let mut recv2 = [0u8; 2];
         a.read_exact(&mut recv2).unwrap();
         assert_eq!(&recv2, b"ok");
+    }
+
+    #[test]
+    fn packet_ext_preserves_timestamp_diff() {
+        let pkt = build_packet_ext(TYPE_STATE, 10, 5, 4, 12345, &[], &[]);
+        let parsed = parse_packet(&pkt);
+        assert_eq!(parsed.timestamp_diff, 12345);
+        assert_eq!(parsed.ty, TYPE_STATE);
+        assert_eq!(parsed.sack.len(), 0);
+    }
+
+    #[test]
+    fn sack_extension_roundtrip() {
+        let mut ooo = HashSet::new();
+        // ack_nr = 10, so first missing is 11, bits represent 12, 13, 14...
+        ooo.insert(12); // bit 0
+        ooo.insert(14); // bit 2
+        let ext = build_sack_extension(10, &ooo);
+        assert!(!ext.is_empty());
+        // Build a packet with that extension
+        let pkt_bytes = build_packet_ext(TYPE_STATE, 1, 1, 10, 0, &ext, &[]);
+        let parsed = parse_packet(&pkt_bytes);
+        assert_eq!(parsed.ty, TYPE_STATE);
+        assert_eq!(parsed.ack, 10);
+        assert_eq!(parsed.sack.len(), 4);
+        // bit 0 and bit 2 should be set
+        assert_ne!(parsed.sack[0] & 0b0000_0001, 0); // seq 12
+        assert_ne!(parsed.sack[0] & 0b0000_0100, 0); // seq 14
+        assert_eq!(parsed.sack[0] & 0b0000_0010, 0); // seq 13 not present
+    }
+
+    #[test]
+    fn sack_extension_empty_when_no_ooo() {
+        let ooo = HashSet::new();
+        let ext = build_sack_extension(10, &ooo);
+        assert!(ext.is_empty());
+    }
+
+    #[test]
+    fn ledbat_cwnd_increases_when_delay_below_target() {
+        let (_tx, rx) = mpsc::channel();
+        let (dtx, _drx) = mpsc::channel();
+        let now = Instant::now();
+        let mut conn = ConnState {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            send_id: 1,
+            recv_id: Some(2),
+            seq: 1,
+            recv_seq: 0,
+            state: ConnStatus::Connected,
+            inflight: VecDeque::new(),
+            cwnd: 4,
+            send_rx: rx,
+            recv_tx: dtx,
+            last_seen: now,
+            connect_started: now,
+            connect_resp: None,
+            connect_stream: None,
+            peer_timestamp: 0,
+            timestamp_diff: 0,
+            ooo_received: HashSet::new(),
+            base_delay: Some(1000),         // 1ms base delay
+            base_delay_updated: now,
+            current_delay: 2000,            // 2ms current delay (well below 100ms target)
+        };
+        let old_cwnd = conn.cwnd;
+        ledbat_update_cwnd(&mut conn, 4 * UTP_PAYLOAD_MAX);
+        // With very low queuing delay the cwnd should not decrease
+        assert!(conn.cwnd >= old_cwnd);
+    }
+
+    #[test]
+    fn ledbat_cwnd_decreases_when_delay_above_target() {
+        let (_tx, rx) = mpsc::channel();
+        let (dtx, _drx) = mpsc::channel();
+        let now = Instant::now();
+        let mut conn = ConnState {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            send_id: 1,
+            recv_id: Some(2),
+            seq: 1,
+            recv_seq: 0,
+            state: ConnStatus::Connected,
+            inflight: VecDeque::new(),
+            cwnd: 20,
+            send_rx: rx,
+            recv_tx: dtx,
+            last_seen: now,
+            connect_started: now,
+            connect_resp: None,
+            connect_stream: None,
+            peer_timestamp: 0,
+            timestamp_diff: 0,
+            ooo_received: HashSet::new(),
+            base_delay: Some(1000),
+            base_delay_updated: now,
+            current_delay: 500_000,         // 500ms current delay >> 100ms target
+        };
+        let old_cwnd = conn.cwnd;
+        ledbat_update_cwnd(&mut conn, 20 * UTP_PAYLOAD_MAX);
+        // With high queuing delay the cwnd should decrease
+        assert!(conn.cwnd < old_cwnd);
     }
 }

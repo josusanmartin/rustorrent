@@ -197,20 +197,27 @@ fn http_connect(
         .write_all(request.as_bytes())
         .map_err(|e| format!("http proxy write: {e}"))?;
 
-    // Read response line
+    // Read response headers in chunks
     let mut response = Vec::with_capacity(256);
-    let mut buf = [0u8; 1];
+    let mut chunk = [0u8; 1024];
     let mut found_end = false;
-    for _ in 0..4096 {
-        match stream.read_exact(&mut buf) {
-            Ok(()) => {
-                response.push(buf[0]);
-                if response.ends_with(b"\r\n\r\n") {
-                    found_end = true;
-                    break;
-                }
-            }
-            Err(e) => return Err(format!("http proxy read: {e}")),
+    while response.len() < 4096 {
+        let n = stream
+            .read(&mut chunk)
+            .map_err(|e| format!("http proxy read: {e}"))?;
+        if n == 0 {
+            return Err("http proxy read: unexpected eof".to_string());
+        }
+        response.extend_from_slice(&chunk[..n]);
+        // Check if the header terminator is present; it could straddle reads
+        let search_start = if response.len() - n < 4 {
+            0
+        } else {
+            response.len() - n - 3
+        };
+        if response[search_start..].windows(4).any(|w| w == b"\r\n\r\n") {
+            found_end = true;
+            break;
         }
     }
     if !found_end {

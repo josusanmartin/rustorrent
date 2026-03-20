@@ -49,6 +49,16 @@ pub enum Message {
         ext_id: u8,
         payload: Vec<u8>,
     },
+    // BEP 6 - Fast Extension
+    SuggestPiece(u32),
+    HaveAll,
+    HaveNone,
+    RejectRequest {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    AllowedFast(u32),
 }
 
 #[derive(Debug)]
@@ -307,6 +317,26 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
             buf.extend_from_slice(payload);
             with_len_prefix(buf)
         }
+        // BEP 6 - Fast Extension
+        Message::SuggestPiece(index) => {
+            let mut payload = Vec::with_capacity(5);
+            payload.push(13);
+            payload.extend_from_slice(&index.to_be_bytes());
+            with_len_prefix(payload)
+        }
+        Message::HaveAll => encode_simple(14),
+        Message::HaveNone => encode_simple(15),
+        Message::RejectRequest {
+            index,
+            begin,
+            length,
+        } => encode_triple(16, *index, *begin, *length),
+        Message::AllowedFast(index) => {
+            let mut payload = Vec::with_capacity(5);
+            payload.push(17);
+            payload.extend_from_slice(&index.to_be_bytes());
+            with_len_prefix(payload)
+        }
     }
 }
 
@@ -356,6 +386,26 @@ pub fn decode_message(payload: &[u8]) -> Result<Message, Error> {
                 return Err(Error::InvalidMessage);
             }
             Ok(Message::Port(u16::from_be_bytes([data[0], data[1]])))
+        }
+        // BEP 6 - Fast Extension
+        13 => {
+            if data.len() != 4 {
+                return Err(Error::InvalidMessage);
+            }
+            Ok(Message::SuggestPiece(read_u32(data)?))
+        }
+        14 => expect_empty(data, Message::HaveAll),
+        15 => expect_empty(data, Message::HaveNone),
+        16 => decode_triple(data, |index, begin, length| Message::RejectRequest {
+            index,
+            begin,
+            length,
+        }),
+        17 => {
+            if data.len() != 4 {
+                return Err(Error::InvalidMessage);
+            }
+            Ok(Message::AllowedFast(read_u32(data)?))
         }
         20 => {
             if data.is_empty() {

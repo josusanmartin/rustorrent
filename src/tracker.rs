@@ -313,7 +313,23 @@ fn build_query(
             push_query(&mut query, "event", event);
         }
     }
+    // BEP 7: advertise IPv6 address if available
+    if let Some(ipv6) = detect_ipv6_address() {
+        push_query(&mut query, "ipv6", &ipv6);
+    }
     query
+}
+
+fn detect_ipv6_address() -> Option<String> {
+    use std::net::{IpAddr, UdpSocket};
+    let socket = UdpSocket::bind("[::]:0").ok()?;
+    socket.connect("[2001:4860:4860::8888]:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V6(addr) if !addr.is_loopback() && !addr.is_unspecified() => {
+            Some(addr.to_string())
+        }
+        _ => None,
+    }
 }
 
 fn push_query(target: &mut String, key: &str, value: &str) {
