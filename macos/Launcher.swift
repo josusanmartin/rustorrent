@@ -57,7 +57,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
             )
         }
 
-        scheduleUiBootstrap(timeout: 0.8)
+        bootstrapUi(timeout: 0.8)
 
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -85,7 +85,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
             title: "Adding Torrent",
             message: "Waiting for the local interface so the torrent can be handed off."
         )
-        scheduleUiBootstrap(timeout: 0.6)
+        bootstrapUi(timeout: 0.6)
         sender.reply(toOpenOrPrint: .success)
     }
 
@@ -181,7 +181,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
             title: "Opening Rustorrent",
             message: "Preparing the built-in interface."
         )
-        scheduleUiBootstrap(timeout: 0.6)
+        bootstrapUi(timeout: 0.6)
     }
 
     @objc
@@ -226,7 +226,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
                 title: "Adding Torrent",
                 message: "Preparing the local interface and queueing the selected files."
             )
-            self.scheduleUiBootstrap(timeout: 0.6)
+            self.bootstrapUi(timeout: 0.6)
         }
     }
 
@@ -398,21 +398,19 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         helpMenu.addItem(help)
     }
 
-    private func scheduleUiBootstrap(timeout: TimeInterval) {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            let reachable = self.isUiReachable(timeout: timeout)
-            DispatchQueue.main.async {
-                if reachable {
-                    self.flushPendingTorrents()
-                    if self.openUiWhenReady {
-                        self.openWebUi()
-                    }
-                } else {
-                    self.startBackendIfNeeded()
-                    self.waitForUiReady()
-                }
+    private func bootstrapUi(timeout: TimeInterval) {
+        if backendProcess == nil {
+            startBackendIfNeeded()
+            waitForUiReady()
+            return
+        }
+        if isUiReachable(timeout: timeout) {
+            flushPendingTorrents()
+            if openUiWhenReady {
+                openWebUi()
             }
+        } else {
+            waitForUiReady()
         }
     }
 
@@ -623,6 +621,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         let homeDir = FileManager.default.homeDirectoryForCurrentUser
 
         do {
+            try preflightDownloadDirectoryAccess(downloadDir)
             try FileManager.default.createDirectory(
                 at: downloadDir,
                 withIntermediateDirectories: true
@@ -644,21 +643,17 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         }
 
         let process = Process()
-        process.executableURL = binary
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = [
-            "--ui",
-            "--ui-addr",
+            "-lc",
+            "exec \"$1\" --ui --ui-addr \"$2\" --download-dir \"$3\" --log \"$4\"",
+            "rustorrent-launch",
+            binary.path,
             "127.0.0.1:\(uiPort)",
-            "--download-dir",
             downloadDir.path,
-            "--log",
             logFile.path,
         ]
         process.currentDirectoryURL = homeDir
-        if let logHandle {
-            process.standardOutput = logHandle
-            process.standardError = logHandle
-        }
 
         process.terminationHandler = { [weak self] proc in
             DispatchQueue.main.async {
@@ -677,6 +672,16 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
                 text: "Could not launch rustorrent-bin: \(error.localizedDescription)"
             )
         }
+    }
+
+    private func preflightDownloadDirectoryAccess(_ url: URL) throws {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
+        _ = try fileManager.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
     }
 
     private func handleBackendExit(_ proc: Process) {

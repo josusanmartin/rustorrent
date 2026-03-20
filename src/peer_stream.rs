@@ -13,6 +13,7 @@ pub enum PeerStreamInner {
 pub struct PeerStream {
     inner: PeerStreamInner,
     cipher: Option<CipherState>,
+    read_buf: Vec<u8>,
 }
 
 impl PeerStream {
@@ -20,6 +21,7 @@ impl PeerStream {
         Self {
             inner: PeerStreamInner::Tcp(stream),
             cipher: None,
+            read_buf: Vec::new(),
         }
     }
 
@@ -27,6 +29,7 @@ impl PeerStream {
         Self {
             inner: PeerStreamInner::Utp(stream),
             cipher: None,
+            read_buf: Vec::new(),
         }
     }
 
@@ -68,6 +71,16 @@ impl PeerStream {
         self.cipher = Some(cipher);
     }
 
+    pub fn prepend_read_buffer(&mut self, mut data: Vec<u8>) {
+        if data.is_empty() {
+            return;
+        }
+        if !self.read_buf.is_empty() {
+            data.extend_from_slice(&self.read_buf);
+        }
+        self.read_buf = data;
+    }
+
     #[allow(dead_code)]
     pub fn is_encrypted(&self) -> bool {
         self.cipher.is_some()
@@ -76,14 +89,24 @@ impl PeerStream {
 
 impl Read for PeerStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut copied = 0usize;
+        if !self.read_buf.is_empty() {
+            copied = buf.len().min(self.read_buf.len());
+            buf[..copied].copy_from_slice(&self.read_buf[..copied]);
+            self.read_buf.drain(..copied);
+            if copied == buf.len() {
+                return Ok(copied);
+            }
+        }
+
         let n = match &mut self.inner {
-            PeerStreamInner::Tcp(stream) => stream.read(buf)?,
-            PeerStreamInner::Utp(stream) => stream.read(buf)?,
+            PeerStreamInner::Tcp(stream) => stream.read(&mut buf[copied..])?,
+            PeerStreamInner::Utp(stream) => stream.read(&mut buf[copied..])?,
         };
         if let Some(cipher) = self.cipher.as_mut() {
-            cipher.decrypt(&mut buf[..n]);
+            cipher.decrypt(&mut buf[copied..copied + n]);
         }
-        Ok(n)
+        Ok(copied + n)
     }
 }
 

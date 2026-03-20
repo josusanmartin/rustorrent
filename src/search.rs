@@ -92,7 +92,11 @@ pub enum SearchDownload {
 static SEARCH_RUNTIME: OnceLock<SearchRuntime> = OnceLock::new();
 static SEARCH_STATE: OnceLock<Mutex<SearchState>> = OnceLock::new();
 
-pub fn init(download_dir: &Path) -> Result<(), String> {
+fn no_plugins_message() -> &'static str {
+    "No search plugins are installed yet. Open Plugins or Community Catalog to add one."
+}
+
+pub fn prepare(download_dir: &Path) -> Result<(), String> {
     let root = download_dir
         .join(".rustorrent")
         .join("search")
@@ -102,7 +106,7 @@ pub fn init(download_dir: &Path) -> Result<(), String> {
         root,
         python: detect_python(),
     };
-    let _ = SEARCH_RUNTIME.set(runtime.clone());
+    let runtime = SEARCH_RUNTIME.get_or_init(|| runtime);
     let state = SEARCH_STATE.get_or_init(|| Mutex::new(SearchState::default()));
     let mut guard = lock_state(state);
     guard.python_available = runtime.python.is_some();
@@ -110,8 +114,14 @@ pub fn init(download_dir: &Path) -> Result<(), String> {
         guard.plugin_error =
             "Python 3 was not found. Install python3 to use qBittorrent-style search plugins."
                 .to_string();
+    } else if guard.plugins.is_empty() {
+        guard.plugin_error = no_plugins_message().to_string();
     }
-    drop(guard);
+    Ok(())
+}
+
+pub fn init(download_dir: &Path) -> Result<(), String> {
+    prepare(download_dir)?;
     refresh_plugins()
 }
 
@@ -127,6 +137,8 @@ pub fn refresh_plugins() -> Result<(), String> {
         guard.plugin_error =
             "Python 3 was not found. Install python3 to use qBittorrent-style search plugins."
                 .to_string();
+    } else if guard.python_available && guard.plugins.is_empty() && guard.plugin_error.is_empty() {
+        guard.plugin_error = no_plugins_message().to_string();
     }
     Ok(())
 }

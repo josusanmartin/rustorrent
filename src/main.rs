@@ -1504,16 +1504,28 @@ fn run() -> Result<(), String> {
     });
     let (cmd_tx, cmd_rx) = mpsc::channel::<ui::UiCommand>();
     if args.ui {
-        if let Err(err) = search::init(&args.download_dir) {
-            log_warn!("search init error: {err}");
-        }
-    }
-    if args.ui {
         if let Err(err) = ui::start(args.ui_addr.clone(), state.clone(), Some(cmd_tx.clone())) {
             log_warn!("ui error: {err}");
         } else {
             log_info!("ui: http://{}", args.ui_addr);
         }
+    }
+    if args.ui {
+        if let Err(err) = search::prepare(&args.download_dir) {
+            log_warn!("search prepare error: {err}");
+        }
+    }
+    if args.ui {
+        let search_root = args.download_dir.clone();
+        thread::spawn(move || {
+            if let Err(err) = search::refresh_plugins() {
+                if let Err(fallback_err) = search::init(&search_root) {
+                    log_warn!("search init error: {fallback_err}");
+                } else {
+                    log_warn!("search refresh error: {err}");
+                }
+            }
+        });
     }
 
     let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -2521,7 +2533,6 @@ fn run_torrent(
         let mut last_announce = Instant::now() - Duration::from_secs(interval + 1); // Force first announce
         let mut rate_last_at = Instant::now();
         let mut last_downloaded = downloaded.load(Ordering::SeqCst);
-        let mut last_uploaded = uploaded.load(Ordering::SeqCst);
         let mut last_progress_at = Instant::now();
         let mut down_rate = 0.0;
         let mut up_rate = 0.0;
@@ -2662,7 +2673,6 @@ fn run_torrent(
             let dt = now.duration_since(rate_last_at).as_secs_f64();
             if dt >= 0.2 {
                 let delta_down = downloaded.saturating_sub(last_downloaded) as f64;
-                let delta_up = uploaded.saturating_sub(last_uploaded) as f64;
                 if delta_down > 0.0 {
                     last_progress_at = now;
                 }
@@ -2704,7 +2714,6 @@ fn run_torrent(
                     0
                 };
                 last_downloaded = downloaded;
-                last_uploaded = uploaded;
                 rate_last_at = now;
             }
 
@@ -7773,11 +7782,15 @@ fn mse_outbound_handshake(
 ) -> Result<peer::Handshake, String> {
     let allow_plain = encryption != EncryptionMode::Require;
     let handshake_bytes = peer::build_handshake(info_hash, peer_id, true);
-    let (crypto, cipher) = mse::initiate(stream, info_hash, allow_plain, &handshake_bytes)?;
+    let (crypto, cipher, buffered) =
+        mse::initiate(stream, info_hash, allow_plain, &handshake_bytes)?;
     if let Some(cipher) = cipher {
         stream.enable_encryption(cipher);
-    } else if matches!(crypto, mse::CryptoMode::Plaintext) && encryption == EncryptionMode::Require
-    {
+    }
+    if !buffered.is_empty() {
+        stream.prepend_read_buffer(buffered);
+    }
+    if matches!(crypto, mse::CryptoMode::Plaintext) && encryption == EncryptionMode::Require {
         return Err("peer selected plaintext".to_string());
     }
     // Peer's BT handshake is the first thing in the encrypted payload stream
@@ -8042,6 +8055,17 @@ fn message_summary(message: &peer::Message) -> String {
         peer::Message::Extended { ext_id, payload } => {
             format!("extended id={} len={}", ext_id, payload.len())
         }
+        peer::Message::SuggestPiece(index) => format!("suggest-piece index={index}"),
+        peer::Message::HaveAll => "have-all".to_string(),
+        peer::Message::HaveNone => "have-none".to_string(),
+        peer::Message::RejectRequest {
+            index,
+            begin,
+            length,
+        } => {
+            format!("reject index={index} begin={begin} length={length}")
+        }
+        peer::Message::AllowedFast(index) => format!("allowed-fast index={index}"),
     }
 }
 

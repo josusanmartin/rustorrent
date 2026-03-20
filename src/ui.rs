@@ -3286,8 +3286,10 @@ function renderSearchStatus(data){
     let message='Enter a query on the left and click Search. Use Manage Plugins to change providers.';
     if(data&&data.busy){message='Searching across installed plugins...';}
     else if(data&&data.last_error){message=String(data.last_error);}
+    else if(data&&data.plugin_error){message=String(data.plugin_error);}
     else if(data&&Array.isArray(data.results)&&data.results.length>0){message='Found '+data.results.length+' search results.';}
     else if(data&&Array.isArray(data.plugins)&&data.plugins.length>0){message='Installed plugins are ready. Enter a query to search.';}
+    else if(data&&data.python_available){message='No search plugins are installed yet. Open Plugins or Community Catalog to add one.';}
     status.textContent=message;
   }
   if(!(data&&data.busy)){
@@ -5480,6 +5482,12 @@ mod tests {
         assert!(html.contains("data-main-tab-target=\"search\""));
         assert!(html.contains("data-main-tab=\"library\""));
         assert!(html.contains("data-main-tab=\"search\""));
+    }
+
+    #[test]
+    fn search_ui_explains_empty_plugin_state() {
+        let html = status_html(&UiState::default());
+        assert!(html.contains("No search plugins are installed yet. Open Plugins or Community Catalog to add one."));
     }
 
     #[test]
