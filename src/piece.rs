@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use crate::torrent::TorrentMeta;
 
@@ -38,6 +39,7 @@ pub struct PieceManager {
     pieces: Vec<Piece>,
     availability: Vec<u32>,
     reserved_by: Vec<Option<u64>>,
+    reservation_time: Vec<Option<Instant>>,
     sequential: bool,
 }
 
@@ -147,6 +149,7 @@ impl PieceManager {
             pieces,
             availability: vec![0; piece_count],
             reserved_by: vec![None; piece_count],
+            reservation_time: vec![None; piece_count],
             sequential: false,
         })
     }
@@ -218,6 +221,9 @@ impl PieceManager {
             }
         }
         for slot in &mut self.reserved_by {
+            *slot = None;
+        }
+        for slot in &mut self.reservation_time {
             *slot = None;
         }
     }
@@ -361,6 +367,7 @@ impl PieceManager {
                 }
                 if !allow_reserved {
                     self.reserved_by[idx] = Some(peer_id);
+                    self.reservation_time[idx] = Some(Instant::now());
                 }
                 return Some(idx as u32);
             }
@@ -398,6 +405,7 @@ impl PieceManager {
         let idx = best_piece?;
         if !allow_reserved {
             self.reserved_by[idx] = Some(peer_id);
+            self.reservation_time[idx] = Some(Instant::now());
         }
         Some(idx as u32)
     }
@@ -422,6 +430,7 @@ impl PieceManager {
         }
         if self.reserved_by[idx] == Some(peer_id) {
             self.reserved_by[idx] = None;
+            self.reservation_time[idx] = None;
         }
     }
 
@@ -429,7 +438,65 @@ impl PieceManager {
         let idx = index as usize;
         if idx < self.reserved_by.len() {
             self.reserved_by[idx] = None;
+            self.reservation_time[idx] = None;
         }
+    }
+
+    /// Steal a piece that has been reserved by another peer for longer than
+    /// `stale_threshold`. Returns the piece index if a stale reservation was
+    /// found and reassigned to `peer_id`.
+    pub fn steal_stale_piece(
+        &mut self,
+        peer_id: u64,
+        bitfield: &[u8],
+        stale_threshold: Duration,
+    ) -> Option<u32> {
+        if bitfield.len() != self.bitfield_len() {
+            return None;
+        }
+
+        let now = Instant::now();
+        let mut best_piece = None;
+        let mut best_priority = 0u8;
+        let mut best_rarity = u32::MAX;
+
+        for (idx, piece) in self.pieces.iter().enumerate() {
+            if piece.is_complete() || !piece.has_missing() || !piece.wanted {
+                continue;
+            }
+            if !bitfield_has(bitfield, idx) {
+                continue;
+            }
+            // Only consider pieces reserved by a *different* peer
+            match self.reserved_by[idx] {
+                Some(owner) if owner != peer_id => {}
+                _ => continue,
+            }
+            // Check if the reservation is stale
+            let reserved_at = match self.reservation_time[idx] {
+                Some(t) => t,
+                None => continue,
+            };
+            if now.duration_since(reserved_at) < stale_threshold {
+                continue;
+            }
+
+            let rarity = self.availability[idx];
+            let priority = piece.priority;
+            if best_piece.is_none()
+                || priority > best_priority
+                || (priority == best_priority && rarity < best_rarity)
+            {
+                best_priority = priority;
+                best_rarity = rarity;
+                best_piece = Some(idx);
+            }
+        }
+
+        let idx = best_piece?;
+        self.reserved_by[idx] = Some(peer_id);
+        self.reservation_time[idx] = Some(now);
+        Some(idx as u32)
     }
 
     pub fn next_request_for_piece(

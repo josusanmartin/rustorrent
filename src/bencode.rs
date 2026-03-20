@@ -68,9 +68,18 @@ pub fn encode_into(value: &Value, out: &mut Vec<u8>) {
         }
         Value::Dict(items) => {
             out.push(b'd');
-            let mut sorted = items.iter().collect::<Vec<_>>();
-            sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            for (key, value) in sorted {
+            let already_sorted = items
+                .windows(2)
+                .all(|w| w[0].0 <= w[1].0);
+            let mut sorted_storage;
+            let ordered: &[(Vec<u8>, Value)] = if already_sorted {
+                items
+            } else {
+                sorted_storage = items.clone();
+                sorted_storage.sort_by(|a, b| a.0.cmp(&b.0));
+                &sorted_storage
+            };
+            for (key, value) in ordered {
                 out.extend_from_slice(key.len().to_string().as_bytes());
                 out.push(b':');
                 out.extend_from_slice(key);

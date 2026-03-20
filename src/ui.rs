@@ -1,12 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::is_paused;
 
@@ -211,6 +211,10 @@ fn lock_state(state: &Arc<Mutex<UiState>>) -> MutexGuard<'_, UiState> {
 
 const API_TOKEN_HEADER: &str = "x-rustorrent-token";
 static UI_API_TOKEN: OnceLock<String> = OnceLock::new();
+static API_TOKEN_RATE: OnceLock<Mutex<HashMap<IpAddr, (u32, Instant)>>> = OnceLock::new();
+
+const API_TOKEN_RATE_MAX: u32 = 10;
+const API_TOKEN_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 fn api_token() -> &'static str {
     UI_API_TOKEN.get_or_init(generate_api_token).as_str()
@@ -223,19 +227,12 @@ fn generate_api_token() -> String {
             return hex_bytes(&bytes);
         }
     }
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let mut seed = nanos as u64 ^ ((nanos >> 64) as u64) ^ std::process::id() as u64;
-    for slot in &mut bytes {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        *slot = (seed & 0xff) as u8;
+    if let Ok(mut file) = File::open("/dev/random") {
+        if file.read_exact(&mut bytes).is_ok() {
+            return hex_bytes(&bytes);
+        }
     }
-    hex_bytes(&bytes)
+    panic!("failed to generate secure API token: neither /dev/urandom nor /dev/random available");
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -313,6 +310,11 @@ fn handle_connection(
     let (path, query) = split_path_query(&request.path);
 
     if request.method == "GET" && path == "/api-token" {
+        if let Ok(peer) = stream.peer_addr() {
+            if !check_api_token_rate(peer.ip()) {
+                return send_api_error_with_status(stream, 429, "too many requests");
+            }
+        }
         return send_api_token(stream);
     }
     if request.method == "HEAD" && path == "/api-token" {
@@ -1473,13 +1475,27 @@ fn request_origin_matches_host(request: &HttpRequest) -> bool {
 fn has_valid_api_token(request: &HttpRequest) -> bool {
     request
         .header_value(API_TOKEN_HEADER)
-        .map(|value| value == api_token())
+        .map(|value| constant_time_eq(value.as_bytes(), api_token().as_bytes()))
         .unwrap_or(false)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
 }
 
 fn authorize_mutating_request(request: &HttpRequest) -> Result<(), String> {
     if !has_valid_api_token(request) {
         return Err("missing or invalid api token".to_string());
+    }
+    if request.header_value("origin").is_none() {
+        return Err("origin header required".to_string());
     }
     if !request_origin_matches_host(request) {
         return Err("forbidden origin".to_string());
@@ -1502,6 +1518,7 @@ fn reason_phrase(code: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
+        429 => "Too Many Requests",
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         _ => "Error",
@@ -1515,6 +1532,7 @@ fn status_for_error(message: &str) -> u16 {
     } else if lower.contains("invalid api token")
         || lower.contains("missing api token")
         || lower.contains("forbidden origin")
+        || lower.contains("origin header required")
     {
         403
     } else if lower.contains("unknown torrent") {
@@ -1570,6 +1588,19 @@ fn send_api_error(stream: TcpStream, message: &str) -> std::io::Result<()> {
 fn send_api_error_with_status(stream: TcpStream, code: u16, message: &str) -> std::io::Result<()> {
     let body = format!("{{\"ok\":false,\"error\":\"{}\"}}", escape_json(message));
     send_json_body(stream, code, &body)
+}
+
+fn check_api_token_rate(ip: IpAddr) -> bool {
+    let lock = API_TOKEN_RATE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = Instant::now();
+    map.retain(|_, (_, ts)| now.duration_since(*ts) < API_TOKEN_RATE_WINDOW);
+    let entry = map.entry(ip).or_insert((0, now));
+    entry.0 += 1;
+    entry.0 <= API_TOKEN_RATE_MAX
 }
 
 fn send_head(mut stream: TcpStream, content_type: &str) -> std::io::Result<()> {
@@ -2322,15 +2353,15 @@ body{
 }
 .search-warning .btn{margin-top:10px;height:32px;padding:0 12px;font-size:12px;border-radius:10px}
 .search-plugin-list{
-  max-height:150px;overflow:auto;margin-top:8px;
+  margin-top:8px;
   border:1px solid var(--outline-var);border-radius:10px;background:var(--surface-cont);
 }
-.search-plugin-row{
-  display:flex;align-items:flex-start;gap:8px;padding:8px 10px;
-  border-bottom:1px solid var(--outline-var);font-size:12px;
-}
-.search-plugin-row:last-child{border-bottom:none}
-.search-plugin-row input[type="checkbox"]{margin-top:2px;accent-color:var(--primary)}
+.search-plugin-table{width:100%;border-collapse:collapse;font-size:12px}
+.search-plugin-table td{padding:6px 10px;vertical-align:middle;border-bottom:1px solid var(--outline-var)}
+.search-plugin-table tr:last-child td{border-bottom:none}
+.search-plugin-table td:first-child{width:24px;text-align:center}
+.search-plugin-table td:last-child{width:70px;text-align:right;white-space:nowrap}
+.search-plugin-table input[type="checkbox"]{accent-color:var(--primary)}
 .search-plugin-meta{flex:1;min-width:0}
 .search-plugin-name{font:600 12px "Inter",sans-serif;color:var(--on-surface);display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .search-plugin-badge{
@@ -3081,27 +3112,22 @@ function renderSearchPluginList(plugins){
     list.innerHTML='<div class="rss-item"><span class="rss-item-info">No search plugins installed yet.</span></div>';
     return;
   }
-  list.innerHTML=visiblePlugins.map(plugin=>{
+  list.innerHTML='<table class="search-plugin-table"><tbody>'+visiblePlugins.map(plugin=>{
     const module=escapeHtml(plugin.module||'');
     const checked=selected.indexOf(plugin.module)!==-1;
     const healthy=!!plugin.healthy;
-    const badge=healthy?'<span class="search-plugin-badge ready">Ready</span>':'<span class="search-plugin-badge">Needs fix</span>';
+    const badge=healthy?' <span class="search-plugin-badge ready">Ready</span>':' <span class="search-plugin-badge">Needs fix</span>';
     const version=plugin.version?(' v'+escapeHtml(plugin.version)):'';
     const cats=Array.isArray(plugin.categories)&&plugin.categories.length>0?escapeHtml(plugin.categories.join(', ')):'all';
-    const url=plugin.site_url?'<div class="search-plugin-url">'+escapeHtml(plugin.site_url)+'</div>':'';
-    const reason=plugin.broken_reason?'<div class="search-plugin-cats">Issue: '+escapeHtml(plugin.broken_reason)+'</div>':'';
-    return ''
-      +'<div class="search-plugin-row">'
-      +'<input type="checkbox" data-search-plugin="'+module+'" '+(checked&&healthy?'checked ':'')+(healthy?'':'disabled ')+'>'
-      +'<div class="search-plugin-meta">'
-      +'<div class="search-plugin-name">'+escapeHtml(plugin.display_name||plugin.module||'plugin')+version+badge+'</div>'
-      +url
-      +'<div class="search-plugin-cats">Categories: '+cats+'</div>'
-      +reason
-      +'</div>'
-      +'<button class="btn ghost" type="button" data-action="search-remove-plugin" data-module="'+module+'">Remove</button>'
-      +'</div>';
-  }).join('');
+    const site=plugin.site_url?' &middot; '+escapeHtml(plugin.site_url):'';
+    const reason=plugin.broken_reason?' &middot; Issue: '+escapeHtml(plugin.broken_reason):'';
+    return '<tr>'
+      +'<td><input type="checkbox" data-search-plugin="'+module+'" '+(checked&&healthy?'checked ':'')+(healthy?'':'disabled ')+'></td>'
+      +'<td>'+escapeHtml(plugin.display_name||plugin.module||'plugin')+version+badge
+      +' <span style="opacity:0.6">'+cats+site+reason+'</span></td>'
+      +'<td><button class="btn ghost" type="button" data-action="search-remove-plugin" data-module="'+module+'" style="padding:2px 8px;font-size:11px">Remove</button></td>'
+      +'</tr>';
+  }).join('')+'</tbody></table>';
 }
 function renderRecommendedCatalog(entries){
   const container=document.getElementById('searchRecommended');
@@ -3406,8 +3432,18 @@ async function submitSearchQuery(e){
   saveSearchCategory(category);
   addedSearchResults.clear();
   lastSearchStartedAt=0;
+  const submitBtn=document.querySelector('.search-form button[type=\"submit\"]');
+  if(submitBtn){submitBtn.disabled=true;submitBtn.textContent='Searching\u2026';}
+  const status=document.getElementById('searchStatusText');
+  if(status){status.textContent='Searching across installed plugins\u2026';}
+  const resultsList=document.getElementById('searchResultsList');
+  if(resultsList){resultsList.innerHTML='<div style=\"text-align:center;padding:32px 0;opacity:0.6\">Searching\u2026</div>';}
   const body='query='+encodeURIComponent(query)+'&category='+encodeURIComponent(category)+'&engines='+encodeURIComponent(engines.join(','));
-  await apiPost('/search/run',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
+  try{
+    await apiPost('/search/run',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
+  }finally{
+    if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='Search';}
+  }
   applySearchPanelView('results');
   scheduleSearchStatusPoll(100);
   await loadSearchStatus(false);
@@ -3863,7 +3899,10 @@ document.addEventListener('click',e=>{
     if(action==='search-install-catalog'){
       const url=actionBtn.dataset.url||'';
       if(!url){return;}
-      installCatalogPlugin(url).catch(showActionError);
+      actionBtn.disabled=true;
+      const origLabel=actionBtn.textContent;
+      actionBtn.textContent='Installing\u2026';
+      installCatalogPlugin(url).catch(showActionError).finally(()=>{actionBtn.disabled=false;actionBtn.textContent=origLabel;});
       return;
     }
     if(action==='search-add-result'){
@@ -5247,6 +5286,17 @@ mod tests {
         let response = run_single_request(request.as_bytes(), None);
         assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
         assert!(response.contains("forbidden origin"));
+    }
+
+    #[test]
+    fn post_with_valid_token_but_missing_origin_is_forbidden() {
+        let request = format!(
+            "POST /torrent/pause?id=1 HTTP/1.1\r\nHost: 127.0.0.1:19002\r\nX-Rustorrent-Token: {}\r\nContent-Length: 0\r\n\r\n",
+            api_token()
+        );
+        let response = run_single_request(request.as_bytes(), None);
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(response.contains("origin header required"));
     }
 
     #[test]

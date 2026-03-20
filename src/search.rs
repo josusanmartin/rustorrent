@@ -1,4 +1,4 @@
-use std::fs;
+use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -255,8 +255,8 @@ fn append_catalog_entries_json(
 
 pub fn install_plugin_from_url(url: &str) -> Result<String, String> {
     let trimmed = url.trim();
-    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
-        return Err("plugin url must start with http:// or https://".to_string());
+    if !trimmed.starts_with("https://") {
+        return Err("plugin url must use https://".to_string());
     }
     let filename = filename_from_url(trimmed)?;
     let module = plugin_module_from_filename(&filename)
@@ -797,23 +797,51 @@ fn download_through_plugin(
     plugin: &str,
     url: &str,
 ) -> Result<Vec<u8>, String> {
+    let tmp_dir = create_plugin_temp_dir()?;
     let args = vec![plugin.to_string(), url.to_string()];
-    let output = run_python_script(runtime, "nova2dl.py", &args, DOWNLOAD_TIMEOUT)?;
-    if !output.success {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            return Err("plugin torrent download failed".to_string());
+    let output =
+        run_python_script_in_dir(runtime, "nova2dl.py", &args, DOWNLOAD_TIMEOUT, &tmp_dir)?;
+    let result = (|| -> Result<Vec<u8>, String> {
+        if !output.success {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                return Err("plugin torrent download failed".to_string());
+            }
+            return Err(stderr);
         }
-        return Err(stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let path_str = stdout
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| "search plugin did not return a torrent file path".to_string())?;
+        let path = Path::new(path_str);
+        let canonical_path = path
+            .canonicalize()
+            .map_err(|err| format!("canonicalize plugin output path: {err}"))?;
+        let canonical_tmp = tmp_dir
+            .canonicalize()
+            .map_err(|err| format!("canonicalize temp dir: {err}"))?;
+        if !canonical_path.starts_with(&canonical_tmp) {
+            return Err("plugin returned a path outside its temp directory".to_string());
+        }
+        let bytes =
+            fs::read(&canonical_path).map_err(|err| format!("read downloaded torrent: {err}"))?;
+        let _ = fs::remove_file(&canonical_path);
+        Ok(bytes)
+    })();
+    let _ = fs::remove_dir_all(&tmp_dir);
+    result
+}
+
+fn create_plugin_temp_dir() -> Result<PathBuf, String> {
+    let mut bytes = [0u8; 8];
+    if let Ok(mut file) = File::open("/dev/urandom") {
+        let _ = file.read_exact(&mut bytes);
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let path = stdout
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| "search plugin did not return a torrent file path".to_string())?;
-    let bytes = fs::read(path).map_err(|err| format!("read downloaded torrent: {err}"))?;
-    let _ = fs::remove_file(path);
-    Ok(bytes)
+    let suffix: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let dir = std::env::temp_dir().join(format!("rustorrent-plugin-{suffix}"));
+    fs::create_dir_all(&dir).map_err(|err| format!("create plugin temp dir: {err}"))?;
+    Ok(dir)
 }
 
 fn run_python_script(
@@ -821,6 +849,16 @@ fn run_python_script(
     script_name: &str,
     args: &[String],
     timeout: Duration,
+) -> Result<ProcessOutput, String> {
+    run_python_script_in_dir(runtime, script_name, args, timeout, &runtime.root.clone())
+}
+
+fn run_python_script_in_dir(
+    runtime: &SearchRuntime,
+    script_name: &str,
+    args: &[String],
+    timeout: Duration,
+    working_dir: &Path,
 ) -> Result<ProcessOutput, String> {
     let python = runtime
         .python
@@ -834,11 +872,21 @@ fn run_python_script(
         .arg("utf8")
         .arg(script_path)
         .args(args)
-        .current_dir(&runtime.root)
+        .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("PYTHONIOENCODING", "utf-8");
+        .env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        command.env("PATH", path);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        command.env("HOME", home);
+    }
+    if let Ok(tmpdir) = std::env::var("TMPDIR") {
+        command.env("TMPDIR", tmpdir);
+    }
+    command.env("PYTHONIOENCODING", "utf-8");
 
     let mut child = command
         .spawn()
@@ -858,6 +906,7 @@ fn run_python_script(
         })
     });
     let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(1);
     loop {
         if let Some(status) = child
             .try_wait()
@@ -878,7 +927,8 @@ fn run_python_script(
             let _ = join_reader(stderr_handle);
             return Err(format!("{script_name} timed out"));
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(50));
     }
 }
 
@@ -1263,5 +1313,45 @@ mod tests {
         append_catalog_entries_json(&mut json, &entries, &[]);
         assert!(json.contains("\"module\":\"publicmod\""));
         assert!(!json.contains("\"module\":\"privatemod\""));
+    }
+
+    #[test]
+    fn install_plugin_from_url_rejects_http() {
+        let result = install_plugin_from_url("http://example.com/plugin.py");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("https://"));
+    }
+
+    #[test]
+    fn install_plugin_from_url_rejects_non_url() {
+        let result = install_plugin_from_url("ftp://example.com/plugin.py");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn plugin_temp_dir_path_traversal_rejected() {
+        let tmp = create_plugin_temp_dir().unwrap();
+        let outside = std::env::temp_dir().join("rustorrent-outside-test");
+        fs::create_dir_all(&outside).unwrap();
+        let test_file = outside.join("secret.torrent");
+        fs::write(&test_file, b"test data").unwrap();
+
+        let canonical_tmp = tmp.canonicalize().unwrap();
+        let canonical_outside = test_file.canonicalize().unwrap();
+        assert!(!canonical_outside.starts_with(&canonical_tmp));
+
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn create_plugin_temp_dir_creates_unique_dirs() {
+        let a = create_plugin_temp_dir().unwrap();
+        let b = create_plugin_temp_dir().unwrap();
+        assert_ne!(a, b);
+        assert!(a.exists());
+        assert!(b.exists());
+        let _ = fs::remove_dir_all(&a);
+        let _ = fs::remove_dir_all(&b);
     }
 }

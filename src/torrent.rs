@@ -11,7 +11,7 @@ type PieceLayerHashes = Vec<(Vec<u8>, Vec<[u8; 32]>)>;
 #[derive(Debug)]
 pub struct TorrentMeta {
     pub announce: Option<Vec<u8>>,
-    pub announce_list: Vec<Vec<u8>>,
+    pub announce_list: Vec<Vec<Vec<u8>>>,
     #[cfg_attr(not(feature = "webseed"), allow(dead_code))]
     pub url_list: Vec<Vec<u8>>,
     #[cfg_attr(not(feature = "webseed"), allow(dead_code))]
@@ -264,25 +264,27 @@ fn parse_files(value: &Value) -> Result<Vec<FileInfo>, Error> {
     Ok(files)
 }
 
-fn parse_announce_list(value: &Value) -> Result<Vec<Vec<u8>>, Error> {
+fn parse_announce_list(value: &Value) -> Result<Vec<Vec<Vec<u8>>>, Error> {
     let list = match value {
         Value::List(items) => items,
         _ => return Err(Error::InvalidAnnounceList),
     };
-    let mut urls = Vec::new();
+    let mut tiers = Vec::with_capacity(list.len());
     for tier in list {
         let tier_list = match tier {
             Value::List(items) => items,
             _ => return Err(Error::InvalidAnnounceList),
         };
+        let mut urls = Vec::with_capacity(tier_list.len());
         for entry in tier_list {
             match entry {
                 Value::Bytes(bytes) => urls.push(bytes.clone()),
                 _ => return Err(Error::InvalidAnnounceList),
             }
         }
+        tiers.push(urls);
     }
-    Ok(urls)
+    Ok(tiers)
 }
 
 fn parse_url_list(value: &Value) -> Result<Vec<Vec<u8>>, Error> {
@@ -467,9 +469,11 @@ mod tests {
         assert_eq!(
             meta.announce_list,
             vec![
-                b"http://tracker/a".to_vec(),
-                b"http://tracker/b".to_vec(),
-                b"http://tracker/c".to_vec()
+                vec![b"http://tracker/a".to_vec()],
+                vec![
+                    b"http://tracker/b".to_vec(),
+                    b"http://tracker/c".to_vec(),
+                ],
             ]
         );
         assert_eq!(
