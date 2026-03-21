@@ -1519,11 +1519,9 @@ fn run() -> Result<(), String> {
         let search_root = args.download_dir.clone();
         thread::spawn(move || {
             if let Err(err) = search::refresh_plugins() {
-                if let Err(fallback_err) = search::init(&search_root) {
-                    log_warn!("search init error: {fallback_err}");
-                } else {
-                    log_warn!("search refresh error: {err}");
-                }
+                log_warn!("search refresh error: {err}");
+                // Re-prepare to reset state, but don't recurse into refresh_plugins
+                let _ = search::prepare(&search_root);
             }
         });
     }
@@ -7784,14 +7782,14 @@ fn mse_outbound_handshake(
     let handshake_bytes = peer::build_handshake(info_hash, peer_id, true);
     let (crypto, cipher, buffered) =
         mse::initiate(stream, info_hash, allow_plain, &handshake_bytes)?;
+    if matches!(crypto, mse::CryptoMode::Plaintext) && encryption == EncryptionMode::Require {
+        return Err("peer selected plaintext".to_string());
+    }
     if let Some(cipher) = cipher {
         stream.enable_encryption(cipher);
     }
     if !buffered.is_empty() {
         stream.prepend_read_buffer(buffered);
-    }
-    if matches!(crypto, mse::CryptoMode::Plaintext) && encryption == EncryptionMode::Require {
-        return Err("peer selected plaintext".to_string());
     }
     // Peer's BT handshake is the first thing in the encrypted payload stream
     let handshake =
