@@ -1,11 +1,18 @@
 import AppKit
+import Darwin
 import Foundation
 import UniformTypeIdentifiers
 import WebKit
 
+private struct UiProbeResult {
+    let reachable: Bool
+    let token: String?
+}
+
 @main
 final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, NSToolbarDelegate {
-    private let uiPort = 9473
+    private let preferredUiPort = 9473
+    private var uiPort = 9473
     private let maxUiWaitAttempts = 150
     private let openUiOnLaunchKey = "open_ui_on_launch"
     private let downloadDirectoryKey = "download_directory"
@@ -48,6 +55,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         buildMenus()
         buildStatusItem()
         collectStartupTorrentFiles(from: CommandLine.arguments)
+        resolveUiEndpoint()
         openUiWhenReady = openUiOnLaunchEnabled() || !pendingTorrentFiles.isEmpty
         if openUiWhenReady {
             showMainWindow()
@@ -606,6 +614,13 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         if backendProcess != nil {
             return
         }
+        let existingUi = probeUi(timeout: 0.4, port: uiPort)
+        if let token = existingUi.token {
+            cachedApiToken = token
+            backendOwned = false
+            log("reusing existing compatible backend on port \(uiPort)")
+            return
+        }
 
         let binary = backendBinaryURL()
         guard FileManager.default.isExecutableFile(atPath: binary.path) else {
@@ -690,14 +705,15 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         backendOwned = false
         cachedApiToken = nil
         if !isUiReachable(timeout: 0.4) {
+            let detail = startupFailureDetail(exitStatus: proc.terminationStatus)
             loadPlaceholderPage(
                 title: "Rustorrent Stopped",
-                message: "The local engine exited with status \(proc.terminationStatus). Relaunch the window to try again.",
+                message: detail,
                 isError: true
             )
             presentFatalError(
                 title: "Rustorrent Stopped",
-                text: "The background process exited with status \(proc.terminationStatus)."
+                text: detail
             )
         }
     }
@@ -824,18 +840,13 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
     }
 
     private func isUiReachable(timeout: TimeInterval) -> Bool {
-        let timeoutSecs = String(max(1, Int(ceil(timeout))))
-        let result = runCurl([
-            "-sS",
-            "--connect-timeout", timeoutSecs,
-            "--max-time", timeoutSecs,
-            uiBaseURL().appendingPathComponent("api-token").absoluteString,
-        ])
-        if result.status == 0 {
-            if let token = parseApiToken(from: result.output) {
-                cachedApiToken = token
-            }
+        let probe = probeUi(timeout: timeout, port: uiPort)
+        if let token = probe.token {
+            cachedApiToken = token
             return true
+        }
+        if probe.reachable {
+            log("ui probe on port \(uiPort) returned a non-token response")
         }
         return false
     }
@@ -935,8 +946,8 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         return fmt.string(from: Date())
     }
 
-    private func uiBaseURL() -> URL {
-        URL(string: "http://127.0.0.1:\(uiPort)")!
+    private func uiBaseURL(port: Int? = nil) -> URL {
+        URL(string: "http://127.0.0.1:\(port ?? uiPort)")!
     }
 
     private func backendBinaryURL() -> URL {
@@ -971,6 +982,102 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".rustorrent", isDirectory: true)
             .appendingPathComponent("launcher.log")
+    }
+
+    private func resolveUiEndpoint() {
+        let preferred = probeUi(timeout: 0.4, port: preferredUiPort)
+        if let token = preferred.token {
+            uiPort = preferredUiPort
+            cachedApiToken = token
+            log("found compatible ui on preferred port \(uiPort)")
+            return
+        }
+        if preferred.reachable {
+            if let alternatePort = reserveLoopbackPort() {
+                uiPort = alternatePort
+                log("preferred ui port \(preferredUiPort) is occupied by an incompatible service; using \(uiPort)")
+                return
+            }
+            log("preferred ui port \(preferredUiPort) is occupied, but no alternate port was reserved")
+        }
+        uiPort = preferredUiPort
+        log("using ui port \(uiPort)")
+    }
+
+    private func probeUi(timeout: TimeInterval, port: Int) -> UiProbeResult {
+        let timeoutSecs = String(max(1, Int(ceil(timeout))))
+        let result = runCurl([
+            "-sS",
+            "--connect-timeout", timeoutSecs,
+            "--max-time", timeoutSecs,
+            uiBaseURL(port: port).appendingPathComponent("api-token").absoluteString,
+        ])
+        guard result.status == 0 else {
+            return UiProbeResult(reachable: false, token: nil)
+        }
+        return UiProbeResult(reachable: true, token: parseApiToken(from: result.output))
+    }
+
+    private func startupFailureDetail(exitStatus: Int32) -> String {
+        let downloadDir = currentDownloadDirectoryURL().path
+        var details: [String] = []
+
+        let lockPath = currentDownloadDirectoryURL().appendingPathComponent(".rustorrent.lock")
+        if let raw = try? String(contentsOf: lockPath, encoding: .utf8),
+           let firstLine = raw.split(whereSeparator: \.isNewline).first,
+           let pid = Int32(firstLine.trimmingCharacters(in: .whitespacesAndNewlines)),
+           pid > 0,
+           pid != Int32(ProcessInfo.processInfo.processIdentifier),
+           kill(pid, 0) == 0
+        {
+            details.append(
+                "Another Rustorrent instance (PID \(pid)) is already using \(downloadDir). Quit the other copy or choose a different download directory in Preferences."
+            )
+        }
+
+        let preferred = probeUi(timeout: 0.3, port: preferredUiPort)
+        if preferred.reachable && preferred.token == nil {
+            details.append(
+                "Port \(preferredUiPort) is already serving an incompatible or older Rustorrent UI. Quit the older copy before relaunching."
+            )
+        }
+
+        details.append("The background process exited with status \(exitStatus).")
+        return details.joined(separator: " ")
+    }
+
+    private func reserveLoopbackPort() -> Int? {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            return nil
+        }
+        defer { close(fd) }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(0).bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+        let bindResult = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { pointer in
+                Darwin.bind(fd, pointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            return nil
+        }
+
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let nameResult = withUnsafeMutablePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { pointer in
+                getsockname(fd, pointer, &length)
+            }
+        }
+        guard nameResult == 0 else {
+            return nil
+        }
+        return Int(UInt16(bigEndian: address.sin_port))
     }
 
     private func escapeHTML(_ text: String) -> String {
