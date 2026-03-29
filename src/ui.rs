@@ -2357,11 +2357,13 @@ body{
   border:1px solid var(--outline-var);border-radius:10px;background:var(--surface-cont);
 }
 .search-plugin-table{width:100%;border-collapse:collapse;font-size:12px}
-.search-plugin-table td{padding:6px 10px;vertical-align:middle;border-bottom:1px solid var(--outline-var)}
+.search-plugin-table td{padding:5px 8px;vertical-align:middle;border-bottom:1px solid var(--outline-var)}
 .search-plugin-table tr:last-child td{border-bottom:none}
 .search-plugin-table td:first-child{width:24px;text-align:center}
-.search-plugin-table td:last-child{width:70px;text-align:right;white-space:nowrap}
+.search-plugin-table td:last-child{width:36px;text-align:center;padding:2px}
 .search-plugin-table input[type="checkbox"]{accent-color:var(--primary)}
+.search-remove-btn{padding:2px!important;min-width:0!important;height:auto!important;color:var(--on-surface-var)}
+.search-remove-btn:hover{color:var(--error)}
 .search-plugin-meta{flex:1;min-width:0}
 .search-plugin-name{font:600 12px "Inter",sans-serif;color:var(--on-surface);display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .search-plugin-badge{
@@ -2378,9 +2380,14 @@ body{
 .search-upload-label input[type="file"]{position:absolute;inset:0;opacity:0;cursor:pointer}
 .search-catalog{margin-top:10px}
 .search-catalog-list{
-  max-height:220px;overflow:auto;
+  max-height:300px;overflow:auto;
   border:1px solid var(--outline-var);border-radius:10px;background:var(--surface-cont);
 }
+.search-catalog-table{width:100%;border-collapse:collapse;font-size:12px}
+.search-catalog-table td{padding:5px 8px;vertical-align:middle;border-bottom:1px solid var(--outline-var)}
+.search-catalog-table tr:last-child td{border-bottom:none}
+.search-catalog-table td:last-child{width:70px;text-align:right;white-space:nowrap}
+.search-catalog-btn{padding:2px 10px!important;font-size:11px!important;height:auto!important}
 .search-recommended-list{
   display:grid;
   grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
@@ -3116,16 +3123,15 @@ function renderSearchPluginList(plugins){
     const module=escapeHtml(plugin.module||'');
     const checked=selected.indexOf(plugin.module)!==-1;
     const healthy=!!plugin.healthy;
-    const badge=healthy?' <span class="search-plugin-badge ready">Ready</span>':' <span class="search-plugin-badge">Needs fix</span>';
+    const badge=healthy?'<span class="search-plugin-badge ready">Ready</span>':'<span class="search-plugin-badge">Broken</span>';
     const version=plugin.version?(' v'+escapeHtml(plugin.version)):'';
     const cats=Array.isArray(plugin.categories)&&plugin.categories.length>0?escapeHtml(plugin.categories.join(', ')):'all';
-    const site=plugin.site_url?' &middot; '+escapeHtml(plugin.site_url):'';
-    const reason=plugin.broken_reason?' &middot; Issue: '+escapeHtml(plugin.broken_reason):'';
+    const reason=plugin.broken_reason?'<div style="color:var(--error);font-size:11px;margin-top:2px">'+escapeHtml(plugin.broken_reason)+'</div>':'';
     return '<tr>'
-      +'<td><input type="checkbox" data-search-plugin="'+module+'" '+(checked&&healthy?'checked ':'')+(healthy?'':'disabled ')+'></td>'
-      +'<td>'+escapeHtml(plugin.display_name||plugin.module||'plugin')+version+badge
-      +' <span style="opacity:0.6">'+cats+site+reason+'</span></td>'
-      +'<td><button class="btn ghost" type="button" data-action="search-remove-plugin" data-module="'+module+'" style="padding:2px 8px;font-size:11px">Remove</button></td>'
+      +'<td><input type="checkbox" data-search-plugin="'+module+'" '+(checked&&healthy?'checked ':'')+(healthy?'':'disabled ')+'title="Enable for search"></td>'
+      +'<td><div style="font-weight:600">'+escapeHtml(plugin.display_name||plugin.module||'plugin')+version+' '+badge+'</div>'
+      +'<div style="opacity:0.6;font-size:11px">'+cats+'</div>'+reason+'</td>'
+      +'<td><button class="btn ghost search-remove-btn" type="button" data-action="search-remove-plugin" data-module="'+module+'" title="Uninstall plugin"><span class="material-symbols-rounded" style="font-size:16px">delete</span></button></td>'
       +'</tr>';
   }).join('')+'</tbody></table>';
 }
@@ -3363,19 +3369,22 @@ function renderSearchCatalog(entries){
     container.innerHTML='<div class="rss-item"><span class="rss-item-info">'+(search?'No community plugins match that filter.':'Load the community list to install unofficial qBittorrent plugins with one click.')+'</span></div>';
     return;
   }
-  container.innerHTML=filtered.map(entry=>''
-    +'<div class="search-catalog-item">'
-    +'<div class="search-catalog-info">'
-    +'<div class="search-catalog-name">'+escapeHtml(entry.name||'plugin')
-      +(entry.private_site?' <span class="search-plugin-badge">Private</span>':'')
-      +(entry.installed?(' <span class="search-plugin-badge'+(entry.installed_healthy?' ready':'')+'">'+(entry.installed_healthy?'Installed':'Needs fix')+'</span>'):'')
-      +'</div>'
-    +'<div class="search-catalog-meta">'+escapeHtml([entry.author||'',entry.version?('wiki v'+entry.version):'',entry.installed&&entry.installed_version?('installed v'+entry.installed_version):'',entry.updated||'',entry.module||''].filter(Boolean).join(' / '))+'</div>'
-    +(entry.comment?'<div class="search-catalog-comment">'+escapeHtml(entry.comment)+'</div>':'')
-    +'</div>'
-    +'<button class="btn primary" type="button" data-action="search-install-catalog" data-url="'+escapeHtml(entry.download_url||'')+'">'+(entry.installed?'Update':'Install')+'</button>'
-    +'</div>'
-  ).join('');
+  container.innerHTML='<table class="search-catalog-table"><tbody>'+filtered.map(entry=>{
+    const name=escapeHtml(entry.name||entry.module||'plugin');
+    const author=entry.author?escapeHtml(entry.author):'';
+    const version=entry.version?'v'+escapeHtml(entry.version):'';
+    const status=entry.installed
+      ?'<span class="search-plugin-badge'+(entry.installed_healthy?' ready':'')+'">'+
+       (entry.installed_healthy?'Installed':'Needs fix')+'</span>'
+      :'';
+    const meta=[author,version,entry.updated||''].filter(Boolean).join(' \u00b7 ');
+    const btnLabel=entry.installed?'Update':'Install';
+    return '<tr>'
+      +'<td><div style="font-weight:600">'+name+' '+status+'</div>'
+      +'<div style="opacity:0.6;font-size:11px">'+escapeHtml(meta)+'</div></td>'
+      +'<td><button class="btn '+(entry.installed?'ghost':'primary')+' search-catalog-btn" type="button" data-action="search-install-catalog" data-url="'+escapeHtml(entry.download_url||'')+'">'+btnLabel+'</button></td>'
+      +'</tr>';
+  }).join('')+'</tbody></table>';
 }
 async function loadSearchCatalog(force){
   if(searchCatalogLoading){return {entries:searchCatalogCache};}
@@ -3438,7 +3447,7 @@ async function submitSearchQuery(e){
   if(submitBtn){submitBtn.disabled=true;submitBtn.textContent='Searching\u2026';}
   const status=document.getElementById('searchStatusText');
   if(status){status.textContent='Searching across installed plugins\u2026';}
-  const resultsList=document.getElementById('searchResultsList');
+  const resultsList=document.getElementById('searchResults');
   if(resultsList){resultsList.innerHTML='<div style=\"text-align:center;padding:32px 0;opacity:0.6\">Searching\u2026</div>';}
   const body='query='+encodeURIComponent(query)+'&category='+encodeURIComponent(category)+'&engines='+encodeURIComponent(engines.join(','));
   try{
@@ -4253,38 +4262,32 @@ fn render_search_results_panel(out: &mut String) {
 fn render_search_plugin_manager(out: &mut String) {
     out.push_str("<div class=\"panel search-plugin-manager search-main-panel\" data-search-view=\"plugins\">");
     out.push_str("<div class=\"search-plugin-manager-head\">");
-    out.push_str("<div class=\"search-plugin-manager-copy\">");
     out.push_str("<div class=\"panel-title\"><span class=\"material-symbols-rounded\" style=\"font-size:16px;vertical-align:-3px;margin-right:4px\">extension</span>Plugins</div>");
-    out.push_str("<div class=\"small\">Install, update, enable, and remove qBittorrent-compatible search plugins without leaving rustorrent.</div>");
-    out.push_str("</div>");
     out.push_str("<div class=\"search-plugin-manager-tools\">");
-    out.push_str("<button type=\"button\" class=\"btn ghost\" onclick=\"loadSearchCatalog(true)\"><span class=\"material-symbols-rounded\">refresh</span>Reload Live List</button>");
-    out.push_str("<button type=\"button\" class=\"btn ghost\" onclick=\"updateInstalledCatalogPlugins()\"><span class=\"material-symbols-rounded\">system_update</span>Update Installed</button>");
+    out.push_str("<button type=\"button\" class=\"btn ghost\" onclick=\"updateInstalledCatalogPlugins()\"><span class=\"material-symbols-rounded\">system_update</span>Update All</button>");
     out.push_str("<button type=\"button\" class=\"btn ghost\" data-search-view-target=\"results\"><span class=\"material-symbols-rounded\">close</span>Close</button>");
     out.push_str("</div>");
     out.push_str("</div>");
-    out.push_str("<div class=\"rss-section-label\">Recommended</div>");
-    out.push_str("<div class=\"small\">Curated public plugins that are broad, stable, and useful for general search.</div>");
-    out.push_str("<div id=\"searchRecommended\"><div class=\"rss-item\"><span class=\"rss-item-info\">Loading recommended plugins...</span></div></div>");
-    out.push_str("<div class=\"rss-section-label\">Installed plugins</div>");
-    out.push_str("<div id=\"searchPluginList\" class=\"search-plugin-list\"><div class=\"rss-item\"><span class=\"rss-item-info\">Loading search plugins...</span></div></div>");
-    out.push_str("<div class=\"search-catalog\">");
-    out.push_str("<div class=\"rss-section-label\">Community plugins</div>");
-    out.push_str("<div id=\"searchCatalogMeta\" class=\"small\" style=\"margin-top:6px\">Loading latest qBittorrent unofficial plugin list...</div>");
-    out.push_str("<input id=\"searchCatalogFilter\" class=\"input\" type=\"search\" placeholder=\"Filter community plugins\" autocomplete=\"off\" style=\"height:32px;padding:0 10px;font-size:12px\">");
-    out.push_str("<div id=\"searchCatalog\" class=\"search-catalog-list\"><div class=\"rss-item\"><span class=\"rss-item-info\">Loading latest unofficial qBittorrent plugins...</span></div></div>");
-    out.push_str("</div>");
-    out.push_str("<div class=\"rss-section-label\">Install plugin</div>");
-    out.push_str("<form class=\"rss-form\" onsubmit=\"installSearchPluginUrl(event)\">");
-    out.push_str(
-        "<input id=\"searchPluginUrl\" class=\"input\" placeholder=\"https://.../plugin.py\">",
-    );
-    out.push_str("<button type=\"submit\" class=\"btn primary\">Install</button>");
+    // Installed section
+    out.push_str("<div class=\"rss-section-label\">Installed</div>");
+    out.push_str("<div id=\"searchPluginList\" class=\"search-plugin-list\"><div class=\"rss-item\"><span class=\"rss-item-info\">Loading...</span></div></div>");
+    // Quick install
+    out.push_str("<div style=\"display:flex;gap:6px;margin-top:10px;align-items:center\">");
+    out.push_str("<form class=\"rss-form\" style=\"flex:1;margin:0\" onsubmit=\"installSearchPluginUrl(event)\">");
+    out.push_str("<input id=\"searchPluginUrl\" class=\"input\" placeholder=\"https://.../plugin.py\" style=\"height:30px;font-size:12px\">");
     out.push_str("</form>");
-    out.push_str("<div class=\"search-install-upload\">");
-    out.push_str("<label class=\"btn ghost search-upload-label\">Upload .py<input id=\"searchPluginFile\" type=\"file\" accept=\".py\" onchange=\"installSearchPluginFile(event)\"></label>");
+    out.push_str("<button type=\"button\" class=\"btn primary\" style=\"height:30px;font-size:12px;padding:0 10px\" onclick=\"document.getElementById('searchPluginUrl')&&installSearchPluginUrl()\">Install URL</button>");
+    out.push_str("<label class=\"btn ghost search-upload-label\" style=\"height:30px;font-size:12px;padding:0 10px\"><span class=\"material-symbols-rounded\" style=\"font-size:14px\">upload_file</span>Upload .py<input id=\"searchPluginFile\" type=\"file\" accept=\".py\" onchange=\"installSearchPluginFile(event)\"></label>");
     out.push_str("</div>");
-    out.push_str("<div class=\"search-note\">Plugins are Python scripts. Review third-party plugins before installing them.</div>");
+    // Community catalog
+    out.push_str("<div class=\"rss-section-label\" style=\"margin-top:12px\">Community Catalog <button type=\"button\" class=\"btn ghost\" style=\"padding:0 6px;height:20px;font-size:11px;vertical-align:1px\" onclick=\"loadSearchCatalog(true)\"><span class=\"material-symbols-rounded\" style=\"font-size:13px\">refresh</span></button></div>");
+    out.push_str("<div id=\"searchCatalogMeta\" class=\"small\">Loading community plugins...</div>");
+    out.push_str("<input id=\"searchCatalogFilter\" class=\"input\" type=\"search\" placeholder=\"Filter...\" autocomplete=\"off\" style=\"height:28px;padding:0 8px;font-size:12px;margin-top:4px\">");
+    out.push_str("<div id=\"searchCatalog\" class=\"search-catalog-list\"><div class=\"rss-item\"><span class=\"rss-item-info\">Loading...</span></div></div>");
+    // Recommended
+    out.push_str("<div class=\"rss-section-label\" style=\"margin-top:12px\">Quick Start</div>");
+    out.push_str("<div class=\"small\">Popular public plugins for general search.</div>");
+    out.push_str("<div id=\"searchRecommended\"><div class=\"rss-item\"><span class=\"rss-item-info\">Loading...</span></div></div>");
     out.push_str("</div>");
 }
 

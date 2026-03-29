@@ -60,6 +60,7 @@ struct SearchState {
     results: Vec<SearchResult>,
     catalog: Vec<SearchCatalogEntry>,
     busy: bool,
+    generation: u64,
     python_available: bool,
     plugin_error: String,
     last_error: String,
@@ -320,9 +321,8 @@ pub fn start_search(query: &str, category: &str, engines: &[String]) -> Result<(
     let state = SEARCH_STATE.get_or_init(|| Mutex::new(SearchState::default()));
     {
         let mut guard = lock_state(state);
-        if guard.busy {
-            return Err("search already running".to_string());
-        }
+        // Allow restarting: clear previous results even if busy
+        guard.generation += 1;
         guard.busy = true;
         guard.last_error.clear();
         guard.results.clear();
@@ -333,20 +333,86 @@ pub fn start_search(query: &str, category: &str, engines: &[String]) -> Result<(
     }
 
     let query_owned = query.to_string();
+    let plugin_count = selected.len();
+    let generation = {
+        let guard = lock_state(state);
+        guard.generation
+    };
+    // Launch one thread per plugin for parallel, incremental results
     thread::spawn(move || {
-        let result = run_search_process(&runtime, &query_owned, &category, &selected);
+        let (tx, rx) = std::sync::mpsc::channel::<(Vec<SearchResult>, String)>();
+        for plugin in &selected {
+            let runtime = runtime.clone();
+            let query = query_owned.clone();
+            let category = category.clone();
+            let plugin = plugin.clone();
+            let tx = tx.clone();
+            thread::Builder::new()
+                .stack_size(512 * 1024)
+                .spawn(move || {
+                    let result =
+                        run_search_process(&runtime, &query, &category, &[plugin]);
+                    match result {
+                        Ok((results, warning)) => {
+                            let _ = tx.send((results, warning));
+                        }
+                        Err(err) => {
+                            let _ = tx.send((Vec::new(), err));
+                        }
+                    }
+                })
+                .ok();
+        }
+        drop(tx);
+        let plugins_by_url = current_plugins();
+        let mut warnings = Vec::new();
+        let mut completed = 0usize;
+        for (mut results, warning) in rx {
+            completed += 1;
+            let warning = summarize_search_warning(&warning);
+            if !warning.is_empty() {
+                warnings.push(warning);
+            }
+            // Merge results incrementally, but only if this search is still current
+            let state = SEARCH_STATE.get_or_init(|| Mutex::new(SearchState::default()));
+            let mut guard = lock_state(state);
+            if guard.generation != generation {
+                // A newer search started; discard our results
+                continue;
+            }
+            // Re-map plugin names from site_url
+            for result in &mut results {
+                if result.plugin.is_empty() {
+                    if let Some(name) =
+                        plugin_name_by_site_url(&result.site_url, &plugins_by_url)
+                    {
+                        result.plugin = name;
+                    }
+                }
+            }
+            guard.results.extend(results);
+            guard.results.sort_by(|left, right| {
+                right
+                    .seeds
+                    .cmp(&left.seeds)
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+            if completed >= plugin_count {
+                guard.busy = false;
+                guard.last_finished_at = now_secs();
+                guard.last_error = if warnings.is_empty() {
+                    String::new()
+                } else {
+                    warnings.join("; ")
+                };
+            }
+        }
+        // Ensure busy is cleared even if no results came (and we're still current)
         let state = SEARCH_STATE.get_or_init(|| Mutex::new(SearchState::default()));
         let mut guard = lock_state(state);
-        guard.busy = false;
-        guard.last_finished_at = now_secs();
-        match result {
-            Ok((results, warning)) => {
-                guard.results = results;
-                guard.last_error = summarize_search_warning(&warning);
-            }
-            Err(err) => {
-                guard.last_error = summarize_search_warning(&err);
-            }
+        if guard.busy && guard.generation == generation {
+            guard.busy = false;
+            guard.last_finished_at = now_secs();
         }
     });
 
