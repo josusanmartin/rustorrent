@@ -14,6 +14,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let preferredUiPort = 9473
     private var uiPort = 9473
     private let maxUiWaitAttempts = 150
+    private let webViewLoadTimeout: TimeInterval = 10
     private let openUiOnLaunchKey = "open_ui_on_launch"
     private let downloadDirectoryKey = "download_directory"
 
@@ -27,6 +28,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
     private var backendOwned = false
     private var uiReadyTimer: Timer?
     private var uiWaitAttempts = 0
+    private var webViewLoadTimer: Timer?
     private var pendingTorrentFiles: [URL] = []
     private var logHandle: FileHandle?
     private var openUiWhenReady = true
@@ -101,6 +103,8 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         log("application will terminate")
         uiReadyTimer?.invalidate()
         uiReadyTimer = nil
+        webViewLoadTimer?.invalidate()
+        webViewLoadTimer = nil
 
         if backendOwned {
             backendProcess?.terminate()
@@ -497,13 +501,15 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         window.toolbar = toolbar
 
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
+        configuration.websiteDataStore = .nonPersistent()
         let webView = WKWebView(frame: window.contentView?.bounds ?? .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
         webView.autoresizingMask = [.width, .height]
-        webView.setValue(false, forKey: "drawsBackground")
+        if #available(macOS 13.0, *) {
+            webView.underPageBackgroundColor = NSColor.windowBackgroundColor
+        }
         window.contentView = webView
 
         mainWindow = window
@@ -522,6 +528,8 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private func loadPlaceholderPage(title: String, message: String, isError: Bool = false) {
         createMainWindowIfNeeded()
+        webViewLoadTimer?.invalidate()
+        webViewLoadTimer = nil
         let accent = isError ? "#b3261e" : "#0b57d0"
         let background = isError ? "#fff8f6" : "#f6f8fb"
         let border = isError ? "#f2b8b5" : "#d3e3fd"
@@ -831,12 +839,14 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         let url = uiBaseURL()
         showMainWindow()
         log("opening ui url \(url.absoluteString)")
-        if lastLoadedURL != url {
-            webView?.load(URLRequest(url: url))
-            lastLoadedURL = url
-        } else {
-            webView?.reload()
-        }
+        startWebViewLoadTimer(for: url)
+        let request = URLRequest(
+            url: url,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: 20
+        )
+        webView?.load(request)
+        lastLoadedURL = url
     }
 
     private func isUiReachable(timeout: TimeInterval) -> Bool {
@@ -982,6 +992,50 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".rustorrent", isDirectory: true)
             .appendingPathComponent("launcher.log")
+    }
+
+    private func startWebViewLoadTimer(for url: URL) {
+        webViewLoadTimer?.invalidate()
+        webViewLoadTimer = Timer.scheduledTimer(withTimeInterval: webViewLoadTimeout, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.webViewLoadTimer = nil
+            guard self.lastLoadedURL == url else { return }
+            let stillLoading = self.webView?.isLoading ?? false
+            self.log("webview load watchdog fired for \(url.absoluteString) (isLoading=\(stillLoading))")
+            if self.isUiReachable(timeout: 0.6) {
+                self.loadPlaceholderPage(
+                    title: "Rustorrent Window Timeout",
+                    message: "The local UI is running, but the embedded window did not finish rendering. Use Reload, or quit older Rustorrent copies that may still be running.",
+                    isError: true
+                )
+            }
+        }
+        if let webViewLoadTimer {
+            RunLoop.main.add(webViewLoadTimer, forMode: .common)
+        }
+    }
+
+    private func stopWebViewLoadTimer() {
+        webViewLoadTimer?.invalidate()
+        webViewLoadTimer = nil
+    }
+
+    private func handleWebViewLoadFailure(_ error: Error, phase: String) {
+        stopWebViewLoadTimer()
+        log("webview \(phase) failed: \(error.localizedDescription)")
+        if isUiReachable(timeout: 0.6) {
+            loadPlaceholderPage(
+                title: "Rustorrent Window Error",
+                message: "The local UI is running, but the embedded web view failed during \(phase): \(error.localizedDescription). Use Reload from the toolbar.",
+                isError: true
+            )
+        } else {
+            loadPlaceholderPage(
+                title: "Rustorrent Window Error",
+                message: "The embedded web view failed during \(phase): \(error.localizedDescription).",
+                isError: true
+            )
+        }
     }
 
     private func resolveUiEndpoint() {
@@ -1186,6 +1240,44 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
             NSWorkspace.shared.open(url)
         }
         return nil
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didStartProvisionalNavigation navigation: WKNavigation!
+    ) {
+        log("webview didStart \(webView.url?.absoluteString ?? lastLoadedURL?.absoluteString ?? "(pending)")")
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didCommit navigation: WKNavigation!
+    ) {
+        log("webview didCommit \(webView.url?.absoluteString ?? lastLoadedURL?.absoluteString ?? "(pending)")")
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFinish navigation: WKNavigation!
+    ) {
+        stopWebViewLoadTimer()
+        log("webview didFinish \(webView.url?.absoluteString ?? lastLoadedURL?.absoluteString ?? "(pending)")")
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFail navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        handleWebViewLoadFailure(error, phase: "navigation")
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        handleWebViewLoadFailure(error, phase: "initial load")
     }
 
     func webView(
