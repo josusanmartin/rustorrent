@@ -10,9 +10,9 @@ Works on **macOS** and **Linux**. Windows support is partial (builds, but NAT-PM
 
 ![Rustorrent library overview](docs/screenshots/library-overview.png)
 
-### Built-in search workspace
+### Search plugin catalog
 
-![Rustorrent search workspace](docs/screenshots/search-workspace.png)
+![Rustorrent search plugin catalog](docs/screenshots/search-workspace.png)
 
 ## Features
 
