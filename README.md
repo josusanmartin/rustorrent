@@ -4,6 +4,16 @@ A minimal BitTorrent client implemented in Rust. Single binary, ~840KB, three de
 
 Works on **macOS** and **Linux**. Windows support is partial (builds, but NAT-PMP gateway detection is not implemented).
 
+## Screenshots
+
+### Library overview
+
+![Rustorrent library overview](docs/screenshots/library-overview.png)
+
+### Built-in search workspace
+
+![Rustorrent search workspace](docs/screenshots/search-workspace.png)
+
 ## Features
 
 - **BitTorrent protocol** — full download and upload with SHA-1 piece verification
