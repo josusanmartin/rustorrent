@@ -961,9 +961,9 @@ mod tests {
             peer_timestamp: 0,
             timestamp_diff: 0,
             ooo_received: HashSet::new(),
-            base_delay: Some(1000),         // 1ms base delay
+            base_delay: Some(1000), // 1ms base delay
             base_delay_updated: now,
-            current_delay: 2000,            // 2ms current delay (well below 100ms target)
+            current_delay: 2000, // 2ms current delay (well below 100ms target)
         };
         let old_cwnd = conn.cwnd;
         ledbat_update_cwnd(&mut conn, 4 * UTP_PAYLOAD_MAX);
@@ -996,7 +996,7 @@ mod tests {
             ooo_received: HashSet::new(),
             base_delay: Some(1000),
             base_delay_updated: now,
-            current_delay: 500_000,         // 500ms current delay >> 100ms target
+            current_delay: 500_000, // 500ms current delay >> 100ms target
         };
         let old_cwnd = conn.cwnd;
         ledbat_update_cwnd(&mut conn, 20 * UTP_PAYLOAD_MAX);

@@ -334,7 +334,11 @@ impl Storage {
 }
 
 fn open_file_no_follow(path: &Path, create: bool) -> Result<File, Error> {
-    if path.symlink_metadata().map(|m| m.is_symlink()).unwrap_or(false) {
+    if path
+        .symlink_metadata()
+        .map(|m| m.is_symlink())
+        .unwrap_or(false)
+    {
         return Err(Error::SymlinkNotAllowed);
     }
     let mut opts = OpenOptions::new();
@@ -356,11 +360,8 @@ fn create_dir_secure(path: &Path) -> Result<(), Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create(path)?;
-        return Ok(());
+        DirBuilder::new().recursive(true).mode(0o755).create(path)?;
+        Ok(())
     }
     #[cfg(not(unix))]
     {

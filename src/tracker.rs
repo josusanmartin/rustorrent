@@ -74,7 +74,7 @@ impl From<bencode::Error> for Error {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn announce(
     announce_url: &str,
     info_hash: [u8; 20],
@@ -325,9 +325,7 @@ fn detect_ipv6_address() -> Option<String> {
     let socket = UdpSocket::bind("[::]:0").ok()?;
     socket.connect("[2001:4860:4860::8888]:80").ok()?;
     match socket.local_addr().ok()?.ip() {
-        IpAddr::V6(addr) if !addr.is_loopback() && !addr.is_unspecified() => {
-            Some(addr.to_string())
-        }
+        IpAddr::V6(addr) if !addr.is_loopback() && !addr.is_unspecified() => Some(addr.to_string()),
         _ => None,
     }
 }
@@ -636,6 +634,7 @@ fn dict_get_int(dict: &[(Vec<u8>, Value)], key: &[u8]) -> Option<u64> {
     })
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ScrapeResult {
     pub seeders: u32,
@@ -644,6 +643,7 @@ pub struct ScrapeResult {
     pub completed: u32,
 }
 
+#[allow(dead_code)]
 pub fn scrape(announce_url: &str, info_hash: [u8; 20]) -> Result<ScrapeResult, Error> {
     let scrape_url = announce_to_scrape_url(announce_url)?;
     let query = format!("info_hash={}", percent_encode(&info_hash));
@@ -690,6 +690,7 @@ pub fn scrape(announce_url: &str, info_hash: [u8; 20]) -> Result<ScrapeResult, E
     Err(Error::MissingField("info_hash in scrape"))
 }
 
+#[allow(dead_code)]
 fn announce_to_scrape_url(url: &str) -> Result<String, Error> {
     if let Some(pos) = url.rfind("/announce") {
         let prefix = &url[..pos];

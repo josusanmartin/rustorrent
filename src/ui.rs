@@ -624,6 +624,7 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
     }
 
     let mut content_length = 0usize;
+    let mut chunked_body = false;
     let mut headers = Vec::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
@@ -635,6 +636,13 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid content length")
                 })?;
             }
+            if name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && header_value
+                    .split(',')
+                    .any(|value| value.trim().eq_ignore_ascii_case("chunked"))
+            {
+                chunked_body = true;
+            }
         }
     }
     if content_length > MAX_BODY_BYTES {
@@ -645,6 +653,18 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
     }
 
     let mut body = buffer[header_end + 4..].to_vec();
+    if chunked_body {
+        body = read_chunked_body(stream, body)?;
+        return Ok(HttpRequest {
+            method,
+            path,
+            headers,
+            body,
+        });
+    }
+    if body.len() > content_length {
+        body.truncate(content_length);
+    }
     let body_deadline = Instant::now() + REQUEST_BODY_TIMEOUT;
     while body.len() < content_length {
         if Instant::now() >= body_deadline {
@@ -681,6 +701,117 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
         headers,
         body,
     })
+}
+
+fn read_chunked_body(stream: &mut TcpStream, mut encoded: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    let mut decoded = Vec::new();
+    let mut cursor = 0usize;
+    let body_deadline = Instant::now() + REQUEST_BODY_TIMEOUT;
+
+    loop {
+        let line_end = loop {
+            if let Some(relative) = find_crlf(&encoded[cursor..]) {
+                break cursor + relative;
+            }
+            read_more_body(stream, &mut encoded, body_deadline)?;
+        };
+
+        let size = parse_chunk_size(&encoded[cursor..line_end])?;
+        cursor = line_end + 2;
+
+        if size == 0 {
+            loop {
+                if encoded.len() >= cursor + 2 && &encoded[cursor..cursor + 2] == b"\r\n" {
+                    return Ok(decoded);
+                }
+                if find_header_end(&encoded[cursor..]).is_some() {
+                    return Ok(decoded);
+                }
+                read_more_body(stream, &mut encoded, body_deadline)?;
+            }
+        }
+
+        let next_len = decoded.len().checked_add(size).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "request body too large")
+        })?;
+        if next_len > MAX_BODY_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request body too large",
+            ));
+        }
+
+        while encoded.len() < cursor + size + 2 {
+            read_more_body(stream, &mut encoded, body_deadline)?;
+        }
+        decoded.extend_from_slice(&encoded[cursor..cursor + size]);
+        cursor += size;
+        if encoded.get(cursor..cursor + 2) != Some(b"\r\n") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid chunk terminator",
+            ));
+        }
+        cursor += 2;
+    }
+}
+
+fn read_more_body(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "request body timeout",
+        ));
+    }
+    let mut chunk = [0u8; 1024];
+    let n = match stream.read(&mut chunk) {
+        Ok(n) => n,
+        Err(err) if is_retryable_io_error(&err) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "request body truncated",
+        ));
+    }
+    buffer.extend_from_slice(&chunk[..n]);
+    if buffer.len() > MAX_HEADER_BYTES + MAX_BODY_BYTES.saturating_mul(2) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "request body too large",
+        ));
+    }
+    Ok(())
+}
+
+fn find_crlf(data: &[u8]) -> Option<usize> {
+    data.windows(2).position(|window| window == b"\r\n")
+}
+
+fn parse_chunk_size(line: &[u8]) -> std::io::Result<usize> {
+    let size_part = line
+        .split(|byte| *byte == b';')
+        .next()
+        .unwrap_or(&[])
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if size_part.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid chunk size",
+        ));
+    }
+    let text = std::str::from_utf8(&size_part)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid chunk size"))?;
+    usize::from_str_radix(text, 16)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid chunk size"))
 }
 
 fn is_retryable_io_error(err: &std::io::Error) -> bool {
@@ -2864,12 +2995,18 @@ function scheduleLiveRender(html){
     liveRenderTimer=null;
     const nextHtml=queuedLiveHtml;
     queuedLiveHtml=null;
-    if(nextHtml){renderApp(nextHtml);}
+    if(nextHtml){
+      if(isAddModalOpen()){pendingHtml=nextHtml;return;}
+      renderApp(nextHtml);
+    }
   },liveRenderIntervalMs);
 }
-function applyUpdate(html){
+function isAddModalOpen(){
   const modal=document.getElementById('addModal');
-  if(modal&&modal.classList.contains('open')){pendingHtml=html;return;}
+  return !!(modal&&modal.classList.contains('open'));
+}
+function applyUpdate(html){
+  if(isAddModalOpen()){pendingHtml=html;return;}
   scheduleLiveRender(html);
   pendingHtml=null;
 }
@@ -4281,7 +4418,9 @@ fn render_search_plugin_manager(out: &mut String) {
     out.push_str("</div>");
     // Community catalog
     out.push_str("<div class=\"rss-section-label\" style=\"margin-top:12px\">Community Catalog <button type=\"button\" class=\"btn ghost\" style=\"padding:0 6px;height:20px;font-size:11px;vertical-align:1px\" onclick=\"loadSearchCatalog(true)\"><span class=\"material-symbols-rounded\" style=\"font-size:13px\">refresh</span></button></div>");
-    out.push_str("<div id=\"searchCatalogMeta\" class=\"small\">Loading community plugins...</div>");
+    out.push_str(
+        "<div id=\"searchCatalogMeta\" class=\"small\">Loading community plugins...</div>",
+    );
     out.push_str("<input id=\"searchCatalogFilter\" class=\"input\" type=\"search\" placeholder=\"Filter...\" autocomplete=\"off\" style=\"height:28px;padding:0 8px;font-size:12px;margin-top:4px\">");
     out.push_str("<div id=\"searchCatalog\" class=\"search-catalog-list\"><div class=\"rss-item\"><span class=\"rss-item-info\">Loading...</span></div></div>");
     // Recommended
@@ -5335,6 +5474,36 @@ mod tests {
     }
 
     #[test]
+    fn add_torrent_accepts_chunked_upload_body() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>();
+        let (captured_tx, captured_rx) = mpsc::channel::<Vec<u8>>();
+        let command_thread = thread::spawn(move || {
+            let cmd = cmd_rx.recv().expect("receive add command");
+            match cmd {
+                UiCommand::AddTorrent { data, reply, .. } => {
+                    captured_tx.send(data).expect("send captured body");
+                    let _ = reply.send(Ok(UiCommandSuccess::TorrentAdded { torrent_id: 88 }));
+                }
+                _ => panic!("expected add torrent command"),
+            }
+        });
+
+        let host = "127.0.0.1:19014";
+        let request = format!(
+            "POST /add-torrent?dir=%2Ftmp&prealloc=0 HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nX-Rustorrent-Token: {}\r\nContent-Type: application/x-bittorrent\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\n",
+            api_token(),
+        );
+
+        let response = run_single_request(request.as_bytes(), Some(cmd_tx));
+        command_thread.join().expect("join command thread");
+        let captured = captured_rx.recv().expect("receive captured body");
+        assert_eq!(captured, b"test");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"ok\":true"));
+        assert!(response.contains("\"torrent_id\":88"));
+    }
+
+    #[test]
     fn archive_action_dispatches_archive_command() {
         let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>();
         let command_thread = thread::spawn(move || {
@@ -5490,7 +5659,9 @@ mod tests {
     #[test]
     fn search_ui_explains_empty_plugin_state() {
         let html = status_html(&UiState::default());
-        assert!(html.contains("No search plugins are installed yet. Open Plugins or Community Catalog to add one."));
+        assert!(html.contains(
+            "No search plugins are installed yet. Open Plugins or Community Catalog to add one."
+        ));
     }
 
     #[test]
@@ -5586,5 +5757,12 @@ mod tests {
         assert!(html.contains("function showToast("));
         assert!(html.contains("function setSearchSort("));
         assert!(html.contains("id=\"searchPluginWarning\""));
+    }
+
+    #[test]
+    fn scheduled_live_render_defers_while_add_modal_is_open() {
+        let html = status_html(&UiState::default());
+        assert!(html.contains("function isAddModalOpen()"));
+        assert!(html.contains("if(isAddModalOpen()){pendingHtml=nextHtml;return;}"));
     }
 }

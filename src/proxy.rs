@@ -215,7 +215,10 @@ fn http_connect(
         } else {
             response.len() - n - 3
         };
-        if response[search_start..].windows(4).any(|w| w == b"\r\n\r\n") {
+        if response[search_start..]
+            .windows(4)
+            .any(|w| w == b"\r\n\r\n")
+        {
             found_end = true;
             break;
         }

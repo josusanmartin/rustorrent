@@ -470,10 +470,7 @@ mod tests {
             meta.announce_list,
             vec![
                 vec![b"http://tracker/a".to_vec()],
-                vec![
-                    b"http://tracker/b".to_vec(),
-                    b"http://tracker/c".to_vec(),
-                ],
+                vec![b"http://tracker/b".to_vec(), b"http://tracker/c".to_vec(),],
             ]
         );
         assert_eq!(

@@ -68,9 +68,7 @@ pub fn encode_into(value: &Value, out: &mut Vec<u8>) {
         }
         Value::Dict(items) => {
             out.push(b'd');
-            let already_sorted = items
-                .windows(2)
-                .all(|w| w[0].0 <= w[1].0);
+            let already_sorted = items.windows(2).all(|w| w[0].0 <= w[1].0);
             let mut sorted_storage;
             let ordered: &[(Vec<u8>, Value)] = if already_sorted {
                 items

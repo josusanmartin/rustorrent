@@ -121,6 +121,7 @@ pub fn prepare(download_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn init(download_dir: &Path) -> Result<(), String> {
     prepare(download_dir)?;
     refresh_plugins()
@@ -350,8 +351,7 @@ pub fn start_search(query: &str, category: &str, engines: &[String]) -> Result<(
             thread::Builder::new()
                 .stack_size(512 * 1024)
                 .spawn(move || {
-                    let result =
-                        run_search_process(&runtime, &query, &category, &[plugin]);
+                    let result = run_search_process(&runtime, &query, &category, &[plugin]);
                     match result {
                         Ok((results, warning)) => {
                             let _ = tx.send((results, warning));
@@ -383,9 +383,7 @@ pub fn start_search(query: &str, category: &str, engines: &[String]) -> Result<(
             // Re-map plugin names from site_url
             for result in &mut results {
                 if result.plugin.is_empty() {
-                    if let Some(name) =
-                        plugin_name_by_site_url(&result.site_url, &plugins_by_url)
-                    {
+                    if let Some(name) = plugin_name_by_site_url(&result.site_url, &plugins_by_url) {
                         result.plugin = name;
                     }
                 }

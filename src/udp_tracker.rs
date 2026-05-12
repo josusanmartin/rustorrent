@@ -141,6 +141,7 @@ fn obtain_connection_id(socket: &UdpSocket, addr: &SocketAddr) -> Result<(u64, b
 }
 
 /// Send an announce request and parse the response.
+#[allow(clippy::too_many_arguments)]
 fn send_announce(
     socket: &UdpSocket,
     connection_id: u64,
@@ -184,8 +185,7 @@ fn send_announce(
         return Err(Error::InvalidTransaction);
     }
     let interval = u32::from_be_bytes([response[8], response[9], response[10], response[11]]);
-    let _leechers =
-        u32::from_be_bytes([response[12], response[13], response[14], response[15]]);
+    let _leechers = u32::from_be_bytes([response[12], response[13], response[14], response[15]]);
     let _seeders = u32::from_be_bytes([response[16], response[17], response[18], response[19]]);
 
     if !(n - RESPONSE_HEADER_LEN).is_multiple_of(6) {
@@ -297,8 +297,10 @@ pub fn announce(
     Err(last_err.unwrap_or(Error::InvalidResponse))
 }
 
+#[allow(dead_code)]
 const ACTION_SCRAPE: u32 = 2;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ScrapeResult {
     pub seeders: u32,
@@ -308,6 +310,7 @@ pub struct ScrapeResult {
 }
 
 /// Send a scrape request and parse the response.
+#[allow(dead_code)]
 fn send_scrape(
     socket: &UdpSocket,
     connection_id: u64,
@@ -345,6 +348,7 @@ fn send_scrape(
     })
 }
 
+#[allow(dead_code)]
 pub fn scrape(url: &str, info_hash: [u8; 20]) -> Result<ScrapeResult, Error> {
     let addr = parse_udp_url(url)?;
     let bind_addr: &str = if addr.is_ipv6() {

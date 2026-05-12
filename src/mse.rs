@@ -578,7 +578,8 @@ mod tests {
         });
 
         let mut client = PeerStream::tcp(TcpStream::connect(addr).unwrap());
-        let (mode, cipher, buffered) = initiate(&mut client, info_hash, false, initial_payload).unwrap();
+        let (mode, cipher, buffered) =
+            initiate(&mut client, info_hash, false, initial_payload).unwrap();
         assert!(matches!(mode, CryptoMode::Rc4));
         if let Some(cipher) = cipher {
             client.enable_encryption(cipher);
