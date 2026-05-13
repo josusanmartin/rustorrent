@@ -210,7 +210,7 @@ impl PieceManager {
     pub fn is_complete(&self) -> bool {
         self.pieces
             .iter()
-            .all(|piece| !piece.wanted || piece.is_complete())
+            .all(|piece| !piece.wanted || piece.verified)
     }
 
     pub fn reset_verified(&mut self) {
@@ -233,7 +233,7 @@ impl PieceManager {
         let mut best = None;
         let mut best_priority = 0u8;
         for (idx, piece) in self.pieces.iter().enumerate() {
-            if !piece.wanted || piece.is_complete() || !piece.has_missing() {
+            if !piece.wanted || piece.verified || !piece.has_missing() {
                 continue;
             }
             if piece.priority > best_priority {
@@ -255,7 +255,7 @@ impl PieceManager {
     pub fn is_piece_complete(&self, index: u32) -> bool {
         self.pieces
             .get(index as usize)
-            .map(|piece| piece.is_complete())
+            .map(|piece| piece.verified)
             .unwrap_or(false)
     }
 
@@ -353,7 +353,7 @@ impl PieceManager {
         if self.sequential {
             // Sequential: pick lowest-index incomplete piece the peer has
             for (idx, piece) in self.pieces.iter().enumerate() {
-                if piece.is_complete() || !piece.has_missing() {
+                if piece.verified || !piece.has_missing() {
                     continue;
                 }
                 if !piece.wanted {
@@ -378,7 +378,7 @@ impl PieceManager {
         let mut best_priority = 0u8;
         let mut best_rarity = u32::MAX;
         for (idx, piece) in self.pieces.iter().enumerate() {
-            if piece.is_complete() || !piece.has_missing() {
+            if piece.verified || !piece.has_missing() {
                 continue;
             }
             if !piece.wanted {
@@ -416,10 +416,7 @@ impl PieceManager {
         }
 
         self.pieces.iter().enumerate().any(|(idx, piece)| {
-            piece.wanted
-                && !piece.is_complete()
-                && piece.has_missing()
-                && bitfield_has(bitfield, idx)
+            piece.wanted && !piece.verified && piece.has_missing() && bitfield_has(bitfield, idx)
         })
     }
 
@@ -461,7 +458,7 @@ impl PieceManager {
         let mut best_rarity = u32::MAX;
 
         for (idx, piece) in self.pieces.iter().enumerate() {
-            if piece.is_complete() || !piece.has_missing() || !piece.wanted {
+            if piece.verified || !piece.has_missing() || !piece.wanted {
                 continue;
             }
             if !bitfield_has(bitfield, idx) {
@@ -542,7 +539,7 @@ impl PieceManager {
         let mut best_piece = None;
         let mut best_rarity = u32::MAX;
         for (idx, piece) in self.pieces.iter().enumerate() {
-            if piece.is_complete() || !piece.has_missing() {
+            if piece.verified || !piece.has_missing() {
                 continue;
             }
             if !bitfield_has(bitfield, idx) {
@@ -714,12 +711,6 @@ fn bitfield_has(bitfield: &[u8], index: usize) -> bool {
 }
 
 impl Piece {
-    fn is_complete(&self) -> bool {
-        self.blocks
-            .iter()
-            .all(|state| *state == BlockState::Complete)
-    }
-
     fn has_missing(&self) -> bool {
         self.blocks.contains(&BlockState::Missing)
     }
@@ -918,6 +909,24 @@ mod tests {
         ));
         assert!(manager.mark_block_complete(0, 0, 16 * 1024).unwrap());
         assert!(!manager.mark_block_complete(0, 0, 16 * 1024).unwrap());
+    }
+
+    #[test]
+    fn complete_requires_hash_verified_piece_not_only_received_blocks() {
+        let meta = dummy_meta(1, 16 * 1024, 16 * 1024);
+        let mut manager = PieceManager::new(&meta).unwrap();
+
+        assert!(manager.mark_block_complete(0, 0, 16 * 1024).unwrap());
+
+        assert!(!manager.is_piece_complete(0));
+        assert!(!manager.is_complete());
+        assert_eq!(manager.completed_pieces(), 0);
+
+        manager.mark_piece_complete(0).unwrap();
+
+        assert!(manager.is_piece_complete(0));
+        assert!(manager.is_complete());
+        assert_eq!(manager.completed_pieces(), 1);
     }
 
     #[test]

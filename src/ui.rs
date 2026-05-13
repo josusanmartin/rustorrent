@@ -4454,6 +4454,10 @@ fn app_body_html(state: &UiState) -> String {
     let mut paused = 0usize;
     let mut errored = 0usize;
     let mut queued = 0usize;
+    let is_complete_torrent = |torrent: &UiTorrent| -> bool {
+        (torrent.total_pieces > 0 && torrent.completed_pieces >= torrent.total_pieces)
+            || (torrent.total_bytes > 0 && torrent.completed_bytes >= torrent.total_bytes)
+    };
     let bucket_for = |torrent: &UiTorrent| -> &'static str {
         let status = torrent.status.as_str();
         if matches!(status, "paused" | "stopped" | "stopping") {
@@ -4465,9 +4469,7 @@ fn app_body_html(state: &UiState) -> String {
         if status == "error" {
             return "error";
         }
-        if matches!(status, "complete" | "seeding")
-            || (torrent.total_bytes > 0 && torrent.completed_bytes >= torrent.total_bytes)
-        {
+        if is_complete_torrent(torrent) {
             return "complete";
         }
         "downloading"
@@ -4748,6 +4750,8 @@ fn app_body_html(state: &UiState) -> String {
             let bucket = bucket_for(torrent);
             let status_display = if bucket == "complete" {
                 "seeding"
+            } else if matches!(status_raw, "complete" | "seeding") {
+                "downloading"
             } else {
                 status_raw
             };
@@ -4764,7 +4768,7 @@ fn app_body_html(state: &UiState) -> String {
                     .saturating_mul(torrent.completed_pieces as u64)
                     / torrent.total_pieces.max(1) as u64
             };
-            if bucket == "complete" && torrent.total_bytes > 0 {
+            if is_complete_torrent(torrent) && torrent.total_bytes > 0 {
                 completed_bytes = torrent.total_bytes;
             }
             let completed_label = human_bytes(completed_bytes.min(torrent.total_bytes));
@@ -5665,7 +5669,7 @@ mod tests {
     }
 
     #[test]
-    fn seeding_bucket_renders_full_progress_even_if_bytes_lag() {
+    fn seeding_status_does_not_force_full_progress_when_bytes_lag() {
         let mut state = UiState::default();
         state.torrents.push(UiTorrent {
             id: 7,
@@ -5679,7 +5683,7 @@ mod tests {
         });
 
         let html = app_body_html(&state);
-        assert!(html.contains("Progress 1000 B / 1000 B (100.00%)"));
+        assert!(html.contains("Progress 998 B / 1000 B (99.80%)"));
     }
 
     #[test]

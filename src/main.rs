@@ -8967,7 +8967,7 @@ fn abandon_inflight(
     if !active_pieces.is_empty() {
         for piece in active_pieces.values() {
             pieces.clear_reservation(piece.index());
-            if !piece.is_complete() {
+            if !pieces.is_piece_complete(piece.index()) {
                 let _ = pieces.reset_piece(piece.index());
             }
         }
@@ -9478,6 +9478,35 @@ mod core_helpers_tests {
             SESSION_UPLOADED_BYTES.load(Ordering::SeqCst),
             block.len() as u64
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn abandon_inflight_resets_complete_but_unverified_piece_buffer() {
+        let root = temp_path("abandon-unverified");
+        fs::create_dir_all(&root).unwrap();
+        let context = make_test_context(32, &root);
+        {
+            let mut pieces = lock_or_recover(&context.pieces);
+            pieces.mark_block_complete(0, 0, 16).unwrap();
+            assert_eq!(pieces.remaining_blocks(), 0);
+            assert!(!pieces.is_piece_complete(0));
+        }
+
+        let mut active = piece::PieceBuffer::new(0, 16).unwrap();
+        active.add_block(0, b"abcdefghijklmnop").unwrap();
+        assert!(active.is_complete());
+
+        let mut active_pieces = HashMap::new();
+        active_pieces.insert(0, active);
+        let mut pending = Vec::new();
+        {
+            let mut pieces = lock_or_recover(&context.pieces);
+            abandon_inflight(&mut pieces, &mut pending, &active_pieces);
+            assert_eq!(pieces.remaining_blocks(), 1);
+            assert!(!pieces.is_complete());
+        }
 
         let _ = fs::remove_dir_all(&root);
     }
