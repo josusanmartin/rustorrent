@@ -1808,72 +1808,78 @@ fn status_html(state: &UiState) -> String {
 .material-symbols-rounded{font-variation-settings:'FILL' 0,'wght' 500,'GRAD' 0,'opsz' 24;vertical-align:middle}
 :root{
   color-scheme:dark;
-  --bg:#111318;
-  --surface:#1b1f27;
-  --surface-cont:#222730;
-  --surface-cont-high:#2a303a;
-  --surface-cont-highest:#323842;
-  --on-surface:#e3e3e8;
-  --on-surface-var:#c4c6cf;
-  --primary:#a8c7fa;
-  --on-primary:#0a305f;
-  --primary-cont:#1b4b8a;
-  --on-primary-cont:#d3e3fd;
-  --secondary:#bec6dc;
-  --on-secondary:#283141;
-  --secondary-cont:#3e4758;
-  --on-secondary-cont:#dae2f9;
-  --tertiary:#9ecaff;
-  --error:#ffb4ab;
-  --on-error:#690005;
-  --error-cont:#93000a;
-  --on-error-cont:#ffdad6;
-  --outline:#8e9199;
-  --outline-var:#44474e;
-  --success:#81d994;
+  --bg:oklch(18% .012 252);
+  --bg-wash:oklch(24% .05 252 / .55);
+  --surface:oklch(24% .014 252);
+  --surface-cont:oklch(28% .018 252);
+  --surface-cont-high:oklch(33% .02 252);
+  --surface-cont-highest:oklch(39% .022 252);
+  --on-surface:oklch(93% .008 252);
+  --on-surface-var:oklch(78% .018 252);
+  --primary:oklch(77% .14 252);
+  --on-primary:oklch(19% .08 252);
+  --primary-cont:oklch(33% .095 252);
+  --on-primary-cont:oklch(89% .06 252);
+  --secondary:oklch(78% .045 252);
+  --on-secondary:oklch(25% .025 252);
+  --secondary-cont:oklch(37% .035 252);
+  --on-secondary-cont:oklch(88% .035 252);
+  --tertiary:oklch(78% .12 210);
+  --error:oklch(78% .13 27);
+  --on-error:oklch(22% .08 27);
+  --error-cont:oklch(35% .12 27);
+  --on-error-cont:oklch(90% .06 27);
+  --outline:oklch(64% .018 252);
+  --outline-var:oklch(37% .018 252);
+  --success:oklch(78% .14 145);
   --success-cont:rgba(76,175,80,.16);
-  --warning:#ffd66b;
+  --warning:oklch(84% .13 82);
   --warning-cont:rgba(251,192,45,.16);
   --danger-cont:rgba(244,67,54,.14);
-  --inverse-surface:#e3e3e8;
-  --inverse-on-surface:#2f3036;
+  --inverse-surface:oklch(93% .008 252);
+  --inverse-on-surface:oklch(28% .014 252);
   --elevation-1:0 1px 3px 1px rgba(0,0,0,.15),0 1px 2px rgba(0,0,0,.3);
   --elevation-2:0 2px 6px 2px rgba(0,0,0,.15),0 1px 2px rgba(0,0,0,.3);
   --elevation-3:0 4px 8px 3px rgba(0,0,0,.15),0 1px 3px rgba(0,0,0,.3);
   --state-hover:rgba(168,199,250,.08);
   --state-press:rgba(168,199,250,.12);
+  --ease-out:cubic-bezier(.23,1,.32,1);
+  --ease-in-out:cubic-bezier(.77,0,.175,1);
+  --fast:160ms;
+  --standard:220ms;
 }
 :root[data-theme="light"]{
   color-scheme:light;
-  --bg:#f8f9fc;
-  --surface:#fff;
-  --surface-cont:#f0f1f6;
-  --surface-cont-high:#e8eaef;
-  --surface-cont-highest:#e1e3e9;
-  --on-surface:#1b1f27;
-  --on-surface-var:#44474e;
-  --primary:#0b57d0;
-  --on-primary:#fff;
-  --primary-cont:#d3e3fd;
-  --on-primary-cont:#062e6f;
-  --secondary:#565f71;
-  --on-secondary:#fff;
-  --secondary-cont:#dae2f9;
-  --on-secondary-cont:#131c2b;
-  --tertiary:#0842a0;
-  --error:#ba1a1a;
-  --on-error:#fff;
-  --error-cont:#ffdad6;
-  --on-error-cont:#410002;
-  --outline:#74777f;
-  --outline-var:#c4c6cf;
-  --success:#1b8726;
+  --bg:oklch(97% .008 252);
+  --bg-wash:oklch(92% .045 252 / .72);
+  --surface:oklch(99% .004 252);
+  --surface-cont:oklch(95% .01 252);
+  --surface-cont-high:oklch(92% .012 252);
+  --surface-cont-highest:oklch(89% .014 252);
+  --on-surface:oklch(23% .018 252);
+  --on-surface-var:oklch(44% .024 252);
+  --primary:oklch(49% .18 252);
+  --on-primary:oklch(98% .006 252);
+  --primary-cont:oklch(90% .06 252);
+  --on-primary-cont:oklch(27% .13 252);
+  --secondary:oklch(47% .035 252);
+  --on-secondary:oklch(98% .006 252);
+  --secondary-cont:oklch(90% .035 252);
+  --on-secondary-cont:oklch(24% .026 252);
+  --tertiary:oklch(50% .14 210);
+  --error:oklch(49% .19 27);
+  --on-error:oklch(98% .006 27);
+  --error-cont:oklch(90% .065 27);
+  --on-error-cont:oklch(24% .09 27);
+  --outline:oklch(56% .018 252);
+  --outline-var:oklch(82% .018 252);
+  --success:oklch(51% .16 145);
   --success-cont:rgba(76,175,80,.12);
-  --warning:#7c5800;
+  --warning:oklch(47% .12 82);
   --warning-cont:rgba(251,192,45,.14);
   --danger-cont:rgba(244,67,54,.1);
-  --inverse-surface:#2f3036;
-  --inverse-on-surface:#f1f0f7;
+  --inverse-surface:oklch(28% .014 252);
+  --inverse-on-surface:oklch(96% .008 252);
   --elevation-1:0 1px 3px 1px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.04);
   --elevation-2:0 2px 6px 2px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.04);
   --elevation-3:0 4px 8px 3px rgba(0,0,0,.08),0 1px 3px rgba(0,0,0,.04);
@@ -1885,7 +1891,9 @@ html,body{height:100%;overflow:hidden}
 body{
   font:14px/1.5 "Inter",system-ui,-apple-system,sans-serif;
   color:var(--on-surface);
-  background:var(--bg);
+  background:
+    radial-gradient(circle at top left,var(--bg-wash),transparent 34rem),
+    linear-gradient(180deg,var(--bg),color-mix(in oklch,var(--bg),var(--surface-cont) 18%));
   -webkit-font-smoothing:antialiased;
 }
 .app{
@@ -1907,7 +1915,7 @@ body{
   justify-content:space-between;
   gap:16px;
   padding:12px 24px;
-  background:var(--surface);
+  background:color-mix(in oklch,var(--surface),transparent 2%);
   border-bottom:1px solid var(--outline-var);
   margin:-16px -24px 0;
   box-shadow:var(--elevation-1);
@@ -1916,7 +1924,7 @@ body{
 .brand-icon{
   width:36px;height:36px;
   border-radius:12px;
-  background:var(--primary);
+  background:linear-gradient(135deg,var(--primary),var(--tertiary));
   color:var(--on-primary);
   display:grid;place-items:center;
   font-size:20px;
@@ -1961,7 +1969,7 @@ body{
   font:500 13px/1 "Inter",sans-serif;
   letter-spacing:.02em;
   cursor:pointer;
-  transition:all .2s cubic-bezier(.2,0,0,1);
+  transition:background var(--fast) var(--ease-out),color var(--fast) var(--ease-out),border-color var(--fast) var(--ease-out),box-shadow var(--fast) var(--ease-out),filter var(--fast) var(--ease-out),transform var(--fast) var(--ease-out);
   background:var(--surface-cont-high);
   color:var(--on-surface);
 }
@@ -1987,6 +1995,65 @@ body{
   min-height:0;
   overflow:hidden;
 }
+.fleet-panel{
+  position:relative;
+  overflow:hidden;
+  display:grid;
+  grid-template-columns:minmax(240px,1.15fr) repeat(4,minmax(120px,.65fr));
+  gap:1px;
+  padding:0;
+  background:var(--outline-var);
+}
+.fleet-panel::before{
+  content:"";
+  position:absolute;
+  inset:-35% -10% auto auto;
+  width:420px;
+  height:220px;
+  background:radial-gradient(circle,color-mix(in oklch,var(--primary),transparent 72%),transparent 68%);
+  pointer-events:none;
+}
+.fleet-hero,.fleet-metric{
+  position:relative;
+  background:var(--surface);
+  padding:16px;
+}
+.fleet-hero{min-width:0}
+.fleet-eyebrow{
+  display:flex;align-items:center;gap:8px;
+  font:700 10px/1 "Inter",sans-serif;
+  letter-spacing:.12em;text-transform:uppercase;color:var(--on-surface-var);
+}
+.signal-dot{
+  width:8px;height:8px;border-radius:999px;
+  background:var(--outline);
+  box-shadow:0 0 0 4px color-mix(in oklch,var(--outline),transparent 84%);
+}
+.signal-dot.live{background:var(--success);box-shadow:0 0 0 4px color-mix(in oklch,var(--success),transparent 84%)}
+.signal-dot.warn{background:var(--warning);box-shadow:0 0 0 4px color-mix(in oklch,var(--warning),transparent 82%)}
+.signal-dot.error{background:var(--error);box-shadow:0 0 0 4px color-mix(in oklch,var(--error),transparent 82%)}
+.fleet-title{
+  margin-top:8px;
+  font:800 24px/1.1 "Inter",system-ui,sans-serif;
+  letter-spacing:-.04em;
+}
+.fleet-copy{
+  margin-top:6px;
+  color:var(--on-surface-var);
+  font:500 12px/1.45 "Inter",sans-serif;
+  max-width:58ch;
+}
+.fleet-metric{display:flex;flex-direction:column;justify-content:space-between;min-height:104px}
+.fleet-metric .label{
+  font:700 10px/1 "Inter",sans-serif;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--on-surface-var);
+}
+.fleet-metric .value{
+  margin-top:14px;
+  font:800 21px/1 "Inter",sans-serif;
+  letter-spacing:-.035em;
+}
+.fleet-metric .hint{margin-top:6px;font:500 11px/1.3 "Inter",sans-serif;color:var(--on-surface-var)}
 .workspace{display:none}
 .workspace.active{display:flex}
 .panel{
@@ -2119,12 +2186,17 @@ body{
   position:relative;
   padding:20px;
   overflow:hidden;
-  transition:box-shadow .2s ease;
+  border-color:color-mix(in oklch,var(--card-accent),var(--outline-var) 72%);
+  background:
+    linear-gradient(180deg,color-mix(in oklch,var(--card-accent),transparent 94%),transparent 120px),
+    var(--surface);
+  transition:box-shadow var(--standard) var(--ease-out),border-color var(--standard) var(--ease-out),transform var(--standard) var(--ease-out);
 }
-.torrent-card:hover{box-shadow:var(--elevation-2)}
+.torrent-card:hover{box-shadow:var(--elevation-2);transform:translateY(-1px)}
 .torrent-card::before{
-  content:"";position:absolute;left:0;top:0;bottom:0;width:4px;
-  background:var(--card-accent);border-radius:0 4px 4px 0;
+  content:"";position:absolute;inset:0 0 auto;
+  height:3px;
+  background:linear-gradient(90deg,var(--card-accent),color-mix(in oklch,var(--card-accent),transparent 74%));
 }
 .torrent-card[data-status="downloading"]{--card-accent:var(--primary)}
 .torrent-card[data-status="complete"]{--card-accent:var(--success)}
@@ -2152,6 +2224,14 @@ body{
   letter-spacing:.04em;
   text-transform:uppercase;
 }
+.status-pill::before{
+  content:"";
+  width:7px;
+  height:7px;
+  border-radius:999px;
+  background:currentColor;
+  box-shadow:0 0 0 3px color-mix(in oklch,currentColor,transparent 84%);
+}
 .status-pill .material-symbols-rounded{font-size:14px}
 .status-pill.status-downloading{background:rgba(168,199,250,.16);color:var(--primary)}
 .status-pill.status-complete,.status-pill.status-seeding{background:var(--success-cont);color:var(--success)}
@@ -2165,6 +2245,8 @@ body{
 .torrent-size{font:500 13px "Inter",sans-serif;color:var(--on-surface-var)}
 .torrent-actions{display:flex;gap:4px;flex-wrap:wrap}
 .torrent-progress{margin-top:14px}
+.torrent-progress-top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.torrent-progress-note{font:600 11px/1 "Inter",sans-serif;color:var(--on-surface-var)}
 .meta{font:400 12px "Inter",sans-serif;color:var(--on-surface-var)}
 .meta.error{color:var(--error)}
 .progress{
@@ -2190,6 +2272,32 @@ body{
 .progress.good .fill{background:var(--success)}
 .torrent-quick{display:none;margin-top:10px;gap:16px;flex-wrap:wrap;font:500 12px "Inter",sans-serif;color:var(--on-surface-var)}
 .torrent-quick .material-symbols-rounded{font-size:16px;vertical-align:-3px;margin-right:2px;opacity:.7}
+.torrent-vitals{
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:8px;
+  margin-top:12px;
+}
+.vital{
+  min-width:0;
+  border:1px solid var(--outline-var);
+  background:color-mix(in oklch,var(--surface-cont),transparent 12%);
+  border-radius:13px;
+  padding:10px 12px;
+}
+.vital-label{
+  display:flex;align-items:center;gap:5px;
+  font:700 10px/1 "Inter",sans-serif;
+  text-transform:uppercase;letter-spacing:.08em;color:var(--on-surface-var);
+}
+.vital-label .material-symbols-rounded{font-size:14px}
+.vital-value{
+  margin-top:7px;
+  font:750 13px/1.25 "Inter",sans-serif;
+  color:var(--on-surface);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.vital-help{margin-top:4px;font:500 11px/1.35 "Inter",sans-serif;color:var(--on-surface-var)}
 .torrent-stats{
   display:grid;
   grid-template-columns:repeat(auto-fit,minmax(130px,1fr));
@@ -2201,7 +2309,9 @@ body{
   padding:10px 14px;
   background:var(--surface-cont);
   border:1px solid var(--outline-var);
+  transition:background var(--fast) var(--ease-out),border-color var(--fast) var(--ease-out);
 }
+.stat:hover{background:var(--surface-cont-high);border-color:color-mix(in oklch,var(--primary),var(--outline-var) 64%)}
 .stat .k{
   display:flex;align-items:center;gap:4px;
   color:var(--on-surface-var);
@@ -2433,9 +2543,13 @@ body{
 .torrent-card[data-collapsed="true"] .torrent-quick{display:flex}
 .empty-state{
   display:flex;flex-direction:column;align-items:center;justify-content:center;
-  padding:64px 24px;text-align:center;
+  padding:72px 24px;text-align:center;
+  min-height:360px;
+  background:
+    radial-gradient(circle at 50% 20%,color-mix(in oklch,var(--primary),transparent 88%),transparent 18rem),
+    var(--surface);
 }
-.empty-state .material-symbols-rounded{font-size:48px;color:var(--on-surface-var);opacity:.5;margin-bottom:12px}
+.empty-state .material-symbols-rounded{font-size:52px;color:var(--primary);opacity:.75;margin-bottom:12px}
 .empty-state p{font:400 14px "Inter",sans-serif;color:var(--on-surface-var);max-width:320px}
 .rss-form{display:flex;gap:6px;margin-top:10px}
 .rss-form .input{height:32px;padding:0 10px;font-size:12px;flex:1;min-width:0}
@@ -2707,19 +2821,31 @@ body{
 .tracker-item .remove-btn:hover{color:var(--error);background:var(--danger-cont)}
 @keyframes progressSheen{0%{transform:translateX(-100%)}100%{transform:translateX(200%)}}
 @keyframes modalFade{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:scale(1)}}
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.001ms!important}
+}
 @media(max-width:900px){
   .layout{gap:16px}
   .sidebar{flex-basis:240px;width:240px}
   .search-sidebar{flex-basis:300px;width:300px}
+  .fleet-panel{grid-template-columns:1fr 1fr}
+  .fleet-hero{grid-column:1 / -1}
 }
 @media(max-width:520px){
-  .layout{flex-direction:column}
-  .sidebar{position:static;flex-basis:auto;width:100%}
+  .layout{flex-direction:column;align-items:stretch;overflow-y:auto;padding-right:0}
+  .sidebar{position:static;flex:0 0 auto;width:100%;max-height:none;overflow:visible;padding-right:0}
+  .torrent-list{flex:0 0 auto;overflow:visible;padding-right:0}
   .torrent-grid{grid-template-columns:1fr}
-  .appbar{flex-direction:column;align-items:flex-start;gap:12px}
-  .appbar-main{width:100%;flex-wrap:wrap}
-  .app-tabs{width:100%}
-  .tab-btn{flex:1;justify-content:center}
+  .torrent-vitals{grid-template-columns:1fr}
+  .appbar{flex-direction:column;align-items:flex-start;gap:12px;width:100%;min-width:0}
+  .appbar-main{width:100%;min-width:0;flex-direction:column;align-items:stretch;gap:12px}
+  .app-tabs{width:100%;min-width:0}
+  .tab-btn{flex:1 1 0;min-width:0;justify-content:center;padding:0 10px;overflow:hidden;white-space:nowrap}
+  .app-actions{width:100%;min-width:0;align-items:stretch}
+  .app-actions .chip{flex:1 1 calc(50% - 4px);min-width:0;justify-content:center;overflow:hidden;white-space:nowrap}
+  .toolbar{width:100%;min-width:0;flex:1 0 100%;display:flex}
+  .toolbar .btn.primary{flex:1;justify-content:center}
+  .toolbar .icon-btn{flex:0 0 40px}
 }
 @media(max-width:700px){
   .app{padding:0 16px 16px}
@@ -2728,6 +2854,7 @@ body{
   .add-prefs{flex-direction:column}
   .add-download-row{flex-direction:column}
   .torrent-stats{grid-template-columns:repeat(2,1fr)}
+  .fleet-panel{grid-template-columns:1fr}
   .search-result-card{flex-direction:column}
   .toast-stack{left:16px;right:16px;bottom:16px}
   .toast{min-width:0;max-width:none}
@@ -4484,6 +4611,49 @@ fn app_body_html(state: &UiState) -> String {
             _ => {}
         }
     }
+    let (fleet_state, fleet_signal, fleet_copy) = if errored > 0 {
+        (
+            "Needs attention",
+            "error",
+            "One or more torrents reported an error. Open the affected item for details.",
+        )
+    } else if downloading > 0 {
+        (
+            "Moving data",
+            "live",
+            "Downloads are active. The swarm panel shows whether peers are connected or only discovered.",
+        )
+    } else if state.upload_rate_bps > 0.0 {
+        (
+            "Seeding now",
+            "live",
+            "Verified pieces are being served to peers. Upload rate reflects actual peer requests.",
+        )
+    } else if complete > 0 {
+        (
+            "Ready to seed",
+            "warn",
+            "Completed torrents stay available. Uploads begin when interested peers request pieces.",
+        )
+    } else if queued > 0 {
+        (
+            "Queued",
+            "",
+            "Torrents are waiting for an active slot or metadata before transfer begins.",
+        )
+    } else if total_torrents == 0 {
+        (
+            "Ready",
+            "",
+            "Add a torrent or search public plugins to start a transfer.",
+        )
+    } else {
+        (
+            "Idle",
+            "warn",
+            "No active peer traffic right now. Trackers and DHT continue looking for peers.",
+        )
+    };
 
     out.push_str("<header class=\"appbar\">");
     out.push_str("<div class=\"appbar-main\">");
@@ -4733,10 +4903,34 @@ fn app_body_html(state: &UiState) -> String {
     out.push_str("</aside>");
 
     out.push_str("<main class=\"torrent-list\">");
+    out.push_str("<section class=\"panel fleet-panel\" aria-label=\"Session overview\">");
+    out.push_str("<div class=\"fleet-hero\">");
+    out.push_str(&format!(
+        "<div class=\"fleet-eyebrow\"><span class=\"signal-dot {fleet_signal}\"></span>Swarm state</div><div class=\"fleet-title\">{fleet_state}</div><div class=\"fleet-copy\">{}</div>",
+        escape_html(fleet_copy)
+    ));
+    out.push_str("</div>");
+    out.push_str(&format!(
+        "<div class=\"fleet-metric\"><div><div class=\"label\">Down</div><div class=\"value\">{}</div></div><div class=\"hint\">Session rate</div></div>",
+        human_rate(state.download_rate_bps)
+    ));
+    out.push_str(&format!(
+        "<div class=\"fleet-metric\"><div><div class=\"label\">Up</div><div class=\"value\">{}</div></div><div class=\"hint\">Served to peers</div></div>",
+        human_rate(state.upload_rate_bps)
+    ));
+    out.push_str(&format!(
+        "<div class=\"fleet-metric\"><div><div class=\"label\">Peers</div><div class=\"value\">{} / {}</div></div><div class=\"hint\">Active / known</div></div>",
+        total_active_peers, total_tracker_peers
+    ));
+    out.push_str(&format!(
+        "<div class=\"fleet-metric\"><div><div class=\"label\">Library</div><div class=\"value\">{}</div></div><div class=\"hint\">{} complete</div></div>",
+        total_torrents, complete
+    ));
+    out.push_str("</section>");
     if state.torrents.is_empty() {
         out.push_str("<div class=\"panel empty-state\">");
         out.push_str("<span class=\"material-symbols-rounded\">cloud_download</span>");
-        out.push_str("<p>No torrents yet. Click <b>Add Torrent</b> to get started.</p>");
+        out.push_str("<p>No torrents yet. Add a file, paste a magnet link, or search plugins to start building your library.</p>");
         out.push_str("</div>");
     } else {
         for (card_index, torrent) in state.torrents.iter().enumerate() {
@@ -4782,6 +4976,42 @@ fn app_body_html(state: &UiState) -> String {
             let pct_value = (pct as f64 / 100.0).min(100.0);
             let peers = format!("{} / {}", torrent.active_peers, torrent.tracker_peers);
             let pieces = format!("{}/{}", torrent.completed_pieces, torrent.total_pieces);
+            let progress_note = if bucket == "complete" {
+                "Verified payload"
+            } else if matches!(status_raw, "complete" | "seeding") {
+                "Verification pending"
+            } else if torrent.active_peers > 0 {
+                "Peers connected"
+            } else if torrent.tracker_peers > 0 {
+                "Finding reachable peers"
+            } else {
+                "Waiting for swarm"
+            };
+            let flow_value = if bucket == "complete" && torrent.upload_rate_bps > 0.0 {
+                "Seeding"
+            } else if torrent.download_rate_bps > 0.0 {
+                "Downloading"
+            } else if bucket == "complete" {
+                "Ready"
+            } else if torrent.active_peers > 0 {
+                "Connected"
+            } else {
+                "Waiting"
+            };
+            let swarm_value = if torrent.active_peers > 0 {
+                format!("{} active", torrent.active_peers)
+            } else if torrent.tracker_peers > 0 {
+                format!("{} known", torrent.tracker_peers)
+            } else {
+                "No peers".to_string()
+            };
+            let integrity_value = if bucket == "complete" {
+                "Verified".to_string()
+            } else if matches!(status_raw, "complete" | "seeding") {
+                "Checking".to_string()
+            } else {
+                pieces.clone()
+            };
             let progress_class =
                 if torrent.total_bytes > 0 && completed_bytes >= torrent.total_bytes {
                     "progress good"
@@ -4849,7 +5079,7 @@ fn app_body_html(state: &UiState) -> String {
             out.push_str("</div>");
 
             out.push_str(&format!(
-                "<div class=\"torrent-progress\"><div class=\"meta\">Progress {completed_label} / {total_bytes} ({:.2}%)</div>",
+                "<div class=\"torrent-progress\"><div class=\"torrent-progress-top\"><div class=\"meta\">Progress {completed_label} / {total_bytes} ({:.2}%)</div><div class=\"torrent-progress-note\">{progress_note}</div></div>",
                 pct_value
             ));
             out.push_str(&format!(
@@ -4859,6 +5089,17 @@ fn app_body_html(state: &UiState) -> String {
             out.push_str(&format!(
                 "<div class=\"torrent-quick\"><span><span class=\"material-symbols-rounded\">download</span>{speed}</span><span><span class=\"material-symbols-rounded\">upload</span>{upload_rate}</span><span><span class=\"material-symbols-rounded\">group</span>{peers}</span><span><span class=\"material-symbols-rounded\">schedule</span>{eta}</span></div>"
             ));
+            out.push_str("<div class=\"torrent-vitals\">");
+            out.push_str(&format!(
+                "<div class=\"vital\"><div class=\"vital-label\"><span class=\"material-symbols-rounded\">bolt</span>Flow</div><div class=\"vital-value\">{flow_value}</div><div class=\"vital-help\">{speed} down / {upload_rate} up</div></div>"
+            ));
+            out.push_str(&format!(
+                "<div class=\"vital\"><div class=\"vital-label\"><span class=\"material-symbols-rounded\">hub</span>Swarm</div><div class=\"vital-value\">{swarm_value}</div><div class=\"vital-help\">{peers} active / known</div></div>"
+            ));
+            out.push_str(&format!(
+                "<div class=\"vital\"><div class=\"vital-label\"><span class=\"material-symbols-rounded\">verified</span>Integrity</div><div class=\"vital-value\">{integrity_value}</div><div class=\"vital-help\">{pieces} pieces</div></div>"
+            ));
+            out.push_str("</div>");
             out.push_str("<div class=\"torrent-stats\">");
             out.push_str(&format!(
                 "<div class=\"stat\"><span class=\"k\"><span class=\"material-symbols-rounded\">download</span>Down</span><span class=\"v\">{speed}</span></div>"
@@ -5634,7 +5875,10 @@ mod tests {
         assert!(html.contains(".layout{gap:16px}"));
         assert!(html.contains(".sidebar{flex-basis:240px;width:240px}"));
         assert!(html.contains("@media(max-width:520px){"));
-        assert!(html.contains(".layout{flex-direction:column}"));
+        assert!(html.contains(".layout{flex-direction:column;align-items:stretch;overflow-y:auto;"));
+        assert!(html.contains(".sidebar{position:static;flex:0 0 auto;width:100%;"));
+        assert!(html.contains(".torrent-list{flex:0 0 auto;overflow:visible;"));
+        assert!(html.contains(".appbar-main{width:100%;min-width:0;flex-direction:column;"));
     }
 
     #[test]
