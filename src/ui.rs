@@ -139,13 +139,18 @@ pub struct UiState {
     pub uploaded_bytes: u64,
     pub tracker_peers: usize,
     pub active_peers: usize,
+    pub interested_peers: usize,
     pub status: String,
     pub last_error: String,
     pub preallocate: bool,
     pub paused: bool,
     pub download_rate_bps: f64,
     pub upload_rate_bps: f64,
+    pub upload_requests_served: u64,
     pub eta_secs: u64,
+    pub incoming_port: u16,
+    pub natpmp_status: String,
+    pub upnp_status: String,
     pub files: Vec<UiFile>,
     pub queue_len: usize,
     pub last_added: String,
@@ -189,8 +194,10 @@ pub struct UiTorrent {
     pub eta_secs: u64,
     pub tracker_peers: usize,
     pub active_peers: usize,
+    pub interested_peers: usize,
     pub paused: bool,
     pub last_error: String,
+    pub upload_requests_served: u64,
     pub files: Vec<UiFile>,
     pub label: String,
     pub trackers: Vec<String>,
@@ -4829,6 +4836,17 @@ fn app_body_html(state: &UiState) -> String {
         "<div class=\"session-row\"><span>Connections</span><span class=\"session-value\">+{} / -{}</span></div>",
         state.peer_connected, state.peer_disconnected
     ));
+    if state.incoming_port > 0 {
+        out.push_str(&format!(
+            "<div class=\"session-row\"><span>Incoming Port</span><span class=\"session-value\">{}</span></div>",
+            state.incoming_port
+        ));
+        out.push_str(&format!(
+            "<div class=\"session-row\"><span>Port Mapping</span><span class=\"session-value\">{} / {}</span></div>",
+            escape_html(&state.natpmp_status),
+            escape_html(&state.upnp_status)
+        ));
+    }
     out.push_str(&format!(
         "<div class=\"session-row\"><span>Disk I/O</span><span class=\"session-value\">{:.1}ms / {:.1}ms</span></div>",
         state.disk_read_ms_avg, state.disk_write_ms_avg
@@ -4919,7 +4937,7 @@ fn app_body_html(state: &UiState) -> String {
         human_rate(state.upload_rate_bps)
     ));
     out.push_str(&format!(
-        "<div class=\"fleet-metric\"><div><div class=\"label\">Peers</div><div class=\"value\">{} / {}</div></div><div class=\"hint\">Active / known</div></div>",
+        "<div class=\"fleet-metric\"><div><div class=\"label\">Peers</div><div class=\"value\">{} / {}</div></div><div class=\"hint\">Connected / known</div></div>",
         total_active_peers, total_tracker_peers
     ));
     out.push_str(&format!(
@@ -4999,12 +5017,20 @@ fn app_body_html(state: &UiState) -> String {
                 "Waiting"
             };
             let swarm_value = if torrent.active_peers > 0 {
-                format!("{} active", torrent.active_peers)
+                format!("{} connected", torrent.active_peers)
             } else if torrent.tracker_peers > 0 {
                 format!("{} known", torrent.tracker_peers)
             } else {
                 "No peers".to_string()
             };
+            let flow_help = format!(
+                "{speed} down / {upload_rate} up / {} requests",
+                torrent.upload_requests_served
+            );
+            let swarm_help = format!(
+                "{} interested / {} connected / known",
+                torrent.interested_peers, peers
+            );
             let integrity_value = if bucket == "complete" {
                 "Verified".to_string()
             } else if matches!(status_raw, "complete" | "seeding") {
@@ -5091,10 +5117,10 @@ fn app_body_html(state: &UiState) -> String {
             ));
             out.push_str("<div class=\"torrent-vitals\">");
             out.push_str(&format!(
-                "<div class=\"vital\"><div class=\"vital-label\"><span class=\"material-symbols-rounded\">bolt</span>Flow</div><div class=\"vital-value\">{flow_value}</div><div class=\"vital-help\">{speed} down / {upload_rate} up</div></div>"
+                "<div class=\"vital\"><div class=\"vital-label\"><span class=\"material-symbols-rounded\">bolt</span>Flow</div><div class=\"vital-value\">{flow_value}</div><div class=\"vital-help\">{flow_help}</div></div>"
             ));
             out.push_str(&format!(
-                "<div class=\"vital\"><div class=\"vital-label\"><span class=\"material-symbols-rounded\">hub</span>Swarm</div><div class=\"vital-value\">{swarm_value}</div><div class=\"vital-help\">{peers} active / known</div></div>"
+                "<div class=\"vital\"><div class=\"vital-label\"><span class=\"material-symbols-rounded\">hub</span>Swarm</div><div class=\"vital-value\">{swarm_value}</div><div class=\"vital-help\">{swarm_help}</div></div>"
             ));
             out.push_str(&format!(
                 "<div class=\"vital\"><div class=\"vital-label\"><span class=\"material-symbols-rounded\">verified</span>Integrity</div><div class=\"vital-value\">{integrity_value}</div><div class=\"vital-help\">{pieces} pieces</div></div>"
@@ -5354,7 +5380,7 @@ fn status_json(state: &UiState) -> String {
         }
         countries_json.push(']');
         torrents_json.push_str(&format!(
-            "{{\"id\":{},\"name\":\"{}\",\"info_hash\":\"{}\",\"download_dir\":\"{}\",\"preallocate\":{},\"status\":\"{}\",\"total_bytes\":{},\"completed_bytes\":{},\"downloaded_bytes\":{},\"uploaded_bytes\":{},\"ratio\":{:.3},\"total_pieces\":{},\"completed_pieces\":{},\"percent\":{},\"download_rate_bps\":{:.2},\"upload_rate_bps\":{:.2},\"eta_secs\":{},\"tracker_peers\":{},\"active_peers\":{},\"paused\":{},\"last_error\":\"{}\",\"label\":\"{}\",\"trackers\":{},\"files\":{},\"peer_countries\":{}}}",
+            "{{\"id\":{},\"name\":\"{}\",\"info_hash\":\"{}\",\"download_dir\":\"{}\",\"preallocate\":{},\"status\":\"{}\",\"total_bytes\":{},\"completed_bytes\":{},\"downloaded_bytes\":{},\"uploaded_bytes\":{},\"ratio\":{:.3},\"total_pieces\":{},\"completed_pieces\":{},\"percent\":{},\"download_rate_bps\":{:.2},\"upload_rate_bps\":{:.2},\"eta_secs\":{},\"tracker_peers\":{},\"active_peers\":{},\"interested_peers\":{},\"upload_requests_served\":{},\"paused\":{},\"last_error\":\"{}\",\"label\":\"{}\",\"trackers\":{},\"files\":{},\"peer_countries\":{}}}",
             torrent.id,
             escape_json(&torrent.name),
             escape_json(&torrent.info_hash),
@@ -5374,6 +5400,8 @@ fn status_json(state: &UiState) -> String {
             torrent.eta_secs,
             torrent.tracker_peers,
             torrent.active_peers,
+            torrent.interested_peers,
+            torrent.upload_requests_served,
             torrent.paused,
             escape_json(&torrent.last_error),
             escape_json(&torrent.label),
@@ -5384,7 +5412,7 @@ fn status_json(state: &UiState) -> String {
     }
     torrents_json.push(']');
     format!(
-        "{{\"name\":\"{}\",\"info_hash\":\"{}\",\"download_dir\":\"{}\",\"status\":\"{}\",\"last_error\":\"{}\",\"total_pieces\":{},\"completed_pieces\":{},\"total_bytes\":{},\"completed_bytes\":{},\"downloaded_bytes\":{},\"uploaded_bytes\":{},\"ratio\":{:.3},\"percent\":{},\"tracker_peers\":{},\"active_peers\":{},\"preallocate\":{},\"paused\":{},\"download_rate_bps\":{:.2},\"upload_rate_bps\":{:.2},\"eta_secs\":{},\"queue_len\":{},\"last_added\":\"{}\",\"current_id\":{},\"peer_connected\":{},\"peer_disconnected\":{},\"disk_read_ms_avg\":{:.3},\"disk_write_ms_avg\":{:.3},\"session_downloaded_bytes\":{},\"session_uploaded_bytes\":{},\"global_download_limit_bps\":{},\"global_upload_limit_bps\":{},\"seed_ratio\":{:.2},\"files\":{},\"torrents\":{}}}",
+        "{{\"name\":\"{}\",\"info_hash\":\"{}\",\"download_dir\":\"{}\",\"status\":\"{}\",\"last_error\":\"{}\",\"total_pieces\":{},\"completed_pieces\":{},\"total_bytes\":{},\"completed_bytes\":{},\"downloaded_bytes\":{},\"uploaded_bytes\":{},\"ratio\":{:.3},\"percent\":{},\"tracker_peers\":{},\"active_peers\":{},\"interested_peers\":{},\"upload_requests_served\":{},\"preallocate\":{},\"paused\":{},\"download_rate_bps\":{:.2},\"upload_rate_bps\":{:.2},\"eta_secs\":{},\"incoming_port\":{},\"natpmp_status\":\"{}\",\"upnp_status\":\"{}\",\"queue_len\":{},\"last_added\":\"{}\",\"current_id\":{},\"peer_connected\":{},\"peer_disconnected\":{},\"disk_read_ms_avg\":{:.3},\"disk_write_ms_avg\":{:.3},\"session_downloaded_bytes\":{},\"session_uploaded_bytes\":{},\"global_download_limit_bps\":{},\"global_upload_limit_bps\":{},\"seed_ratio\":{:.2},\"files\":{},\"torrents\":{}}}",
         escape_json(&state.name),
         escape_json(&state.info_hash),
         escape_json(&state.download_dir),
@@ -5400,11 +5428,16 @@ fn status_json(state: &UiState) -> String {
         overall_percent,
         state.tracker_peers,
         state.active_peers,
+        state.interested_peers,
+        state.upload_requests_served,
         state.preallocate,
         state.paused,
         state.download_rate_bps,
         state.upload_rate_bps,
         state.eta_secs,
+        state.incoming_port,
+        escape_json(&state.natpmp_status),
+        escape_json(&state.upnp_status),
         state.queue_len,
         escape_json(&state.last_added),
         current_id_json,
@@ -5648,6 +5681,34 @@ mod tests {
         let state = UiState::default();
         let json = status_json(&state);
         assert!(json.contains("\"current_id\":null"));
+    }
+
+    #[test]
+    fn status_json_exposes_seed_upload_diagnostics() {
+        let mut state = UiState {
+            incoming_port: 6881,
+            natpmp_status: "mapped".to_string(),
+            upnp_status: "failed: no gateway".to_string(),
+            interested_peers: 2,
+            upload_requests_served: 7,
+            ..Default::default()
+        };
+        state.torrents.push(UiTorrent {
+            id: 1,
+            interested_peers: 1,
+            upload_requests_served: 3,
+            ..Default::default()
+        });
+
+        let json = status_json(&state);
+
+        assert!(json.contains("\"incoming_port\":6881"));
+        assert!(json.contains("\"natpmp_status\":\"mapped\""));
+        assert!(json.contains("\"upnp_status\":\"failed: no gateway\""));
+        assert!(json.contains("\"interested_peers\":2"));
+        assert!(json.contains("\"upload_requests_served\":7"));
+        assert!(json.contains("\"interested_peers\":1"));
+        assert!(json.contains("\"upload_requests_served\":3"));
     }
 
     #[test]

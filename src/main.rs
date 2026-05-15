@@ -247,7 +247,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
@@ -282,15 +282,16 @@ const METADATA_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const TRANSFER_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PEER_RETRIES: u32 = 8;
 const PEER_RETRY_BASE_SECS: u64 = 2;
-const NO_PEER_REANNOUNCE_SECS: u64 = 5;
+const NO_PEER_REANNOUNCE_SECS: u64 = 30;
 const PEER_BAN_SECS: u64 = 60;
+const PEER_RETRY_EXHAUSTED_BAN_SECS: u64 = 15 * 60;
 const PEER_RETRY_MAX_SECS: u64 = 30;
 const PEER_THREAD_STACK: usize = 512 * 1024; // 512KB
 const TRACKER_ANNOUNCE_WAIT_BUDGET: Duration = Duration::from_secs(4);
 const TRACKER_ANNOUNCE_POLL: Duration = Duration::from_millis(150);
 const TORRENT_LOOP_INTERVAL: Duration = Duration::from_millis(200);
 const PEER_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const STALL_REANNOUNCE_SECS: u64 = 3;
+const STALL_REANNOUNCE_SECS: u64 = 30;
 const STARTUP_BURST_MIN_WORKERS: usize = 24;
 const STARTUP_BURST_MULTIPLIER: usize = 3;
 const STARTUP_BURST_BYTES: u64 = 8 * 1024 * 1024;
@@ -623,6 +624,9 @@ struct TorrentContext {
     limits: TransferLimits,
     downloaded: Arc<AtomicU64>,
     uploaded: Arc<AtomicU64>,
+    active_peers: Arc<AtomicUsize>,
+    interested_peers: Arc<AtomicUsize>,
+    upload_requests_served: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
     upload_manager: Arc<UploadManager>,
@@ -1493,6 +1497,9 @@ fn run() -> Result<(), String> {
         ui.peer_profile_global_limit = args.max_peers_global;
         ui.peer_profile_torrent_limit = args.max_peers_torrent;
         ui.peer_profile_numwant = args.numwant;
+        ui.incoming_port = args.port;
+        ui.natpmp_status = "pending".to_string();
+        ui.upnp_status = "pending".to_string();
         ui.proxy_label = match &args.proxy {
             Some(proxy::ProxyConfig::Socks5 { host, port }) => format!("socks5://{host}:{port}"),
             Some(proxy::ProxyConfig::Http { host, port }) => format!("http://{host}:{port}"),
@@ -1606,12 +1613,14 @@ fn run() -> Result<(), String> {
     let dht = dht::start(args.port);
     let lpd = lpd::start();
     let port = args.port;
+    let mapping_ui = ui_state.clone();
     thread::spawn(move || {
-        let _ = natpmp::map_port(port, 3600);
+        record_port_mapping_result(&mapping_ui, "nat-pmp", port, natpmp::map_port(port, 3600));
     });
     let port = args.port;
+    let mapping_ui = ui_state.clone();
     thread::spawn(move || {
-        let _ = upnp::map_port(port);
+        record_port_mapping_result(&mapping_ui, "upnp", port, upnp::map_port(port));
     });
 
     let mut queue: VecDeque<TorrentRequest> = VecDeque::new();
@@ -2350,7 +2359,10 @@ fn run_torrent(
     let uploaded = Arc::new(AtomicU64::new(resume_uploaded));
     let paused_flag = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let peer_queue = Arc::new(Mutex::new(PeerQueue::new(ip_filter.clone())));
+    let peer_queue = Arc::new(Mutex::new(PeerQueue::new_with_local_addrs(
+        ip_filter.clone(),
+        local_peer_addrs(args.port),
+    )));
     if let Some(resume) = resume_data.as_ref() {
         if !resume.peers.is_empty() {
             if let Ok(mut queue) = peer_queue.lock() {
@@ -2458,6 +2470,9 @@ fn run_torrent(
     let completed_log = Arc::new(Mutex::new(Vec::new()));
     let peer_tags = Arc::new(AtomicU64::new(1));
     let upload_manager = Arc::new(UploadManager::new(UPLOAD_SLOTS));
+    let active_peers = Arc::new(AtomicUsize::new(0));
+    let interested_peers = Arc::new(AtomicUsize::new(0));
+    let upload_requests_served = Arc::new(AtomicU64::new(0));
     let shared_trackers = Arc::new(Mutex::new(trackers.clone()));
     let initial_renames: HashMap<usize, String> = resume_data
         .as_ref()
@@ -2477,6 +2492,9 @@ fn run_torrent(
         limits: limits.clone(),
         downloaded: Arc::clone(&downloaded),
         uploaded: Arc::clone(&uploaded),
+        active_peers: Arc::clone(&active_peers),
+        interested_peers: Arc::clone(&interested_peers),
+        upload_requests_served: Arc::clone(&upload_requests_served),
         paused: Arc::clone(&paused_flag),
         stop_requested: Arc::clone(&stop_flag),
         upload_manager: Arc::clone(&upload_manager),
@@ -2539,7 +2557,6 @@ fn run_torrent(
         let has_trackers = !trackers.http.is_empty() || !trackers.udp.is_empty();
         // Track per-tracker failures for exponential backoff: url -> (fail_count, last_failure)
         let mut tracker_failures: HashMap<String, (u32, Instant)> = HashMap::new();
-        let active_peers = Arc::new(AtomicUsize::new(0));
         let per_torrent_slots = Arc::new(PeerSlots::new(peer_settings.max_peers_torrent()));
         let peer_tags = Arc::clone(&peer_tags);
         let torrent_id = request.id;
@@ -2608,6 +2625,8 @@ fn run_torrent(
                 let completed_clone = Arc::clone(&completed_log);
                 let queue_clone = Arc::clone(&peer_queue);
                 let active_clone = Arc::clone(&active_peers);
+                let interested_clone = Arc::clone(&interested_peers);
+                let upload_requests_clone = Arc::clone(&upload_requests_served);
                 let tags_clone = Arc::clone(&peer_tags);
                 let file_spans = Arc::clone(&file_spans);
                 let downloaded = Arc::clone(&downloaded);
@@ -2637,6 +2656,8 @@ fn run_torrent(
                             &queue_clone,
                             allow_pex,
                             &active_clone,
+                            &interested_clone,
+                            &upload_requests_clone,
                             &file_spans,
                             base_piece_length,
                             connect_cfg,
@@ -2716,6 +2737,8 @@ fn run_torrent(
                 (q.known_len(), q.len())
             };
             let active_count = active_peers.load(Ordering::SeqCst);
+            let interested_count = interested_peers.load(Ordering::SeqCst);
+            let upload_requests_count = upload_requests_served.load(Ordering::SeqCst);
 
             // Only announce if enough time has passed OR we have no peers/low activity
             let time_since_announce = last_announce.elapsed().as_secs();
@@ -2923,6 +2946,7 @@ fn run_torrent(
             let stopping = stop_flag.load(Ordering::SeqCst);
             let shown_known_count = if stopping { 0 } else { known_count };
             let shown_active_count = if stopping { 0 } else { active_count };
+            let shown_interested_count = if stopping { 0 } else { interested_count };
             let shown_down_rate = if stopping { 0.0 } else { down_rate };
             let shown_up_rate = if stopping { 0.0 } else { up_rate };
             let shown_eta_secs = if stopping { 0 } else { eta_secs };
@@ -2956,6 +2980,8 @@ fn run_torrent(
                     state.uploaded_bytes = uploaded;
                     state.status = torrent_status.to_string();
                     state.active_peers = shown_active_count;
+                    state.interested_peers = shown_interested_count;
+                    state.upload_requests_served = upload_requests_count;
                     state.download_rate_bps = shown_down_rate;
                     state.upload_rate_bps = shown_up_rate;
                     state.eta_secs = shown_eta_secs;
@@ -2967,6 +2993,8 @@ fn run_torrent(
                 update_torrent_entry(state, request.id, |torrent| {
                     torrent.tracker_peers = shown_known_count;
                     torrent.active_peers = shown_active_count;
+                    torrent.interested_peers = shown_interested_count;
+                    torrent.upload_requests_served = upload_requests_count;
                     torrent.paused = paused;
                     torrent.status = torrent_status.to_string();
                     torrent.completed_pieces = completed_pieces;
@@ -3080,6 +3108,7 @@ fn run_torrent(
             state.download_rate_bps = 0.0;
             state.upload_rate_bps = 0.0;
             state.active_peers = 0;
+            state.interested_peers = 0;
             state.eta_secs = 0;
             state.current_id = None;
         }
@@ -3089,6 +3118,7 @@ fn run_torrent(
             torrent.download_rate_bps = 0.0;
             torrent.upload_rate_bps = 0.0;
             torrent.active_peers = 0;
+            torrent.interested_peers = 0;
             torrent.eta_secs = 0;
         });
     });
@@ -4184,6 +4214,7 @@ struct PeerQueue {
     failures: HashMap<SocketAddr, u32>,
     banned: HashMap<SocketAddr, Instant>,
     filter: Option<Arc<IpFilter>>,
+    local_peer_addrs: HashSet<SocketAddr>,
 }
 
 #[derive(Clone, Copy)]
@@ -4200,7 +4231,15 @@ struct DeferredPeer {
 }
 
 impl PeerQueue {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(filter: Option<Arc<IpFilter>>) -> Self {
+        Self::new_with_local_addrs(filter, HashSet::new())
+    }
+
+    fn new_with_local_addrs(
+        filter: Option<Arc<IpFilter>>,
+        local_peer_addrs: HashSet<SocketAddr>,
+    ) -> Self {
         Self {
             known: HashSet::new(),
             queued: HashSet::new(),
@@ -4210,6 +4249,7 @@ impl PeerQueue {
             failures: HashMap::new(),
             banned: HashMap::new(),
             filter,
+            local_peer_addrs,
         }
     }
 
@@ -4222,6 +4262,9 @@ impl PeerQueue {
         let high_priority = matches!(source, PeerSource::Tracker);
         for addr in peers {
             if !is_viable_peer_addr(addr, source) {
+                continue;
+            }
+            if self.is_local_self_peer(addr) {
                 continue;
             }
             if self.is_filtered(addr) {
@@ -4255,7 +4298,7 @@ impl PeerQueue {
     fn pop(&mut self) -> Option<SocketAddr> {
         self.promote_ready();
         while let Some(addr) = self.queue.pop_front() {
-            if self.is_filtered(addr) || self.is_banned(addr) {
+            if self.is_local_self_peer(addr) || self.is_filtered(addr) || self.is_banned(addr) {
                 self.queued.remove(&addr);
                 continue;
             }
@@ -4273,6 +4316,9 @@ impl PeerQueue {
     fn note_failure(&mut self, addr: SocketAddr) -> Option<Duration> {
         let attempts = self.failures.entry(addr).or_insert(0);
         *attempts = attempts.saturating_add(1);
+        if *attempts >= MAX_PEER_RETRIES {
+            return None;
+        }
         let step = attempts
             .saturating_sub(1)
             .min(MAX_PEER_RETRIES.saturating_sub(1));
@@ -4283,7 +4329,7 @@ impl PeerQueue {
     }
 
     fn schedule_retry(&mut self, addr: SocketAddr, delay: Duration) {
-        if self.is_filtered(addr) || self.is_banned(addr) {
+        if self.is_local_self_peer(addr) || self.is_filtered(addr) || self.is_banned(addr) {
             return;
         }
         if self.queued.contains(&addr) || self.inflight.contains(&addr) {
@@ -4311,7 +4357,7 @@ impl PeerQueue {
             }
         });
         for addr in ready {
-            if self.is_filtered(addr) || self.is_banned(addr) {
+            if self.is_local_self_peer(addr) || self.is_filtered(addr) || self.is_banned(addr) {
                 continue;
             }
             if self.queued.contains(&addr) || self.inflight.contains(&addr) {
@@ -4329,7 +4375,15 @@ impl PeerQueue {
     }
 
     fn ban(&mut self, addr: SocketAddr) {
-        let until = Instant::now() + Duration::from_secs(PEER_BAN_SECS);
+        self.ban_for(addr, Duration::from_secs(PEER_BAN_SECS));
+    }
+
+    fn ban_for(&mut self, addr: SocketAddr, duration: Duration) {
+        self.queued.remove(&addr);
+        self.inflight.remove(&addr);
+        self.deferred.retain(|entry| entry.addr != addr);
+        self.failures.remove(&addr);
+        let until = Instant::now() + duration;
         self.banned.insert(addr, until);
     }
 
@@ -4344,7 +4398,7 @@ impl PeerQueue {
     fn sample(&self, max: usize) -> Vec<SocketAddr> {
         self.known
             .iter()
-            .filter(|addr| !self.is_filtered(**addr))
+            .filter(|addr| !self.is_local_self_peer(**addr) && !self.is_filtered(**addr))
             .take(max)
             .cloned()
             .collect()
@@ -4384,6 +4438,10 @@ impl PeerQueue {
             .as_ref()
             .map(|filter| filter.is_blocked(addr.ip()))
             .unwrap_or(false)
+    }
+
+    fn is_local_self_peer(&self, addr: SocketAddr) -> bool {
+        self.local_peer_addrs.contains(&addr)
     }
 }
 
@@ -4431,6 +4489,35 @@ fn is_viable_peer_addr(addr: SocketAddr, source: PeerSource) -> bool {
             true
         }
     }
+}
+
+fn local_peer_addrs(listen_port: u16) -> HashSet<SocketAddr> {
+    let mut addrs = HashSet::new();
+    addrs.insert(SocketAddr::new(
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        listen_port,
+    ));
+    addrs.insert(SocketAddr::new(
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        listen_port,
+    ));
+    if let Some(ip) = outbound_local_ip("8.8.8.8:80", "0.0.0.0:0") {
+        addrs.insert(SocketAddr::new(ip, listen_port));
+    }
+    if let Some(ip) = outbound_local_ip("[2001:4860:4860::8888]:80", "[::]:0") {
+        addrs.insert(SocketAddr::new(ip, listen_port));
+    }
+    addrs
+}
+
+fn outbound_local_ip(remote_addr: &str, bind_addr: &str) -> Option<IpAddr> {
+    let socket = UdpSocket::bind(bind_addr).ok()?;
+    socket.connect(remote_addr).ok()?;
+    Some(socket.local_addr().ok()?.ip())
+}
+
+fn is_self_peer_id(local_peer_id: &[u8; 20], remote_peer_id: &[u8; 20]) -> bool {
+    local_peer_id == remote_peer_id
 }
 
 #[derive(Debug, Clone)]
@@ -4885,6 +4972,8 @@ fn peer_worker_loop(
     peer_queue: &Arc<Mutex<PeerQueue>>,
     allow_pex: bool,
     active_peers: &Arc<AtomicUsize>,
+    interested_peers: &Arc<AtomicUsize>,
+    upload_requests_served: &Arc<AtomicU64>,
     file_spans: &Arc<Vec<FileSpan>>,
     base_piece_length: u64,
     connect_cfg: ConnectionConfig,
@@ -4927,23 +5016,6 @@ fn peer_worker_loop(
             queue.finish(addr);
             break;
         }
-        active_peers.fetch_add(1, Ordering::SeqCst);
-        let geo_cc = GEOIP_DB
-            .get()
-            .and_then(|db| db.lookup(addr.ip()))
-            .map(|cc| cc.to_string());
-        update_ui(ui_state, |state| {
-            let active_count = active_peers.load(Ordering::SeqCst);
-            if state.current_id == Some(torrent_id) {
-                state.active_peers = active_count;
-            }
-            update_torrent_entry(state, torrent_id, |torrent| {
-                torrent.active_peers = active_count;
-                if let Some(cc) = geo_cc.as_deref() {
-                    add_peer_country(torrent, cc);
-                }
-            });
-        });
         log_info!("connecting to peer {addr}...");
 
         let peer_tag = peer_tags.fetch_add(1, Ordering::SeqCst);
@@ -4964,45 +5036,21 @@ fn peer_worker_loop(
             &limits,
             downloaded,
             uploaded,
+            active_peers,
+            interested_peers,
+            upload_requests_served,
             upload_manager,
             paused_flag,
             stop_flag,
             ui_state,
         );
 
-        active_peers.fetch_sub(1, Ordering::SeqCst);
         peer_slots.release();
         per_torrent_slots.release();
-        update_ui(ui_state, |state| {
-            let active_count = active_peers.load(Ordering::SeqCst);
-            if state.current_id == Some(torrent_id) {
-                state.active_peers = active_count;
-            }
-            update_torrent_entry(state, torrent_id, |torrent| {
-                torrent.active_peers = active_count;
-                if let Some(cc) = geo_cc.as_deref() {
-                    remove_peer_country(torrent, cc);
-                }
-            });
-        });
 
         {
             let mut queue = lock_or_recover(peer_queue);
-            queue.finish(addr);
-            match &result {
-                Ok(()) => {
-                    queue.clear_failure(addr);
-                }
-                Err(err) => {
-                    if is_retryable_peer_error(err) {
-                        if let Some(delay) = queue.note_failure(addr) {
-                            queue.schedule_retry(addr, delay);
-                        }
-                    } else {
-                        queue.clear_failure(addr);
-                    }
-                }
-            }
+            record_peer_result(&mut queue, addr, &result);
         }
 
         if let Err(err) = &result {
@@ -6784,6 +6832,9 @@ fn download_from_peer_concurrent(
     limits: &TransferLimits,
     downloaded: &Arc<AtomicU64>,
     uploaded: &Arc<AtomicU64>,
+    active_peers: &Arc<AtomicUsize>,
+    interested_peers: &Arc<AtomicUsize>,
+    upload_requests_served: &Arc<AtomicU64>,
     upload_manager: &Arc<UploadManager>,
     paused_flag: &Arc<AtomicBool>,
     stop_flag: &Arc<AtomicBool>,
@@ -6825,10 +6876,12 @@ fn download_from_peer_concurrent(
     // Reduce timeout for the main peer loop (need responsiveness for piece requests)
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
 
+    if is_self_peer_id(&peer_id, &handshake.peer_id) {
+        return Err("self peer".to_string());
+    }
+
     log_debug!("peer: {addr}");
     log_debug!("peer id: {}", hex(&handshake.peer_id));
-    upload_manager.register(peer_tag);
-    PEER_CONNECTED.fetch_add(1, Ordering::SeqCst);
 
     // Send bitfield first (BEP 3: must be first message after handshake)
     let (local_bitfield, have_pieces, mut seed_mode) = {
@@ -6885,6 +6938,10 @@ fn download_from_peer_concurrent(
     }
     // Flush all handshake messages (bitfield + ext + interested) together
     let _ = stream.flush();
+
+    upload_manager.register(peer_tag);
+    PEER_CONNECTED.fetch_add(1, Ordering::SeqCst);
+    let geo_cc = add_active_peer_session(ui_state, torrent_id, active_peers, addr);
 
     let mut reader = peer::MessageReader::new();
     let mut bitfield: Option<Vec<u8>> = None;
@@ -7261,7 +7318,7 @@ fn download_from_peer_concurrent(
                             }
                         }
                         peer::Message::Interested => {
-                            peer_interested = true;
+                            set_peer_interest(interested_peers, &mut peer_interested, true);
                             upload_manager.set_interested(peer_tag, true);
                             // Immediately unchoke if eligible (don't wait for next loop)
                             if am_choking
@@ -7274,7 +7331,7 @@ fn download_from_peer_concurrent(
                             }
                         }
                         peer::Message::NotInterested => {
-                            peer_interested = false;
+                            set_peer_interest(interested_peers, &mut peer_interested, false);
                             upload_manager.set_interested(peer_tag, false);
                         }
                         peer::Message::Choke => {
@@ -7316,6 +7373,7 @@ fn download_from_peer_concurrent(
                                     length,
                                     limits,
                                     uploaded,
+                                    upload_requests_served,
                                     upload_manager,
                                     peer_tag,
                                 ) {
@@ -7588,8 +7646,10 @@ fn download_from_peer_concurrent(
         let _ = p.remove_peer_bitfield(&bits);
     }
 
+    set_peer_interest(interested_peers, &mut peer_interested, false);
     upload_manager.unregister(peer_tag);
     PEER_DISCONNECTED.fetch_add(1, Ordering::SeqCst);
+    remove_active_peer_session(ui_state, torrent_id, active_peers, geo_cc.as_deref());
 
     result
 }
@@ -8098,16 +8158,43 @@ fn is_retryable_peer_error(err: &str) -> bool {
     if err.contains("wrong info hash") || err.contains("no needed pieces") {
         return false;
     }
-    err.contains("connect")
-        || err.contains("timeout")
+    if err.contains("connection refused")
+        || err.contains("peer closed connection")
+        || err.contains("network is unreachable")
+        || err.contains("no route to host")
+        || err.contains("self peer")
+    {
+        return false;
+    }
+    err.contains("timeout")
         || err.contains("timed out")
-        || err.contains("connection refused")
         || err.contains("connection reset")
         || err.contains("handshake read failed")
         || err.contains("handshake write failed")
-        || err.contains("message read failed")
         || err.contains("peer timed out")
         || err.contains("peer snubbed")
+        || err == "connect failed"
+}
+
+fn record_peer_result(queue: &mut PeerQueue, addr: SocketAddr, result: &Result<(), String>) {
+    queue.finish(addr);
+    match result {
+        Ok(()) => {
+            queue.clear_failure(addr);
+        }
+        Err(err) => {
+            if is_retryable_peer_error(err) {
+                if let Some(delay) = queue.note_failure(addr) {
+                    queue.schedule_retry(addr, delay);
+                } else {
+                    queue.ban_for(addr, Duration::from_secs(PEER_RETRY_EXHAUSTED_BAN_SECS));
+                }
+            } else {
+                queue.clear_failure(addr);
+                queue.ban(addr);
+            }
+        }
+    }
 }
 
 fn bitfield_has(bitfield: &[u8], index: usize) -> bool {
@@ -8365,8 +8452,7 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
         configure_keepalive(tcp);
     }
 
-    let (_handshake, context) = match inbound_handshake(&mut stream, &registry, inbound.encryption)
-    {
+    let (handshake, context) = match inbound_handshake(&mut stream, &registry, inbound.encryption) {
         Ok(result) => result,
         Err(err) => {
             let _ = err;
@@ -8374,9 +8460,14 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
             return;
         }
     };
+    if is_self_peer_id(&context.peer_id, &handshake.peer_id) {
+        log_debug!("dropping self peer {addr}");
+        return;
+    }
     let peer_tag = context.peer_tags.fetch_add(1, Ordering::SeqCst);
     context.upload_manager.register(peer_tag);
     PEER_CONNECTED.fetch_add(1, Ordering::SeqCst);
+    context.active_peers.fetch_add(1, Ordering::SeqCst);
 
     let mut reader = peer::MessageReader::new();
     let mut peer_interested = false;
@@ -8468,7 +8559,7 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
                 idle = 0;
                 match message {
                     peer::Message::Interested => {
-                        peer_interested = true;
+                        set_peer_interest(&context.interested_peers, &mut peer_interested, true);
                         context.upload_manager.set_interested(peer_tag, true);
                         // Immediately unchoke if eligible
                         if am_choking
@@ -8481,7 +8572,7 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
                         }
                     }
                     peer::Message::NotInterested => {
-                        peer_interested = false;
+                        set_peer_interest(&context.interested_peers, &mut peer_interested, false);
                         context.upload_manager.set_interested(peer_tag, false);
                     }
                     peer::Message::Request {
@@ -8500,6 +8591,7 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
                                 length,
                                 &context.limits,
                                 &context.uploaded,
+                                &context.upload_requests_served,
                                 &context.upload_manager,
                                 peer_tag,
                             ) {
@@ -8535,8 +8627,14 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
         }
     }
 
+    set_peer_interest(&context.interested_peers, &mut peer_interested, false);
     context.upload_manager.unregister(peer_tag);
     PEER_DISCONNECTED.fetch_add(1, Ordering::SeqCst);
+    let _ = context
+        .active_peers
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            Some(value.saturating_sub(1))
+        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8550,6 +8648,7 @@ fn handle_upload_request<W: Write>(
     length: u32,
     limits: &TransferLimits,
     uploaded: &Arc<AtomicU64>,
+    upload_requests_served: &Arc<AtomicU64>,
     upload_manager: &Arc<UploadManager>,
     peer_tag: u64,
 ) -> Result<(), String> {
@@ -8596,6 +8695,7 @@ fn handle_upload_request<W: Write>(
     .map_err(|err| format!("piece write failed: {err}"))?;
     uploaded.fetch_add(length as u64, Ordering::SeqCst);
     SESSION_UPLOADED_BYTES.fetch_add(length as u64, Ordering::SeqCst);
+    upload_requests_served.fetch_add(1, Ordering::SeqCst);
     upload_manager.record_upload(peer_tag, length as u64);
     Ok(())
 }
@@ -8999,6 +9099,50 @@ where
     }
 }
 
+fn port_mapping_status_message(protocol: &str, port: u16, result: &Result<(), String>) -> String {
+    match result {
+        Ok(()) => format!("mapped {protocol} on port {port}"),
+        Err(err) => format!("failed {protocol} on port {port}: {err}"),
+    }
+}
+
+fn record_port_mapping_result(
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    protocol: &str,
+    port: u16,
+    result: Result<(), String>,
+) {
+    let message = port_mapping_status_message(protocol, port, &result);
+    if result.is_ok() {
+        log_info!("{message}");
+    } else {
+        log_warn!("{message}");
+    }
+    update_ui(ui_state, |state| match protocol {
+        "nat-pmp" => state.natpmp_status = message,
+        "upnp" => state.upnp_status = message,
+        _ => {}
+    });
+}
+
+fn set_peer_interest(
+    interested_peers: &Arc<AtomicUsize>,
+    peer_interested: &mut bool,
+    interested: bool,
+) {
+    if *peer_interested == interested {
+        return;
+    }
+    *peer_interested = interested;
+    if interested {
+        interested_peers.fetch_add(1, Ordering::SeqCst);
+    } else {
+        let _ = interested_peers.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            Some(value.saturating_sub(1))
+        });
+    }
+}
+
 fn add_peer_country(torrent: &mut ui::UiTorrent, cc: &str) {
     if let Some(entry) = torrent
         .peer_country_counts
@@ -9021,6 +9165,91 @@ fn remove_peer_country(torrent: &mut ui::UiTorrent, cc: &str) {
         entry.1 = entry.1.saturating_sub(1);
     }
     torrent.peer_country_counts.retain(|(_, count)| *count > 0);
+}
+
+enum PeerCountryDelta<'a> {
+    Add(&'a str),
+    Remove(&'a str),
+    None,
+}
+
+#[cfg(test)]
+fn set_active_peer_count(
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    torrent_id: u64,
+    active_peers: &Arc<AtomicUsize>,
+) {
+    update_active_peer_ui(
+        ui_state,
+        torrent_id,
+        active_peers.load(Ordering::SeqCst),
+        PeerCountryDelta::None,
+    );
+}
+
+fn add_active_peer_session(
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    torrent_id: u64,
+    active_peers: &Arc<AtomicUsize>,
+    addr: SocketAddr,
+) -> Option<String> {
+    let active_count = active_peers.fetch_add(1, Ordering::SeqCst) + 1;
+    let geo_cc = GEOIP_DB
+        .get()
+        .and_then(|db| db.lookup(addr.ip()))
+        .map(|cc| cc.to_string());
+    update_active_peer_ui(
+        ui_state,
+        torrent_id,
+        active_count,
+        geo_cc
+            .as_deref()
+            .map(PeerCountryDelta::Add)
+            .unwrap_or(PeerCountryDelta::None),
+    );
+    geo_cc
+}
+
+fn remove_active_peer_session(
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    torrent_id: u64,
+    active_peers: &Arc<AtomicUsize>,
+    geo_cc: Option<&str>,
+) {
+    let previous = active_peers
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            Some(value.saturating_sub(1))
+        })
+        .unwrap_or_else(|value| value);
+    update_active_peer_ui(
+        ui_state,
+        torrent_id,
+        previous.saturating_sub(1),
+        geo_cc
+            .map(PeerCountryDelta::Remove)
+            .unwrap_or(PeerCountryDelta::None),
+    );
+}
+
+fn update_active_peer_ui(
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    torrent_id: u64,
+    active_count: usize,
+    country_delta: PeerCountryDelta<'_>,
+) {
+    update_ui(ui_state, |state| {
+        if state.current_id == Some(torrent_id) {
+            state.active_peers = active_count;
+        }
+        update_torrent_entry(state, torrent_id, |torrent| {
+            torrent.active_peers = active_count;
+            match country_delta {
+                PeerCountryDelta::Add(cc) => add_peer_country(torrent, cc),
+                PeerCountryDelta::Remove(cc) => remove_peer_country(torrent, cc),
+                PeerCountryDelta::None => {}
+            }
+        });
+    });
 }
 
 fn update_torrent_entry<F>(state: &mut ui::UiState, torrent_id: u64, update: F)
@@ -9417,6 +9646,9 @@ mod core_helpers_tests {
             },
             downloaded: Arc::new(AtomicU64::new(0)),
             uploaded: Arc::new(AtomicU64::new(0)),
+            active_peers: Arc::new(AtomicUsize::new(0)),
+            interested_peers: Arc::new(AtomicUsize::new(0)),
+            upload_requests_served: Arc::new(AtomicU64::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
             stop_requested: Arc::new(AtomicBool::new(false)),
             upload_manager: Arc::new(UploadManager::new(UPLOAD_SLOTS)),
@@ -9458,6 +9690,7 @@ mod core_helpers_tests {
             block.len() as u32,
             &context.limits,
             &context.uploaded,
+            &context.upload_requests_served,
             &context.upload_manager,
             99,
         )
@@ -9478,8 +9711,52 @@ mod core_helpers_tests {
             SESSION_UPLOADED_BYTES.load(Ordering::SeqCst),
             block.len() as u64
         );
+        assert_eq!(context.upload_requests_served.load(Ordering::SeqCst), 1);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn port_mapping_status_message_reports_success_and_failure() {
+        assert_eq!(
+            port_mapping_status_message("nat-pmp", 6881, &Ok(())),
+            "mapped nat-pmp on port 6881"
+        );
+        assert_eq!(
+            port_mapping_status_message("upnp", 6881, &Err("no gateway".to_string())),
+            "failed upnp on port 6881: no gateway"
+        );
+    }
+
+    #[test]
+    fn active_peer_count_updates_target_torrent_from_handshaken_counter() {
+        let state = Arc::new(Mutex::new(ui::UiState::default()));
+        let ui_state = Some(Arc::clone(&state));
+        let active_peers = Arc::new(AtomicUsize::new(3));
+
+        update_ui(&ui_state, |state| {
+            state.current_id = Some(7);
+            state.active_peers = 0;
+            state.torrents.push(ui::UiTorrent {
+                id: 7,
+                name: "selected".to_string(),
+                active_peers: 0,
+                ..Default::default()
+            });
+            state.torrents.push(ui::UiTorrent {
+                id: 8,
+                name: "other".to_string(),
+                active_peers: 9,
+                ..Default::default()
+            });
+        });
+
+        set_active_peer_count(&ui_state, 7, &active_peers);
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.active_peers, 3);
+        assert_eq!(state.torrents[0].active_peers, 3);
+        assert_eq!(state.torrents[1].active_peers, 9);
     }
 
     #[test]
@@ -9838,6 +10115,85 @@ mod core_helpers_tests {
     }
 
     #[test]
+    fn peer_queue_rejects_local_lpd_self_addresses() {
+        let local_addrs = ["192.168.1.10:6881".parse().unwrap()].into_iter().collect();
+        let mut queue = PeerQueue::new_with_local_addrs(None, local_addrs);
+
+        let added = queue.enqueue_with_source(
+            [
+                "192.168.1.10:6881".parse().unwrap(),
+                "192.168.1.20:6881".parse().unwrap(),
+            ],
+            PeerSource::Lpd,
+        );
+
+        assert_eq!(added, 1);
+        assert_eq!(queue.known_len(), 1);
+        assert_eq!(queue.pop(), Some("192.168.1.20:6881".parse().unwrap()));
+    }
+
+    #[test]
+    fn peer_retry_policy_does_not_requeue_hard_failures() {
+        assert!(is_retryable_peer_error(
+            "connect 198.51.100.10:6881 failed: connection timed out"
+        ));
+        assert!(!is_retryable_peer_error(
+            "connect 198.51.100.10:6881 failed: Connection refused (os error 61)"
+        ));
+        assert!(!is_retryable_peer_error(
+            "message read failed: io error: peer closed connection"
+        ));
+    }
+
+    #[test]
+    fn hard_peer_failure_is_banned_from_immediate_requeue() {
+        let addr: SocketAddr = "8.8.8.8:6881".parse().unwrap();
+        let mut queue = PeerQueue::new(None);
+        assert_eq!(queue.enqueue_with_source([addr], PeerSource::Tracker), 1);
+        assert_eq!(queue.pop(), Some(addr));
+
+        record_peer_result(
+            &mut queue,
+            addr,
+            &Err("connect 8.8.8.8:6881 failed: Connection refused (os error 61)".to_string()),
+        );
+
+        assert_eq!(queue.enqueue_with_source([addr], PeerSource::Tracker), 0);
+        assert_eq!(queue.pop(), None);
+    }
+
+    #[test]
+    fn repeated_retryable_peer_failures_eventually_ban_peer() {
+        let addr: SocketAddr = "8.8.4.4:6881".parse().unwrap();
+        let mut queue = PeerQueue::new(None);
+        assert_eq!(queue.enqueue_with_source([addr], PeerSource::Tracker), 1);
+        assert_eq!(queue.pop(), Some(addr));
+
+        for _ in 0..MAX_PEER_RETRIES {
+            record_peer_result(
+                &mut queue,
+                addr,
+                &Err("connect 8.8.4.4:6881 failed: connection timed out".to_string()),
+            );
+        }
+
+        assert!(queue.is_banned(addr));
+        assert!(!queue.is_deferred(addr));
+        assert_eq!(queue.enqueue_with_source([addr], PeerSource::Tracker), 0);
+        assert_eq!(queue.pop(), None);
+    }
+
+    #[test]
+    fn matching_peer_id_is_self_connection() {
+        let local = [7u8; 20];
+        let mut remote = local;
+        assert!(is_self_peer_id(&local, &remote));
+
+        remote[19] = 8;
+        assert!(!is_self_peer_id(&local, &remote));
+    }
+
+    #[test]
     fn request_queue_depth_tracks_peer_rate() {
         assert_eq!(request_queue_depth_for_rate(DEFAULT_PEER_RATE_BPS), 64);
         assert_eq!(
@@ -9857,6 +10213,14 @@ mod core_helpers_tests {
         assert_eq!(settings.metadata_peer_limit(), 20);
         assert_eq!(settings.max_peers_global(), 80);
         assert_eq!(settings.max_peers_torrent(), 12);
+    }
+
+    #[test]
+    fn reannounce_intervals_do_not_flood_trackers_on_stalls() {
+        let no_peer_secs = std::hint::black_box(NO_PEER_REANNOUNCE_SECS);
+        let stall_secs = std::hint::black_box(STALL_REANNOUNCE_SECS);
+        assert!(no_peer_secs >= 30);
+        assert!(stall_secs >= 30);
     }
 
     #[test]

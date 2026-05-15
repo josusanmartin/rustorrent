@@ -464,9 +464,6 @@ fn handle_response(
         Some(Value::Bytes(tx)) => tx.clone(),
         _ => return,
     };
-    let Some(pending_query) = pending.remove(&tx) else {
-        return;
-    };
     let Some(Value::Dict(r)) = dict_get(dict, b"r") else {
         return;
     };
@@ -481,29 +478,38 @@ fn handle_response(
             rt.insert(node);
         }
     }
-    if let Some(Value::List(values)) = dict_get(r, b"values") {
-        let mut peers = Vec::new();
-        for value in values {
-            if let Value::Bytes(bytes) = value {
-                peers.extend(decode_peers(bytes));
+
+    let pending_query = pending.remove(&tx);
+    if let Some(pending_query) = pending_query {
+        if let Some(Value::List(values)) = dict_get(r, b"values") {
+            let mut peers = Vec::new();
+            for value in values {
+                if let Value::Bytes(bytes) = value {
+                    peers.extend(decode_peers(bytes));
+                }
+            }
+            if !peers.is_empty() {
+                peer_store
+                    .entry(pending_query.info_hash)
+                    .or_default()
+                    .extend(peers.iter().cloned());
+                if let Some(entry) = torrents.get(&pending_query.info_hash) {
+                    let _ = entry.peers_tx.send(peers);
+                }
             }
         }
-        if !peers.is_empty() {
-            peer_store
-                .entry(pending_query.info_hash)
-                .or_default()
-                .extend(peers.iter().cloned());
+        if let Some(Value::Bytes(token)) = dict_get(r, b"token") {
             if let Some(entry) = torrents.get(&pending_query.info_hash) {
-                let _ = entry.peers_tx.send(peers);
+                let tx = next_tx_id();
+                let announce = build_announce_peer_query(
+                    node_id,
+                    pending_query.info_hash,
+                    entry.port,
+                    token,
+                    &tx,
+                );
+                let _ = socket.send_to(&announce, pending_query.addr);
             }
-        }
-    }
-    if let Some(Value::Bytes(token)) = dict_get(r, b"token") {
-        if let Some(entry) = torrents.get(&pending_query.info_hash) {
-            let tx = next_tx_id();
-            let announce =
-                build_announce_peer_query(node_id, pending_query.info_hash, entry.port, token, &tx);
-            let _ = socket.send_to(&announce, pending_query.addr);
         }
     }
 
@@ -922,6 +928,45 @@ mod tests {
 
         let encoded = rt.encode_closest_nodes(&target);
         assert_eq!(encoded.len(), 26 * 8);
+    }
+
+    #[test]
+    fn response_without_pending_query_still_imports_bootstrap_nodes() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = "198.51.100.2:6881".parse().unwrap();
+        let mut rt = RoutingTable::new([0u8; 20]);
+        let mut pending = HashMap::new();
+        let mut peer_store = HashMap::new();
+        let torrents = HashMap::new();
+        let node_id = [9u8; 20];
+
+        let mut compact_node = Vec::new();
+        compact_node.extend_from_slice(&[3u8; 20]);
+        compact_node.extend_from_slice(&[203, 0, 113, 10]);
+        compact_node.extend_from_slice(&6881u16.to_be_bytes());
+        let dict = vec![
+            (b"t".to_vec(), Value::Bytes(b"aa".to_vec())),
+            (
+                b"r".to_vec(),
+                Value::Dict(vec![
+                    (b"id".to_vec(), Value::Bytes([2u8; 20].to_vec())),
+                    (b"nodes".to_vec(), Value::Bytes(compact_node)),
+                ]),
+            ),
+        ];
+
+        handle_response(
+            &dict,
+            &addr,
+            &mut rt,
+            &mut pending,
+            &socket,
+            &node_id,
+            &mut peer_store,
+            &torrents,
+        );
+
+        assert_eq!(rt.node_count(), 2);
     }
 
     #[test]
