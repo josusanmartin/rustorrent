@@ -426,13 +426,15 @@ class HolepunchTests(unittest.TestCase):
         with first, second:
             first_addr = first.getsockname()
             second_addr = second.getsockname()
-            # Both connections register with the relay asynchronously; until
-            # the second one has, the answer is "not connected" (error 2).
+            # Both connections register with the relay asynchronously: until
+            # the second one has, the answer is "not connected" (error 2), and
+            # until its extension handshake is read, "no support" (error 3).
+            pending = {holepunch_msg(2, second_addr, code) for code in (2, 3)}
             deadline = time.monotonic() + 10
             while True:
                 send(first, 20, bytes([their_id]) + holepunch_msg(0, second_addr))
                 reply = self.next_holepunch(first, 5)
-                if reply != holepunch_msg(2, second_addr, 2) or time.monotonic() > deadline:
+                if reply not in pending or time.monotonic() > deadline:
                     break
                 time.sleep(.1)
             self.assertEqual(reply, holepunch_msg(1, second_addr))
