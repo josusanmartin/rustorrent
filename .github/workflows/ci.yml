@@ -104,8 +104,13 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          ./macos/package_app.sh --dmg --output "$RUNNER_TEMP/rustorrent-dist"
           ./macos/package_app.sh --universal --dmg --output "$RUNNER_TEMP/rustorrent-dist"
-          hdiutil verify "$RUNNER_TEMP/rustorrent-dist/"*.dmg
+          for dmg in "$RUNNER_TEMP/rustorrent-dist/"*.dmg; do hdiutil verify "$dmg"; done
+          ls -l "$RUNNER_TEMP/rustorrent-dist"
+          # The Apple silicon download must stay under 1 MB.
+          size="$(stat -f%z "$RUNNER_TEMP/rustorrent-dist/"*-arm64.dmg)"
+          test "$size" -lt 1000000 || { echo "arm64 DMG is $size bytes, over 1 MB"; exit 1; }
           codesign --verify --deep --strict target/macos-app/build/Rustorrent.app
           test -f target/macos-app/build/Rustorrent.app/Contents/MacOS/rustorrent
           test -f target/macos-app/build/Rustorrent.app/Contents/MacOS/rustorrent-bin

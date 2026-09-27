@@ -46,6 +46,8 @@ jobs:
           cd "$RUNNER_TEMP/dist"
           for dmg in *.dmg; do hdiutil verify "$dmg"; done
           ls -l
+          size="$(stat -f%z *-arm64.dmg)"
+          test "$size" -lt 1000000 || { echo "arm64 DMG is $size bytes, over 1 MB"; exit 1; }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos

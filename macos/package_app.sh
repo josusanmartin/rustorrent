@@ -206,9 +206,11 @@ if $CREATE_DMG; then
   rm -f "$DMG_PATH"
 
   echo "==> Creating DMG artifact"
+  # LZMA (ULMO, macOS 10.15+) packs the app noticeably tighter than bzip2,
+  # which keeps the Apple silicon DMG under 1 MB.
   hdiutil create -volname "$APP_NAME" \
     -srcfolder "$DMG_TEMP" \
-    -fs HFS+ -ov -format UDBZ \
+    -fs HFS+ -ov -format ULMO \
     "$DMG_PATH" >/dev/null
   rm -rf "$DMG_TEMP"
   echo "DMG artifact: $DMG_PATH"
