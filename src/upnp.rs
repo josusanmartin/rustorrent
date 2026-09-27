@@ -11,17 +11,37 @@ const SSDP_TIMEOUT: Duration = Duration::from_secs(1);
 pub fn map_port(port: u16) -> Result<crate::PortMapping, String> {
     let location = discover_gateway()
         .ok_or_else(|| "gateway did not answer UPnP discovery after 3 attempts".to_string())?;
-    map_port_at(&location, port)
+    map_port_at(&location, port, None)
 }
 
-fn map_port_at(location: &str, port: u16) -> Result<crate::PortMapping, String> {
+/// Maps the port on the router in front of ours: `client` is our router's
+/// address on that outer network, where the outer router must forward to.
+pub fn map_port_upstream(
+    gateway: Ipv4Addr,
+    client: Ipv4Addr,
+    port: u16,
+) -> Result<crate::PortMapping, String> {
+    // Multicast discovery does not cross our router, so ask the gateway directly.
+    let location = discover_gateway_at(SocketAddrV4::new(gateway, 1900), 2, SSDP_TIMEOUT)
+        .ok_or_else(|| format!("{gateway} did not answer UPnP discovery"))?;
+    map_port_at(&location, port, Some(client))
+}
+
+fn map_port_at(
+    location: &str,
+    port: u16,
+    client: Option<Ipv4Addr>,
+) -> Result<crate::PortMapping, String> {
     let location = location.to_string();
     let description = http::get_same_origin(&location, 512 * 1024)?;
     let control = parse_control_url(&description, &location)
         .ok_or_else(|| "upnp control url not found".to_string())?;
     let gateway =
         http::url_host_ip(&control.url).ok_or_else(|| "invalid gateway address".to_string())?;
-    let client = local_ip(gateway).ok_or_else(|| "no local route to the gateway".to_string())?;
+    let client = match client {
+        Some(client) => client.to_string(),
+        None => local_ip(gateway).ok_or_else(|| "no local route to the gateway".to_string())?,
+    };
 
     for protocol in ["TCP", "UDP"] {
         // A timed lease is renewed below; some routers only take permanent ones.
@@ -101,7 +121,7 @@ fn discover_gateway_at(
         for version in [1, 2] {
             let msg = format!(
                 "M-SEARCH * HTTP/1.1\r\n\
-HOST: 239.255.255.250:1900\r\n\
+HOST: {discovery_addr}\r\n\
 MAN: \"ssdp:discover\"\r\n\
 MX: 1\r\n\
 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:{version}\r\n\
@@ -382,7 +402,7 @@ mod tests {
     #[test]
     fn map_port_falls_back_to_a_permanent_lease_and_reads_the_public_address() {
         let (location, router) = fake_router("725");
-        let mapping = map_port_at(&location, 51413).unwrap();
+        let mapping = map_port_at(&location, 51413, None).unwrap();
         assert_eq!(mapping.external_port, 51413);
         assert_eq!(mapping.external_ip, Some(Ipv4Addr::new(100, 64, 0, 9)));
         assert_eq!(
@@ -394,7 +414,7 @@ mod tests {
     #[test]
     fn map_port_explains_a_port_taken_by_another_device() {
         let (location, router) = fake_router("718");
-        let err = map_port_at(&location, 51413).err().unwrap();
+        let err = map_port_at(&location, 51413, None).err().unwrap();
         assert!(err.contains("already forwards port 51413"), "{err}");
         assert_eq!(router.join().unwrap(), ["timed"]);
     }

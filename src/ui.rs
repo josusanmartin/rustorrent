@@ -184,6 +184,8 @@ pub struct UiState {
     pub incoming_port: u16,
     pub natpmp_status: String,
     pub upnp_status: String,
+    /// Port mapping on the router in front of ours, when there are two.
+    pub upstream_status: String,
     /// The public address the router reports for itself.
     pub router_external_ip: String,
     /// The public address trackers saw our announces come from (BEP 24).
@@ -2391,6 +2393,7 @@ fn push_session_fields(json: &mut JsonObject<'_>, state: &UiState) {
         .num("incoming_port", state.incoming_port)
         .str("natpmp_status", &state.natpmp_status)
         .str("upnp_status", &state.upnp_status)
+        .str("upstream_status", &state.upstream_status)
         .str("router_external_ip", &state.router_external_ip)
         .str("tracker_external_ip", &state.tracker_external_ip)
         .num("inbound_public_peers", state.inbound_public_peers)

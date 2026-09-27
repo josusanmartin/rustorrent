@@ -14,6 +14,16 @@ const MAX_ROUTE_TABLE_BYTES: usize = 1024 * 1024;
 
 pub fn map_port(port: u16, lifetime: u32) -> Result<crate::PortMapping, String> {
     let gateway = default_gateway().ok_or_else(|| "no gateway found".to_string())?;
+    map_port_via(gateway, port, lifetime)
+}
+
+/// Maps the port on a given gateway. Behind two routers this reaches the
+/// outer one, which sees our requests as coming from the inner router.
+pub fn map_port_via(
+    gateway: Ipv4Addr,
+    port: u16,
+    lifetime: u32,
+) -> Result<crate::PortMapping, String> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|err| err.to_string())?;
     let addr = SocketAddrV4::new(gateway, NATPMP_PORT);
 

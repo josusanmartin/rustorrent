@@ -673,7 +673,12 @@ function reach(){
   if(fw==='block-all')return['err','Firewall blocks incoming connections','“Block all incoming connections” is on in System Settings › Network › Firewall, so peers cannot reach you. Turn it off to seed.','Blocked by firewall'];
   if(fw==='blocked'||fw==='unlisted')return['err','The macOS firewall is blocking Rustorrent','Peers cannot connect to you, so seeding waits. Allow Rustorrent to accept incoming connections.','Blocked by firewall',1];
   if(n)return['ok','Reachable',`${plural(n,'peer')} connected to you from the internet this session.`,'Reachable'];
-  if(sharedIp(rip)||rip&&tip&&!tip.includes(':')&&tip!==rip)return['warn','Behind a shared internet address',`Your router's internet address${rip?` (${rip})`:''} is not your public one${tip?` (${tip})`:''}. Your provider or a second router sits in front of it, so peers cannot connect in. Uploads still reach peers that Rustorrent connects to.`,'Not reachable'];
+  const ups=G.upstream_status||'',cgnat=/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(rip||'')||!sharedIp(rip)&&rip&&tip&&!tip.includes(':')&&tip!==rip;
+  if(cgnat)return['warn','Behind your provider\'s shared address',`Your internet provider shares one public address between customers (carrier-grade NAT), so peers cannot connect in and no router setting can change that. Ask your provider for a public IPv4 address. Uploads still reach peers that Rustorrent connects to.`,'Not reachable'];
+  if(sharedIp(rip)){
+    if(ups.startsWith('mapped '))return['warn','Port open on both routers',`Your router sits behind another router or modem, and Rustorrent opened ${ups.match(/port \d+/)[0]} on both. Waiting for the first peer to connect in.`,'Waiting for peers'];
+    return['warn','Behind a second router',`Your router's internet address (${rip}) is private, so another router or your provider's modem sits in front of it${ups?' and did not accept a request to open the port':''}. On that device (usually at ${rip.replace(/\.\d+$/,'.1')}): turn on bridge mode, or forward port ${port} (TCP and UDP) to ${rip}, or make ${rip} its DMZ host. Until then, uploads only reach peers that Rustorrent connects to.`,'Not reachable'];
+  }
   const m=maps.find(m=>m&&m.startsWith('mapped '));
   if(m)return['warn','Port open on your router',`Your router forwards ${m.match(/port \d+/)[0]} to Rustorrent over ${m.includes('upnp')?'UPnP':'NAT-PMP'}. Waiting for the first peer to connect in.`,'Waiting for peers'];
   if(maps.some(m=>m==='pending'))return['warn','Checking your router…','','Checking…'];

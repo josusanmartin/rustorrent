@@ -160,6 +160,14 @@ mod natpmp {
     pub fn map_port(_port: u16, _lifetime: u32) -> Result<crate::PortMapping, String> {
         Err("natpmp disabled".to_string())
     }
+
+    pub fn map_port_via(
+        _gateway: std::net::Ipv4Addr,
+        _port: u16,
+        _lifetime: u32,
+    ) -> Result<crate::PortMapping, String> {
+        Err("natpmp disabled".to_string())
+    }
 }
 
 #[cfg(not(feature = "upnp"))]
@@ -167,14 +175,24 @@ mod upnp {
     pub fn map_port(_port: u16) -> Result<crate::PortMapping, String> {
         Err("upnp disabled".to_string())
     }
+
+    pub fn map_port_upstream(
+        _gateway: std::net::Ipv4Addr,
+        _client: std::net::Ipv4Addr,
+        _port: u16,
+    ) -> Result<crate::PortMapping, String> {
+        Err("upnp disabled".to_string())
+    }
 }
 
-/// The port trackers and the DHT should tell other peers to connect to.
+/// The port trackers and the DHT should tell other peers to connect to: the
+/// outermost router's mapping wins, since that is where peers arrive.
 pub(crate) fn announce_port(listen_port: u16) -> u16 {
-    match MAPPED_EXTERNAL_PORT.load(Ordering::Relaxed) {
-        0 => listen_port,
-        port => port,
-    }
+    [&UPSTREAM_EXTERNAL_PORT, &MAPPED_EXTERNAL_PORT]
+        .iter()
+        .map(|port| port.load(Ordering::Relaxed))
+        .find(|port| *port != 0)
+        .unwrap_or(listen_port)
 }
 
 #[cfg(not(feature = "utp"))]
@@ -405,6 +423,9 @@ static PEER_DISCONNECTED: AtomicU64 = AtomicU64::new(0);
 /// External port a router mapped for us when it differs from the listen port;
 /// 0 means peers reach us on the listen port itself.
 static MAPPED_EXTERNAL_PORT: AtomicU16 = AtomicU16::new(0);
+/// External port on the router in front of ours (double NAT), or 0.
+static UPSTREAM_EXTERNAL_PORT: AtomicU16 = AtomicU16::new(0);
+static UPSTREAM_MAPPING_STARTED: AtomicBool = AtomicBool::new(false);
 /// Peers with public addresses that connected to us: proof that the incoming
 /// port is reachable from the internet.
 static INBOUND_PUBLIC_PEERS: AtomicU64 = AtomicU64::new(0);
@@ -13593,6 +13614,44 @@ fn saved_listen_port(download_dir: &Path) -> u16 {
     port
 }
 
+/// Our router's own internet address is private, so another router or the
+/// provider's modem sits in front of it. Ask that device to forward the port
+/// to our router, which already forwards it to us.
+fn start_upstream_mapping(
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    port: u16,
+    router_ip: std::net::Ipv4Addr,
+) {
+    if UPSTREAM_MAPPING_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let ui_state = ui_state.clone();
+    spawn_detached("upstream-mapping", move || {
+        run_port_mapping_with_retries(
+            &ui_state,
+            "upstream",
+            port,
+            &[Duration::from_secs(30), Duration::from_secs(120)],
+            || map_upstream_port(port, router_ip),
+        );
+    });
+}
+
+fn map_upstream_port(port: u16, router_ip: std::net::Ipv4Addr) -> Result<PortMapping, String> {
+    let gateway = upstream_gateway_guess(router_ip);
+    natpmp::map_port_via(gateway, port, 3600).or_else(|natpmp_error| {
+        upnp::map_port_upstream(gateway, router_ip, port).map_err(|upnp_error| {
+            format!("{gateway} refused NAT-PMP ({natpmp_error}) and UPnP ({upnp_error})")
+        })
+    })
+}
+
+/// Modems and provider routers almost always sit at .1 of their network.
+fn upstream_gateway_guess(router_ip: std::net::Ipv4Addr) -> std::net::Ipv4Addr {
+    let [a, b, c, _] = router_ip.octets();
+    std::net::Ipv4Addr::new(a, b, c, 1)
+}
+
 fn port_mapping_status_message(
     protocol: &str,
     port: u16,
@@ -13616,15 +13675,22 @@ fn record_port_mapping_result(
 ) {
     let message = port_mapping_status_message(protocol, port, &result);
     if let Ok(mapping) = result {
-        // Peers must be told the router's port, which can differ from ours.
-        let external = if mapping.external_port == port {
-            0
+        if protocol == "upstream" {
+            UPSTREAM_EXTERNAL_PORT.store(mapping.external_port, Ordering::Relaxed);
         } else {
-            mapping.external_port
-        };
-        MAPPED_EXTERNAL_PORT.store(external, Ordering::Relaxed);
-        if let Some(ip) = mapping.external_ip {
-            update_ui(ui_state, |state| state.router_external_ip = ip.to_string());
+            // Peers must be told the router's port, which can differ from ours.
+            let external = if mapping.external_port == port {
+                0
+            } else {
+                mapping.external_port
+            };
+            MAPPED_EXTERNAL_PORT.store(external, Ordering::Relaxed);
+            if let Some(ip) = mapping.external_ip {
+                update_ui(ui_state, |state| state.router_external_ip = ip.to_string());
+                if ip.is_private() {
+                    start_upstream_mapping(ui_state, port, ip);
+                }
+            }
         }
     }
     if result.is_ok() {
@@ -13643,6 +13709,7 @@ fn set_port_mapping_status(
     update_ui(ui_state, |state| match protocol {
         "nat-pmp" => state.natpmp_status = message,
         "upnp" => state.upnp_status = message,
+        "upstream" => state.upstream_status = message,
         _ => {}
     });
 }
@@ -15713,6 +15780,14 @@ mod core_helpers_tests {
         assert_eq!(context.upload_requests_served.load(Ordering::SeqCst), 1);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upstream_mapping_targets_the_outer_network_gateway() {
+        assert_eq!(
+            upstream_gateway_guess("192.168.100.18".parse().unwrap()),
+            "192.168.100.1".parse::<std::net::Ipv4Addr>().unwrap()
+        );
     }
 
     #[test]
