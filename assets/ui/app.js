@@ -119,12 +119,12 @@ $('app').outerHTML=`<div class="app" id="app">
  <section class="view" id="v-search" aria-labelledby="title" hidden><div class="pad">
   <form class="sform" data-f="search"><input id="sq" class="in" type="search" aria-label="Search query" placeholder="Search with your plugins" autocomplete="off"><select id="scat" class="in" aria-label="Category">${['All categories','Anime','Books','Games','Movies','Music','Pictures','Software','TV'].map((c,i)=>`<option value="${i?c.toLowerCase():'all'}">${c}</option>`).join('')}</select><button class="btn primary" id="sGo">Search</button></form>
   <p class="muted gap" id="sStatus">Loading search plugins…</p>
-  <div class="note" id="sWarn" hidden><b>No search plugins installed.</b> Rustorrent doesn't ship with search providers. Install a public plugin to start searching.<br><button class="btn" data-a="plugins">Manage plugins</button></div>
+  <div class="note" id="sWarn" hidden><b>No search plugins installed.</b> Install the recommended plugins, the ones qBittorrent ships and its project maintains, or pick your own.<br><button class="btn primary" data-a="precommend">Install recommended plugins</button> <button class="btn" data-a="plugins">Choose plugins</button></div>
   <div id="sResults"></div>
   <details class="card gap" id="plugins"><summary>Plugins</summary>
    <p class="muted">Search plugins run third-party Python code on this computer. Install only plugins you trust.</p>
    <div class="list" id="pList"></div>
-   <form class="inline" data-f="purl"><input id="pUrl" class="in" type="url" aria-label="Plugin URL" placeholder="https://…/plugin.py"><button class="btn">Install</button><label class="btn">Upload .py<input id="pFile" class="vh" type="file" accept=".py"></label><button class="btn" type="button" data-a="pupdate">Update all</button></form>
+   <form class="inline" data-f="purl"><input id="pUrl" class="in" type="url" aria-label="Plugin URL" placeholder="https://…/plugin.py"><button class="btn">Install</button><label class="btn">Upload .py<input id="pFile" class="vh" type="file" accept=".py"></label><button class="btn" type="button" data-a="pupdate">Update all</button><button class="btn" type="button" data-a="precommend" id="pRec" hidden>Install recommended</button></form>
    <div class="sect"><h3>Community catalog <button class="ib" data-a="pcat" aria-label="Refresh catalog" title="Refresh catalog">${ic('recheck')}</button></h3>
    <input id="cFilter" class="in wide" type="search" aria-label="Filter catalog" placeholder="Filter plugins"><p class="muted gap" id="cMeta"></p><div class="list scroll" id="cList"></div></div>
   </details>
@@ -608,7 +608,7 @@ async function pluginsChanged(){await loadSearch();if(catalog)loadCatalog()}
 function renderSearch(){
   const plugins=(S.plugins||[]).filter(p=>p.module!=='__init__'),ready=plugins.filter(p=>p.healthy).length,on=enabledPlugins(),res=S.results||[];
   if(S.last_started_at&&S.last_started_at!==sStarted){sStarted=S.last_started_at;added.clear()}
-  $('sWarn').hidden=ready>0||!!S.loading;
+  $('sWarn').hidden=ready>0||!!S.loading;$('pRec').hidden=!S.recommended_missing;$('sStatus').hidden=!$('sWarn').hidden;
   txt($('sStatus'),S.loading?'Loading search plugins…':S.busy?'Searching…':S.last_error||S.plugin_error||(res.length?`${plural(res.length,'result')} from ${plural(on.length,'plugin')}.`
     :ready?`Ready to search with ${on.length===ready?'all ':''}${plural(on.length,'plugin')}.`:'Install a plugin to start searching.'));
   $('sGo').disabled=!!S.busy;txt($('sGo'),S.busy?'Searching…':'Search');
@@ -722,6 +722,7 @@ const CLICK={
   sadd:el=>{el.disabled=true;post('/search/add-result',q({index:el.dataset.index,dir:G.download_dir||'',prealloc:G.preallocate?1:0}))
     .then(()=>{added.add(el.dataset.index);txt(el,'Added');el.classList.remove('primary');toast('Torrent added',el.dataset.name)},e=>{el.disabled=false;toast('Could not add result',e.message,true)})},
   punins:el=>{if(confirm(`Remove search plugin ${el.dataset.module}?`))act('/search/remove-plugin',{module:el.dataset.module},'Plugin removed').then(pluginsChanged)},
+  precommend:el=>{if(!trust('the recommended plugins (EZTV, LimeTorrents, The Pirate Bay, SolidTorrents, TorLock, TorrentProject and Torrents.csv, maintained by the qBittorrent project)'))return;for(const b of document.querySelectorAll('[data-a=precommend]')){b.disabled=true;b.dataset.label=b.textContent;txt(b,'Installing…')}act('/search/install-recommended',null,'Recommended plugins installed').then(pluginsChanged).finally(()=>{for(const b of document.querySelectorAll('[data-a=precommend]')){b.disabled=false;txt(b,b.dataset.label)}})},
   pinstall:el=>{if(!el.dataset.url||!trust('this plugin'))return;el.disabled=true;txt(el,'Installing…');act('/search/install-url',{url:el.dataset.url},'Plugin installed').then(pluginsChanged)},
   pupdate:async()=>{
     const urls=(catalog||[]).filter(x=>x.installed&&x.download_url).map(x=>x.download_url);

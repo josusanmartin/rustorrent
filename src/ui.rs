@@ -564,6 +564,9 @@ fn handle_connection(
             "/rss/add-rule" => handle_rss_add_rule(&request, &cmd_tx).map(|_| None),
             "/rss/remove-rule" => handle_rss_remove_rule(&request, &cmd_tx).map(|_| None),
             "/search/install-url" => handle_search_install_url(&request).map(|_| None),
+            "/search/install-recommended" => {
+                crate::search::install_recommended_plugins().map(|_| None)
+            }
             "/search/install-plugin" => {
                 handle_search_install_plugin(&request, &query).map(|_| None)
             }
@@ -709,6 +712,7 @@ fn post_body_limit(path: &str) -> Option<usize> {
         | "/torrent/delete"
         | "/select-download-dir"
         | "/network/allow-firewall"
+        | "/search/install-recommended"
         | "/torrent/recheck" => Some(0),
         _ => None,
     }

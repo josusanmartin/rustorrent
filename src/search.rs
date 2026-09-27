@@ -26,6 +26,19 @@ const CATALOG_CACHE_SECS: u64 = 6 * 60 * 60;
 const CATALOG_URL: &str =
     "https://raw.githubusercontent.com/qbittorrent/search-plugins/master/wiki/Unofficial-search-plugins.mediawiki";
 static NETWORK_ENABLED: AtomicBool = AtomicBool::new(true);
+/// The plugins qBittorrent itself installs, maintained by the qBittorrent
+/// project. Jackett is left out because it needs a separately run server.
+pub const RECOMMENDED_PLUGINS: [&str; 7] = [
+    "piratebay",
+    "limetorrents",
+    "eztv",
+    "solidtorrents",
+    "torlock",
+    "torrentproject",
+    "torrentscsv",
+];
+const OFFICIAL_PLUGIN_BASE: &str =
+    "https://raw.githubusercontent.com/qbittorrent/search-plugins/master/nova3/engines/";
 
 pub fn set_network_enabled(enabled: bool) {
     NETWORK_ENABLED.store(enabled, Ordering::Release);
@@ -492,6 +505,13 @@ pub fn status_json() -> String {
         "loading",
         &(state.python_available && !state.plugins_scanned),
     );
+    out.raw(
+        "recommended_missing",
+        &RECOMMENDED_PLUGINS
+            .iter()
+            .filter(|module| !state.plugins.iter().any(|plugin| plugin.module == **module))
+            .count(),
+    );
     out.str("plugin_error", &state.plugin_error);
     out.str("last_error", &state.last_error);
     out.str("query", &state.last_query);
@@ -553,12 +573,27 @@ pub fn catalog_json(force_refresh: bool) -> String {
     out.0
 }
 
+/// Adult-only sites are left out of the catalog; they can still be
+/// installed from a URL or a file.
+fn is_adult_site(entry: &SearchCatalogEntry) -> bool {
+    const MARKERS: [&str; 6] = ["porn", "xxx", "sukebei", "hentai", "nsfw", "adult"];
+    [&entry.name, &entry.module, &entry.download_url]
+        .iter()
+        .any(|text| {
+            let text = text.to_ascii_lowercase();
+            MARKERS.iter().any(|marker| text.contains(marker))
+        })
+}
+
 fn append_catalog_entries_json(
     out: &mut Json,
     entries: &[SearchCatalogEntry],
     installed_plugins: &[SearchPlugin],
 ) {
-    for entry in entries.iter().filter(|entry| !entry.private_site) {
+    for entry in entries
+        .iter()
+        .filter(|entry| !entry.private_site && !is_adult_site(entry))
+    {
         let installed = installed_plugins
             .iter()
             .find(|plugin| plugin.module == entry.module);
@@ -634,6 +669,36 @@ pub fn install_plugin_from_url(url: &str) -> Result<String, String> {
         .map_err(|err| format!("plugin download: {err}"))?;
     install_plugin_bytes(&filename, &bytes)?;
     Ok(module)
+}
+
+/// Installs the recommended plugins that are missing and returns how many
+/// were added. One failed download does not stop the others.
+pub fn install_recommended_plugins() -> Result<usize, String> {
+    require_network()?;
+    let runtime = runtime()?;
+    let installed = current_plugins();
+    let mut added = 0;
+    let mut errors = Vec::new();
+    for module in RECOMMENDED_PLUGINS {
+        if installed.iter().any(|plugin| plugin.module == module) {
+            continue;
+        }
+        let url = format!("{OFFICIAL_PLUGIN_BASE}{module}.py");
+        let written = http::get_public(&url, MAX_PLUGIN_BYTES)
+            .map_err(|err| format!("download: {err}"))
+            .and_then(|bytes| write_plugin_file(runtime, &format!("{module}.py"), &bytes));
+        match written {
+            Ok(_) => added += 1,
+            Err(err) => errors.push(format!("{module}: {err}")),
+        }
+    }
+    if added > 0 {
+        refresh_plugins()?;
+    }
+    if added == 0 && !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    Ok(added)
 }
 
 pub fn install_plugin_from_bytes(filename: &str, bytes: &[u8]) -> Result<String, String> {
@@ -1307,11 +1372,16 @@ fn install_plugin_bytes(filename: &str, bytes: &[u8]) -> Result<String, String> 
     if source.contains('\0') {
         return Err("plugin source contains a NUL byte".to_string());
     }
-    let runtime = runtime()?;
-    let path = runtime.root.join("engines").join(format!("{module}.py"));
-    write_file_atomic(&path, bytes, "write plugin")?;
+    write_plugin_file(runtime()?, filename, bytes)?;
     refresh_plugins()?;
     Ok(module)
+}
+
+fn write_plugin_file(runtime: &SearchRuntime, filename: &str, bytes: &[u8]) -> Result<(), String> {
+    let module = plugin_module_from_filename(filename)
+        .ok_or_else(|| "plugin filename must be a valid python module name".to_string())?;
+    let path = runtime.root.join("engines").join(format!("{module}.py"));
+    write_file_atomic(&path, bytes, "write plugin")
 }
 
 fn current_plugins() -> Vec<SearchPlugin> {
@@ -2043,6 +2113,44 @@ mod tests {
         assert_eq!(entries[0].name, "Bit Search");
         assert_eq!(entries[0].module, "bitsearch");
         assert!(entries[0].download_url.ends_with("bitsearch.py"));
+    }
+
+    #[test]
+    fn catalog_leaves_out_adult_sites_only() {
+        let entry = |name: &str, url: &str| SearchCatalogEntry {
+            name: name.to_string(),
+            module: filename_from_link(url).trim_end_matches(".py").to_string(),
+            download_url: url.to_string(),
+            comment: "works for everything except XXX and software".to_string(),
+            ..SearchCatalogEntry::default()
+        };
+        let base = "https://raw.githubusercontent.com/example/plugins/main/";
+        for (name, file) in [
+            ("My Porn Club", "mypornclub.py"),
+            ("XXXClub", "xxxclubto.py"),
+            ("Sukebei Nyaa", "sukebei/nyaa.py"),
+        ] {
+            assert!(
+                is_adult_site(&entry(name, &format!("{base}{file}"))),
+                "{name}"
+            );
+        }
+        for (name, file) in [("Nyaa.si", "nyaasi.py"), ("EZTV", "eztvx.py")] {
+            assert!(
+                !is_adult_site(&entry(name, &format!("{base}{file}"))),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn recommended_plugins_are_valid_module_names() {
+        for module in RECOMMENDED_PLUGINS {
+            assert_eq!(
+                plugin_module_from_filename(&format!("{module}.py")).as_deref(),
+                Some(module)
+            );
+        }
     }
 
     #[test]

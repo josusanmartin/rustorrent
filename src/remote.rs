@@ -31,6 +31,7 @@ Controls a running rustorrent (started with --ui, --tui or --daemon).
   get <result#> [--dir <d>]         Add a search result
   plugins                           List search plugins
   plugin install <url|file.py> | plugin remove <module>
+  plugin recommended                Install the recommended search plugins
   rss                               List feeds and rules
   rss add-feed <url> [secs] | rss remove-feed <url>
   rss add-rule <name> <pattern> [feed-url] | rss remove-rule <name>
@@ -846,13 +847,20 @@ pub fn main(mut args: Vec<String>) -> Result<(), String> {
                     client.upload(&format!("/search/install-plugin?{query}"), &data)?;
                 }
             }
+            "recommended" => {
+                client.post("/search/install-recommended", &[])?;
+                print_plugins(&client.get("/search/status")?);
+            }
             "remove" | "rm" => {
                 client.post(
                     "/search/remove-plugin",
                     &[("module", need(&args, 1, "plugin module")?)],
                 )?;
             }
-            _ => return Err("usage: plugin install <url|file.py> | plugin remove <module>".into()),
+            _ => return Err(
+                "usage: plugin install <url|file.py> | plugin remove <module> | plugin recommended"
+                    .into(),
+            ),
         },
         "rss" => match args.first().map(String::as_str).unwrap_or("list") {
             "list" | "ls" => print_rss(&client.get("/rss/status")?),
@@ -1218,7 +1226,7 @@ fn print_plugins(status: &Json) {
         return;
     }
     if plugins.is_empty() {
-        println!("No search plugins installed.");
+        println!("No search plugins installed. `rustorrent remote plugin recommended` adds the recommended set.");
     }
     for p in plugins {
         println!(
