@@ -171,9 +171,9 @@ class InteropTests(unittest.TestCase):
                 leecher.start()
                 leecher.add(torrent)
                 wait_for(lambda: leecher.done() > 0, seconds=60)
-                state = app.torrent(tid)
-                self.assertLess(state['percent'], 10000, 'Rustorrent finished before uploading')
-                self.assertGreater(state['uploaded_bytes'], 0)
+                self.assertLess(app.torrent(tid)['percent'], 10000, 'Rustorrent finished before uploading')
+                # Transfer counters reach the status API on the torrent loop's next tick.
+                wait_for(lambda: app.torrent(tid)['uploaded_bytes'] > 0, seconds=10)
                 wait_for(lambda: leecher.done() == 1, seconds=60)
                 self.assertEqual((leecher.data / 'fixture.bin').read_bytes(), PAYLOAD)
             except Exception:
