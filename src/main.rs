@@ -1,6 +1,7 @@
 mod bencode;
 #[cfg(feature = "dht")]
 mod dht;
+mod firewall;
 mod geoip;
 mod http;
 mod ip_filter;
@@ -146,17 +147,33 @@ mod udp_tracker {
     }
 }
 
+/// A port mapping a router accepted.
+pub(crate) struct PortMapping {
+    pub renew_after: Duration,
+    pub external_port: u16,
+    /// The router's own internet address, when it reports one.
+    pub external_ip: Option<std::net::Ipv4Addr>,
+}
+
 #[cfg(not(feature = "natpmp"))]
 mod natpmp {
-    pub fn map_port(_port: u16, _lifetime: u32) -> Result<std::time::Duration, String> {
+    pub fn map_port(_port: u16, _lifetime: u32) -> Result<crate::PortMapping, String> {
         Err("natpmp disabled".to_string())
     }
 }
 
 #[cfg(not(feature = "upnp"))]
 mod upnp {
-    pub fn map_port(_port: u16) -> Result<std::time::Duration, String> {
+    pub fn map_port(_port: u16) -> Result<crate::PortMapping, String> {
         Err("upnp disabled".to_string())
+    }
+}
+
+/// The port trackers and the DHT should tell other peers to connect to.
+pub(crate) fn announce_port(listen_port: u16) -> u16 {
+    match MAPPED_EXTERNAL_PORT.load(Ordering::Relaxed) {
+        0 => listen_port,
+        port => port,
     }
 }
 
@@ -267,7 +284,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -385,6 +402,12 @@ static SESSION_UPLOADED_BYTES: AtomicU64 = AtomicU64::new(0);
 static ATOMIC_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PEER_CONNECTED: AtomicU64 = AtomicU64::new(0);
 static PEER_DISCONNECTED: AtomicU64 = AtomicU64::new(0);
+/// External port a router mapped for us when it differs from the listen port;
+/// 0 means peers reach us on the listen port itself.
+static MAPPED_EXTERNAL_PORT: AtomicU16 = AtomicU16::new(0);
+/// Peers with public addresses that connected to us: proof that the incoming
+/// port is reachable from the internet.
+static INBOUND_PUBLIC_PEERS: AtomicU64 = AtomicU64::new(0);
 static SEED_RATIO_BITS: AtomicU64 = AtomicU64::new(0);
 static MAX_SEED_TIME_SECS: AtomicU64 = AtomicU64::new(0);
 static SUPER_SEED: AtomicBool = AtomicBool::new(false);
@@ -1208,7 +1231,7 @@ bandwidth (bytes/s, k/m/g suffixes, 0 = unlimited):
   --schedule <secs:command>   run a scheduler command periodically
 
 network:
-  --port <port>               incoming peer port (default 6881)
+  --port <port>               incoming peer port (default: picked once, then kept)
   --no-port-mapping           leave router port mapping alone
   --encryption <disable|prefer|require>, --no-encryption
   --utp | --no-utp            micro transport protocol (default on)
@@ -2756,7 +2779,7 @@ fn open_private_log_file(path: &Path) -> Result<fs::File, String> {
 fn run() -> Result<(), String> {
     install_signal_handlers();
     install_panic_logger();
-    let args = parse_args()?;
+    let mut args = parse_args()?;
 
     fs::create_dir_all(&args.download_dir).map_err(|err| {
         format!(
@@ -2815,6 +2838,9 @@ fn run() -> Result<(), String> {
     // unrelated process after PID reuse.
     let _lock_file = acquire_session_lock(&args.download_dir)?;
     ensure_private_state_directory(&args.download_dir)?;
+    if args.port_is_default {
+        args.port = saved_listen_port(&args.download_dir);
+    }
 
     // Write the optional PID file only after this instance owns the session.
     let _pid_file_guard = if let Some(pid_path) = args.pid_file.as_ref() {
@@ -3104,6 +3130,18 @@ fn run() -> Result<(), String> {
             };
             state.natpmp_status = reason.to_string();
             state.upnp_status = reason.to_string();
+        });
+    }
+    if cfg!(target_os = "macos") && direct_discovery {
+        let firewall_ui = ui_state.clone();
+        spawn_detached("firewall-status", move || {
+            while !shutdown_requested() {
+                let status = firewall::status();
+                update_ui(&firewall_ui, |state| {
+                    state.firewall_status = status.to_string();
+                });
+                sleep_with_shutdown(Duration::from_secs(60));
+            }
         });
     }
 
@@ -4865,7 +4903,7 @@ fn run_torrent_once(
                         &trackers,
                         meta.info_hash,
                         peer_id,
-                        args.port,
+                        announce_port(args.port),
                         uploaded,
                         downloaded,
                         left,
@@ -4902,6 +4940,11 @@ fn run_torrent_once(
                             tracker_failures.remove(&result.tracker_url);
                             interval = response.interval.clamp(60, 3600);
                             log_info!("tracker {label} returned {} peers", response.peers.len());
+                            if let Some(ip) = response.external_ip {
+                                update_ui(ui_state, |state| {
+                                    state.tracker_external_ip = ip.to_string();
+                                });
+                            }
                             lock_or_recover(&peer_queue)
                                 .enqueue_with_source(response.peers, PeerSource::Tracker);
                         }
@@ -5040,7 +5083,7 @@ fn run_torrent_once(
                 &stop_trackers,
                 meta.info_hash,
                 peer_id,
-                args.port,
+                announce_port(args.port),
                 uploaded,
                 downloaded,
                 left,
@@ -9234,6 +9277,8 @@ struct Args {
     numwant: u32,
     metadata_peer_limit: usize,
     port: u16,
+    /// --port was not given, so a port saved with the session is used.
+    port_is_default: bool,
     port_mapping: bool,
     enable_utp: bool,
     encryption: EncryptionMode,
@@ -9328,6 +9373,7 @@ fn parse_args() -> Result<Args, String> {
     let mut numwant = peer_tuning.numwant;
     let mut metadata_peer_limit = peer_tuning.metadata_peer_limit;
     let mut port = 6881u16;
+    let mut port_is_default = true;
     let mut enable_utp = true;
     let mut port_mapping = true;
     let mut encryption = EncryptionMode::Prefer;
@@ -9495,6 +9541,7 @@ fn parse_args() -> Result<Args, String> {
         if arg == "--port" {
             let value = flag_value(&args_list, idx, "--port")?;
             port = parse_flag::<u16>(value, "--port")?;
+            port_is_default = false;
             idx += 2;
             continue;
         }
@@ -9857,6 +9904,7 @@ fn parse_args() -> Result<Args, String> {
         numwant,
         metadata_peer_limit,
         port,
+        port_is_default,
         enable_utp,
         port_mapping,
         encryption,
@@ -12882,6 +12930,9 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
         log_debug!("dropping self peer {addr}");
         return;
     }
+    if crate::http::is_public_http_ip(normalize_peer_addr(addr).ip()) {
+        INBOUND_PUBLIC_PEERS.fetch_add(1, Ordering::Relaxed);
+    }
     let peer_tag = context.peer_tags.fetch_add(1, Ordering::SeqCst);
     let Some(_torrent_slot) = context.torrent_peer_slots.try_acquire() else {
         return;
@@ -13520,9 +13571,39 @@ where
     }
 }
 
-fn port_mapping_status_message(protocol: &str, port: u16, result: &Result<(), String>) -> String {
+/// The incoming port picked on first run and kept with the session. A fixed
+/// default such as 6881 is throttled by some providers and is often already
+/// forwarded to another device on the same network.
+fn saved_listen_port(download_dir: &Path) -> u16 {
+    let path = download_dir.join(".rustorrent").join("listen-port");
+    let saved = read_file_limited(&path, 16, true)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| text.trim().parse::<u16>().ok())
+        .filter(|port| *port >= 1024);
+    if let Some(port) = saved {
+        return port;
+    }
+    // Below the ephemeral ranges of macOS (49152+) and Linux (32768+).
+    let port = 10_000 + (system_entropy_u64() % 22_768) as u16;
+    if let Err(err) = write_atomic_file(&path, format!("{port}\n").as_bytes(), "port", false, true)
+    {
+        log_warn!("could not save the incoming port: {err}");
+    }
+    port
+}
+
+fn port_mapping_status_message(
+    protocol: &str,
+    port: u16,
+    result: &Result<&PortMapping, String>,
+) -> String {
     match result {
-        Ok(()) => format!("mapped {protocol} on port {port}"),
+        Ok(mapping) if mapping.external_port != port => format!(
+            "mapped {protocol} on port {} (forwarded to {port})",
+            mapping.external_port
+        ),
+        Ok(_) => format!("mapped {protocol} on port {port}"),
         Err(err) => format!("failed {protocol} on port {port}: {err}"),
     }
 }
@@ -13531,9 +13612,21 @@ fn record_port_mapping_result(
     ui_state: &Option<Arc<Mutex<ui::UiState>>>,
     protocol: &str,
     port: u16,
-    result: Result<(), String>,
+    result: Result<&PortMapping, String>,
 ) {
     let message = port_mapping_status_message(protocol, port, &result);
+    if let Ok(mapping) = result {
+        // Peers must be told the router's port, which can differ from ours.
+        let external = if mapping.external_port == port {
+            0
+        } else {
+            mapping.external_port
+        };
+        MAPPED_EXTERNAL_PORT.store(external, Ordering::Relaxed);
+        if let Some(ip) = mapping.external_ip {
+            update_ui(ui_state, |state| state.router_external_ip = ip.to_string());
+        }
+    }
     if result.is_ok() {
         log_info!("{message}");
     } else {
@@ -13561,17 +13654,19 @@ fn run_port_mapping_with_retries<F>(
     retry_delays: &[Duration],
     mut map_port: F,
 ) where
-    F: FnMut() -> Result<Duration, String>,
+    F: FnMut() -> Result<PortMapping, String>,
 {
     let mut failures = 0usize;
     while !shutdown_requested() {
         let result = map_port();
         match result {
-            Ok(renew_after) => {
-                record_port_mapping_result(ui_state, protocol, port, Ok(()));
+            Ok(mapping) => {
+                record_port_mapping_result(ui_state, protocol, port, Ok(&mapping));
                 failures = 0;
                 sleep_with_shutdown(
-                    renew_after.clamp(Duration::from_millis(500), Duration::from_secs(1800)),
+                    mapping
+                        .renew_after
+                        .clamp(Duration::from_millis(500), Duration::from_secs(1800)),
                 );
             }
             Err(error) => {
@@ -15621,10 +15716,34 @@ mod core_helpers_tests {
     }
 
     #[test]
+    fn default_listen_port_is_picked_once_and_kept() {
+        let root = std::env::temp_dir().join(format!(
+            "rustorrent-port-{}-{}",
+            std::process::id(),
+            system_entropy_u64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        ensure_private_state_directory(&root).unwrap();
+        let first = saved_listen_port(&root);
+        assert!((10_000..32_768).contains(&first), "{first}");
+        assert_eq!(saved_listen_port(&root), first);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn port_mapping_status_message_reports_success_and_failure() {
+        let mapping = |external_port| PortMapping {
+            renew_after: Duration::from_secs(60),
+            external_port,
+            external_ip: None,
+        };
         assert_eq!(
-            port_mapping_status_message("nat-pmp", 6881, &Ok(())),
+            port_mapping_status_message("nat-pmp", 6881, &Ok(&mapping(6881))),
             "mapped nat-pmp on port 6881"
+        );
+        assert_eq!(
+            port_mapping_status_message("nat-pmp", 6881, &Ok(&mapping(40123))),
+            "mapped nat-pmp on port 40123 (forwarded to 6881)"
         );
         assert_eq!(
             port_mapping_status_message("upnp", 6881, &Err("no gateway".to_string())),
@@ -20485,6 +20604,7 @@ fn start_console_progress(
                         SESSION_DOWNLOADED_BYTES.load(Ordering::SeqCst);
                     guard.session_uploaded_bytes = SESSION_UPLOADED_BYTES.load(Ordering::SeqCst);
                     guard.peer_connected = PEER_CONNECTED.load(Ordering::SeqCst);
+                    guard.inbound_public_peers = INBOUND_PUBLIC_PEERS.load(Ordering::Relaxed);
                     guard.peer_disconnected = PEER_DISCONNECTED.load(Ordering::SeqCst);
                     guard.disk_read_ms_avg = read_ms;
                     guard.disk_write_ms_avg = write_ms;

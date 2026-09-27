@@ -367,6 +367,7 @@ fn parse_announce_response(
     Ok(TrackerResponse {
         interval: interval as u64,
         peers,
+        external_ip: None,
     })
 }
 

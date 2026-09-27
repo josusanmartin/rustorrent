@@ -54,8 +54,8 @@ input[type=checkbox]{width:15px;height:15px;margin:0;accent-color:var(--accent-b
 .app{display:grid;grid-template-columns:212px minmax(0,1fr);height:100vh;height:100dvh}
 .side{display:flex;flex-direction:column;gap:2px;min-height:0;padding:14px 10px 10px;background:var(--bg);border-right:1px solid var(--line);overflow-y:auto}
 .brand{display:flex;align-items:center;gap:9px;padding:2px 8px 14px;font-weight:650;font-size:14px;letter-spacing:-.01em}
-.logo{display:grid;place-items:center;width:24px;height:24px;border-radius:7px;background:linear-gradient(135deg,#4f8cff,#1d4ed8);color:#fff}
-.logo .i{width:15px;height:15px;stroke-width:2.2}
+.logo{display:grid;place-items:center;width:24px;height:24px;border-radius:7px;background:linear-gradient(135deg,#ff8a4c,#c2410c)}
+.logo .mark{width:24px;height:24px}
 .nav-h{padding:14px 8px 4px}
 .nav{display:flex;align-items:center;gap:9px;width:100%;height:30px;padding:0 8px;border:0;border-radius:6px;background:none;color:var(--fg);text-align:left;cursor:pointer;transition:background .15s}
 .nav .i{color:var(--muted)}
@@ -66,6 +66,16 @@ input[type=checkbox]{width:15px;height:15px;margin:0;accent-color:var(--accent-b
 .nav .c{flex:none;color:var(--muted);font-size:12px;font-weight:500;font-variant-numeric:tabular-nums}
 .labels{display:contents}
 .foot{margin-top:auto;padding:12px 8px 2px}
+.net{display:flex;align-items:center;gap:7px;width:100%;margin:0 0 10px;padding:0;border:0;background:none;color:var(--muted);font:inherit;font-size:12px;text-align:left;cursor:pointer}
+.net:hover{color:var(--fg)}
+.net>i,.reach>i{flex:none;width:8px;height:8px;border-radius:50%;background:var(--warn)}
+.net.ok>i,.reach.ok>i{background:var(--ok)}
+.net.err>i,.reach.err>i{background:var(--err)}
+.reach{display:flex;gap:10px;align-items:baseline;margin-top:10px}
+.reach>i{transform:translateY(-1px)}
+.reach p{margin:3px 0 0;color:var(--muted)}
+.reach p:empty{display:none}
+#fwBtn{margin-top:12px}
 .spark{display:block;width:100%;height:34px;overflow:visible}
 .spark .sd{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.5}
 .spark .su{fill:none;stroke:var(--ok);stroke-width:1.5}

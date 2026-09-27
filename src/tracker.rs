@@ -13,6 +13,8 @@ const MAX_TRACKER_PEERS: usize = 1024;
 pub struct TrackerResponse {
     pub interval: u64,
     pub peers: Vec<SocketAddr>,
+    /// Our address as the tracker saw it (BEP 24).
+    pub external_ip: Option<std::net::IpAddr>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -185,8 +187,24 @@ fn parse_tracker_body(body: &[u8]) -> Result<TrackerResponse, String> {
     if !saw_peers {
         return Err("tracker response missing peers".to_string());
     }
+    let external_ip = match dict_get(&dict, b"external ip") {
+        Some(Value::Bytes(bytes)) => match bytes.len() {
+            4 => <[u8; 4]>::try_from(bytes.as_slice())
+                .ok()
+                .map(std::net::IpAddr::from),
+            16 => <[u8; 16]>::try_from(bytes.as_slice())
+                .ok()
+                .map(std::net::IpAddr::from),
+            _ => None,
+        },
+        _ => None,
+    };
     crate::log_stderr(format_args!("  tracker: {} peers", peers.len()));
-    Ok(TrackerResponse { interval, peers })
+    Ok(TrackerResponse {
+        interval,
+        peers,
+        external_ip,
+    })
 }
 
 pub(crate) fn sanitize_failure_reason(reason: &[u8]) -> String {
@@ -392,6 +410,17 @@ mod tests {
         let parsed = parse_tracker_body(&body).unwrap();
         assert_eq!(parsed.peers.len(), MAX_TRACKER_PEERS);
         assert!(parsed.peers.iter().all(SocketAddr::is_ipv4));
+    }
+
+    #[test]
+    fn parse_tracker_body_reads_the_external_ip() {
+        let body = bencode::encode(&Value::Dict(vec![
+            (b"external ip".to_vec(), Value::Bytes(vec![203, 0, 113, 7])),
+            (b"interval".to_vec(), Value::Int(60)),
+            (b"peers".to_vec(), Value::Bytes(Vec::new())),
+        ]));
+        let response = parse_tracker_body(&body).unwrap();
+        assert_eq!(response.external_ip, Some([203, 0, 113, 7].into()));
     }
 
     #[test]

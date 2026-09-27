@@ -8,9 +8,14 @@ const SSDP_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 2
 const SSDP_ATTEMPTS: usize = 3;
 const SSDP_TIMEOUT: Duration = Duration::from_secs(1);
 
-pub fn map_port(port: u16) -> Result<Duration, String> {
+pub fn map_port(port: u16) -> Result<crate::PortMapping, String> {
     let location = discover_gateway()
         .ok_or_else(|| "gateway did not answer UPnP discovery after 3 attempts".to_string())?;
+    map_port_at(&location, port)
+}
+
+fn map_port_at(location: &str, port: u16) -> Result<crate::PortMapping, String> {
+    let location = location.to_string();
     let description = http::get_same_origin(&location, 512 * 1024)?;
     let control = parse_control_url(&description, &location)
         .ok_or_else(|| "upnp control url not found".to_string())?;
@@ -19,18 +24,65 @@ pub fn map_port(port: u16) -> Result<Duration, String> {
     let client = local_ip(gateway).ok_or_else(|| "no local route to the gateway".to_string())?;
 
     for protocol in ["TCP", "UDP"] {
-        let body = build_add_port_mapping(port, protocol, &control.service_type, &client);
-        let headers = vec![
-            ("Content-Type", "text/xml; charset=\"utf-8\"".to_string()),
-            (
-                "SOAPAction",
-                format!("\"{}#AddPortMapping\"", control.service_type),
+        // A timed lease is renewed below; some routers only take permanent ones.
+        let mut result = add_port_mapping(&control, port, protocol, &client, LEASE_SECS);
+        if result.as_ref().is_err_and(|err| err == "upnp error 725") {
+            result = add_port_mapping(&control, port, protocol, &client, 0);
+        }
+        result.map_err(|err| match err.as_str() {
+            "upnp error 718" => format!(
+                "the router already forwards port {port} to another device; \
+                 choose a different incoming port"
             ),
-        ];
-        let _ = http::post(&control.url, &headers, body.as_bytes(), 128 * 1024)?;
+            _ => err,
+        })?;
     }
-    // Permanent leases can disappear after a router restart or network change.
-    Ok(Duration::from_secs(30 * 60))
+    Ok(crate::PortMapping {
+        renew_after: Duration::from_secs(u64::from(LEASE_SECS) / 2),
+        external_port: port,
+        external_ip: external_ip(&control),
+    })
+}
+
+const LEASE_SECS: u32 = 3600;
+
+fn soap(control: &ControlEndpoint, action: &str, arguments: &str) -> Result<Vec<u8>, String> {
+    let body = format!(
+        "<?xml version=\"1.0\"?>\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+<s:Body><u:{action} xmlns:u=\"{}\">{arguments}</u:{action}></s:Body></s:Envelope>",
+        control.service_type
+    );
+    let headers = vec![
+        ("Content-Type", "text/xml; charset=\"utf-8\"".to_string()),
+        (
+            "SOAPAction",
+            format!("\"{}#{action}\"", control.service_type),
+        ),
+    ];
+    http::post(&control.url, &headers, body.as_bytes(), 128 * 1024)
+}
+
+fn add_port_mapping(
+    control: &ControlEndpoint,
+    port: u16,
+    protocol: &str,
+    client: &str,
+    lease: u32,
+) -> Result<(), String> {
+    soap(
+        control,
+        "AddPortMapping",
+        &add_port_mapping_arguments(port, protocol, client, lease),
+    )
+    .map(drop)
+}
+
+fn external_ip(control: &ControlEndpoint) -> Option<Ipv4Addr> {
+    let body = soap(control, "GetExternalIPAddress", "").ok()?;
+    let text = std::str::from_utf8(&body).ok()?;
+    let (_, rest) = text.split_once("NewExternalIPAddress>")?;
+    rest.split('<').next()?.trim().parse().ok()
 }
 
 fn discover_gateway() -> Option<String> {
@@ -43,15 +95,21 @@ fn discover_gateway_at(
     timeout: Duration,
 ) -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    let msg = "\
-M-SEARCH * HTTP/1.1\r\n\
+    for _ in 0..attempts {
+        // Newer routers only answer searches for version 2 of the device.
+        let mut sent = false;
+        for version in [1, 2] {
+            let msg = format!(
+                "M-SEARCH * HTTP/1.1\r\n\
 HOST: 239.255.255.250:1900\r\n\
 MAN: \"ssdp:discover\"\r\n\
 MX: 1\r\n\
-ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\
-\r\n";
-    for _ in 0..attempts {
-        if socket.send_to(msg.as_bytes(), discovery_addr).is_err() {
+ST: urn:schemas-upnp-org:device:InternetGatewayDevice:{version}\r\n\
+\r\n"
+            );
+            sent |= socket.send_to(msg.as_bytes(), discovery_addr).is_ok();
+        }
+        if !sent {
             continue;
         }
         let deadline = Instant::now() + timeout;
@@ -149,24 +207,16 @@ fn parse_control_url(xml: &[u8], base: &str) -> Option<ControlEndpoint> {
     })
 }
 
-fn build_add_port_mapping(port: u16, protocol: &str, service_type: &str, client: &str) -> String {
+fn add_port_mapping_arguments(port: u16, protocol: &str, client: &str, lease: u32) -> String {
     format!(
-        "<?xml version=\"1.0\"?>\
-<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
-<s:Body>\
-<u:AddPortMapping xmlns:u=\"{service_type}\">\
-<NewRemoteHost></NewRemoteHost>\
+        "<NewRemoteHost></NewRemoteHost>\
 <NewExternalPort>{port}</NewExternalPort>\
 <NewProtocol>{protocol}</NewProtocol>\
 <NewInternalPort>{port}</NewInternalPort>\
-<NewInternalClient>{}</NewInternalClient>\
+<NewInternalClient>{client}</NewInternalClient>\
 <NewEnabled>1</NewEnabled>\
 <NewPortMappingDescription>rustorrent</NewPortMappingDescription>\
-<NewLeaseDuration>0</NewLeaseDuration>\
-</u:AddPortMapping>\
-</s:Body>\
-</s:Envelope>",
-        client
+<NewLeaseDuration>{lease}</NewLeaseDuration>"
     )
 }
 
@@ -217,18 +267,13 @@ mod tests {
     }
 
     #[test]
-    fn add_port_mapping_body_contains_requested_port() {
-        let body = build_add_port_mapping(
-            51413,
-            "UDP",
-            "urn:schemas-upnp-org:service:WANPPPConnection:1",
-            "192.0.2.2",
-        );
+    fn add_port_mapping_arguments_contain_port_and_lease() {
+        let body = add_port_mapping_arguments(51413, "UDP", "192.0.2.2", 3600);
         assert!(body.contains("<NewExternalPort>51413</NewExternalPort>"));
         assert!(body.contains("<NewInternalPort>51413</NewInternalPort>"));
-        assert!(body.contains("AddPortMapping"));
         assert!(body.contains("<NewProtocol>UDP</NewProtocol>"));
-        assert!(body.contains("WANPPPConnection:1"));
+        assert!(body.contains("<NewInternalClient>192.0.2.2</NewInternalClient>"));
+        assert!(body.contains("<NewLeaseDuration>3600</NewLeaseDuration>"));
     }
 
     #[test]
@@ -274,5 +319,83 @@ mod tests {
             Some("http://127.0.0.1:1900/igd.xml".to_string())
         );
         handle.join().unwrap();
+    }
+
+    /// A tiny router: serves the description, refuses a timed lease the way
+    /// permanent-only routers do, then accepts the permanent one.
+    fn fake_router(fault: &'static str) -> (String, thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let mut actions = Vec::new();
+            let mut timed_refused = false;
+            for stream in listener.incoming().take(7) {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .map_or(0, |v| v.trim().parse().unwrap());
+                        if body.len() >= length {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&request).to_string();
+                let (status, body) = if text.starts_with("GET") {
+                    ("200 OK", "<root><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><controlURL>/ctl</controlURL></service></root>".to_string())
+                } else if text.contains("GetExternalIPAddress") {
+                    actions.push("ip".to_string());
+                    (
+                        "200 OK",
+                        "<NewExternalIPAddress>100.64.0.9</NewExternalIPAddress>".to_string(),
+                    )
+                } else if text.contains("<NewLeaseDuration>3600") {
+                    timed_refused = true;
+                    actions.push("timed".to_string());
+                    ("500 Internal Server Error", format!("<s:Fault><detail><UPnPError><errorCode>{fault}</errorCode></UPnPError></detail></s:Fault>"))
+                } else {
+                    actions.push("permanent".to_string());
+                    ("200 OK", String::new())
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).unwrap();
+                if actions.last().is_some_and(|a| a == "ip") || fault == "718" && timed_refused {
+                    break;
+                }
+            }
+            actions
+        });
+        (format!("{base}/desc.xml"), handle)
+    }
+
+    #[test]
+    fn map_port_falls_back_to_a_permanent_lease_and_reads_the_public_address() {
+        let (location, router) = fake_router("725");
+        let mapping = map_port_at(&location, 51413).unwrap();
+        assert_eq!(mapping.external_port, 51413);
+        assert_eq!(mapping.external_ip, Some(Ipv4Addr::new(100, 64, 0, 9)));
+        assert_eq!(
+            router.join().unwrap(),
+            ["timed", "permanent", "timed", "permanent", "ip"]
+        );
+    }
+
+    #[test]
+    fn map_port_explains_a_port_taken_by_another_device() {
+        let (location, router) = fake_router("718");
+        let err = map_port_at(&location, 51413).err().unwrap();
+        assert!(err.contains("already forwards port 51413"), "{err}");
+        assert_eq!(router.join().unwrap(), ["timed"]);
     }
 }

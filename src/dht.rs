@@ -1616,7 +1616,7 @@ fn dht_thread(
                 if entry.last_query.elapsed() >= QUERY_INTERVAL
                     && start_peer_lookup(
                         *info_hash,
-                        entry.port,
+                        crate::announce_port(entry.port),
                         &mut rt,
                         &mut pending,
                         &socket,

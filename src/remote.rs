@@ -1126,8 +1126,48 @@ pub fn session_lines(s: &Json) -> Vec<String> {
             s.s("natpmp_status"),
             s.s("upnp_status")
         ),
+        format!("Reachable    {}", reachability(s)),
         format!("Version      {}", s.s("version")),
     ]
+}
+
+/// Whether other peers can connect to us, mirroring the browser's
+/// Connectivity card.
+pub fn reachability(s: &Json) -> String {
+    let inbound = s.u("inbound_public_peers");
+    let (router, tracker) = (s.s("router_external_ip"), s.s("tracker_external_ip"));
+    let shared = router.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| {
+        let [a, b, ..] = ip.octets();
+        ip.is_private() || (a == 100 && (64..128).contains(&b))
+    }) || (!router.is_empty()
+        && !tracker.is_empty()
+        && !tracker.contains(':')
+        && tracker != router);
+    let mapped = [s.s("natpmp_status"), s.s("upnp_status")]
+        .iter()
+        .any(|status| status.starts_with("mapped "));
+    match s.s("firewall_status") {
+        "block-all" | "blocked" | "unlisted" => {
+            "no: the macOS firewall blocks incoming connections (allow Rustorrent in Settings)"
+                .into()
+        }
+        _ if inbound > 0 => format!(
+            "yes: {inbound} peer{} connected in",
+            if inbound == 1 { "" } else { "s" }
+        ),
+        _ if shared => {
+            "no: behind a shared internet address (provider NAT or a second router)".into()
+        }
+        _ if mapped => "not confirmed yet: the router forwards the port".into(),
+        _ if s.s("upnp_status").starts_with("disabled") => format!(
+            "no: automatic port forwarding is off; forward port {} to this computer",
+            s.u("incoming_port")
+        ),
+        _ => format!(
+            "no: the router did not open the port; enable UPnP or NAT-PMP, or forward port {}",
+            s.u("incoming_port")
+        ),
+    }
 }
 
 fn print_session(s: &Json) {
@@ -1288,6 +1328,22 @@ mod tests {
         assert_eq!(clip("abcdef", 4), "abc…");
         assert_eq!(parse_priority("high").unwrap(), 3);
         assert!(parse_priority("urgent").is_err());
+    }
+
+    #[test]
+    fn reachability_explains_each_case() {
+        let r = |json: &str| reachability(&Json::parse(json).unwrap());
+        assert!(r(r#"{"inbound_public_peers":3}"#).starts_with("yes: 3 peers"));
+        assert!(
+            r(r#"{"firewall_status":"unlisted","inbound_public_peers":3}"#).contains("firewall")
+        );
+        assert!(r(r#"{"router_external_ip":"100.72.1.2"}"#).contains("shared"));
+        assert!(
+            r(r#"{"router_external_ip":"198.51.100.2","tracker_external_ip":"203.0.113.9"}"#)
+                .contains("shared")
+        );
+        assert!(r(r#"{"upnp_status":"mapped upnp on port 20000"}"#).starts_with("not confirmed"));
+        assert!(r(r#"{"incoming_port":20000}"#).contains("forward port 20000"));
     }
 
     #[test]

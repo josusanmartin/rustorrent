@@ -95,11 +95,11 @@ const num=(id,max,step,u)=>`<div class="unit"><input id="${id}" class="in" type=
 const choice=(id,opts)=>`<select id="${id}" class="in">${opts.map(([v,l])=>`<option value="${v}">${l}</option>`).join('')}</select>`;
 $('app').outerHTML=`<div class="app" id="app">
 <nav class="side" aria-label="Sections">
- <div class="brand"><span class="logo">${ic('dl')}</span>Rustorrent</div>
+ <div class="brand"><span class="logo"><svg class="mark" viewBox="8 6 112 112" aria-hidden="true"><g fill="#fff" stroke="#fff" opacity=".25"><rect x="59" y="15" width="10" height="13" rx="3"/><rect x="59" y="15" width="10" height="13" rx="3" transform="rotate(36 64 62)"/><rect x="59" y="15" width="10" height="13" rx="3" transform="rotate(72 64 62)"/><rect x="59" y="15" width="10" height="13" rx="3" transform="rotate(108 64 62)"/><rect x="59" y="15" width="10" height="13" rx="3" transform="rotate(144 64 62)"/><rect x="59" y="15" width="10" height="13" rx="3" transform="rotate(180 64 62)"/><rect x="59" y="15" width="10" height="13" rx="3" transform="rotate(216 64 62)"/><rect x="59" y="15" width="10" height="13" rx="3" transform="rotate(252 64 62)"/><rect x="59" y="15" width="10" height="13" rx="3" transform="rotate(288 64 62)"/><rect x="59" y="15" width="10" height="13" rx="3" transform="rotate(324 64 62)"/><circle cx="64" cy="62" r="38" fill="none" stroke-width="6"/></g><path d="M54.5 37v45M46.5 74l8 8 8-8M54.5 37h13a12 12 0 0 1 0 24h-13M68.5 61l13 21" fill="none" stroke="#fff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/></svg></span>Rustorrent</div>
  <div class="nav-h">Library</div>${NAV.map(([f,l,n])=>navBtn(n,l,`data-f="${f}"`)).join('')}
  <div class="labels" id="labels"></div>
  <div class="nav-h">Tools</div>${navBtn('search','Search','data-v="search"')}${navBtn('rss','RSS','data-v="rss"')}${navBtn('sliders','Settings','data-v="settings"')}
- <div class="foot"><svg class="spark" viewBox="0 0 100 34" preserveAspectRatio="none" role="img" aria-label="Recent transfer rates"><path class="sd"/><path class="su"/></svg><div class="tot"><span id="totDown"></span><span id="totUp"></span></div></div>
+ <div class="foot"><button class="net" id="net" data-a="net"><i></i><span id="netT"></span></button><svg class="spark" viewBox="0 0 100 34" preserveAspectRatio="none" role="img" aria-label="Recent transfer rates"><path class="sd"/><path class="su"/></svg><div class="tot"><span id="totDown"></span><span id="totUp"></span></div></div>
 </nav>
 <main class="main">
  <header class="bar">
@@ -136,6 +136,7 @@ $('app').outerHTML=`<div class="app" id="app">
    <form class="inline" data-f="rrule"><input id="rName" class="in" aria-label="Rule name" placeholder="Name"><input id="rPat" class="in" aria-label="Title pattern" placeholder="Pattern"><button class="btn">Add rule</button></form></section>
  </div></section>
  <section class="view" id="v-settings" aria-labelledby="title" hidden><div class="pad">
+  <section class="card"><h2>Connectivity</h2><div class="reach" id="reach" role="status"><i></i><div><b id="reachT"></b><p id="reachD"></p></div></div><button class="btn" id="fwBtn" data-a="fw" hidden>Allow incoming connections</button></section>
   <section class="card"><h2>Bandwidth</h2><p class="muted">Limits apply to all transfers. Use 0 for unlimited.</p>${field('limDown','Download limit',num('limDown',102400,64,'KiB/s'))}${field('limUp','Upload limit',num('limUp',102400,64,'KiB/s'))}</section>
   <section class="card"><h2>Seeding</h2>${field('ratio','Stop seeding at ratio',num('ratio',10,0.1,'0 = keep seeding'))}</section>
   <section class="card"><h2>Connections</h2>${field('profile','Peer profile',choice('profile',[['conservative','Conservative'],['balanced','Balanced'],['aggressive','Aggressive']]),'<span id="profileNote"></span>')}</section>
@@ -231,7 +232,7 @@ function connect(){
 function render(){
   raf=0;
   txt($('rDown'),rate(G.download_rate_bps));txt($('rUp'),rate(G.upload_rate_bps));
-  renderSide();
+  renderSide();renderReach();
   if(structural){
     for(const [id,r] of rows)if(!T.has(id)){r.el.remove();rows.delete(id)}
     let prev=null;
@@ -665,8 +666,30 @@ function renderRss(){
 }
 const rssAct=(url,body,title)=>act(url,body,title).then(d=>{loadRss();return d});
 
+/* reachability: whether other peers can connect to us, and what to do if not */
+const sharedIp=ip=>/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(ip||'');
+function reach(){
+  const fw=G.firewall_status,n=G.inbound_public_peers||0,port=G.incoming_port,maps=[G.natpmp_status,G.upnp_status],rip=G.router_external_ip,tip=G.tracker_external_ip;
+  if(fw==='block-all')return['err','Firewall blocks incoming connections','“Block all incoming connections” is on in System Settings › Network › Firewall, so peers cannot reach you. Turn it off to seed.','Blocked by firewall'];
+  if(fw==='blocked'||fw==='unlisted')return['err','The macOS firewall is blocking Rustorrent','Peers cannot connect to you, so seeding waits. Allow Rustorrent to accept incoming connections.','Blocked by firewall',1];
+  if(n)return['ok','Reachable',`${plural(n,'peer')} connected to you from the internet this session.`,'Reachable'];
+  if(sharedIp(rip)||rip&&tip&&!tip.includes(':')&&tip!==rip)return['warn','Behind a shared internet address',`Your router's internet address${rip?` (${rip})`:''} is not your public one${tip?` (${tip})`:''}. Your provider or a second router sits in front of it, so peers cannot connect in. Uploads still reach peers that Rustorrent connects to.`,'Not reachable'];
+  const m=maps.find(m=>m&&m.startsWith('mapped '));
+  if(m)return['warn','Port open on your router',`Your router forwards ${m.match(/port \d+/)[0]} to Rustorrent over ${m.includes('upnp')?'UPnP':'NAT-PMP'}. Waiting for the first peer to connect in.`,'Waiting for peers'];
+  if(maps.some(m=>m==='pending'))return['warn','Checking your router…','','Checking…'];
+  if(maps.every(m=>m&&m.startsWith('disabled')))return['warn','Automatic port forwarding is off',`Rustorrent is not asking your router to open a port. Forward port ${port} (TCP and UDP) to this computer so peers can connect in.`,'Not reachable'];
+  return['warn','Incoming port not open',`Your router did not accept a UPnP or NAT-PMP request. Turn one of them on in the router settings, or forward port ${port} (TCP and UDP) to this computer. Until then only peers that Rustorrent connects to can download from you.`,'Not reachable'];
+}
+function renderReach(){
+  const [k,title,detail,short,fix]=reach(),net=$('net');
+  net.className='net '+k;txt($('netT'),short);attr(net,'title',title);
+  if(view!=='settings')return;
+  $('reach').className='reach '+k;txt($('reachT'),title);txt($('reachD'),detail);$('fwBtn').hidden=!fix;
+}
+
 /* settings */
 function renderSettings(force){
+  renderReach();
   const set=(id,v)=>{const e=$(id);if(force||document.activeElement!==e&&!e.dataset.dirty)e.value=v};
   set('limDown',Math.round((G.global_download_limit_bps||0)/1024));set('limUp',Math.round((G.global_upload_limit_bps||0)/1024));
   set('ratio',G.seed_ratio||0);set('profile',G.peer_profile||'balanced');
@@ -683,6 +706,8 @@ function clampInput(e,max,round){const v=Math.max(0,Math.min(max,round(+e.value|
 
 /* events */
 const CLICK={
+  net:()=>go('settings'),
+  fw:el=>{el.disabled=true;act('/network/allow-firewall',null,'Firewall updated','Peers can now connect to Rustorrent.').finally(()=>{el.disabled=false})},
   add:()=>openAdd(),'submit-add':submitAdd,browse:browseDir,'rm-go':removeGo,pcat:()=>loadCatalog(true),
   close:el=>closeDialog(el.closest('dialog')),
   clear:()=>{findText='';store.set('find','');$('find').value='';go('library','all')},

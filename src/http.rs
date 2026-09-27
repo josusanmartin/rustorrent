@@ -507,6 +507,17 @@ pub fn post(
         ..Request::public(max_bytes, default_budget())
     };
     let response = request_once(&parse_url(url)?, "POST", body, &request)?;
+    if response.status >= 400 {
+        // UPnP routers explain a refusal in a SOAP fault's errorCode.
+        let text = String::from_utf8_lossy(&response.body);
+        if let Some(code) = text
+            .split_once("<errorCode>")
+            .and_then(|(_, rest)| rest.split_once("</errorCode>"))
+            .and_then(|(code, _)| code.trim().parse::<u16>().ok())
+        {
+            return Err(format!("upnp error {code}"));
+        }
+    }
     success_body(response, max_bytes)
 }
 

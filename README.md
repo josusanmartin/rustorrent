@@ -348,7 +348,7 @@ but trackers, DHT and LPD announce the v1 swarm identifier.
 | `--daemon` | off | Run in the background with the web interface (Unix) |
 | `--pid-file <path>` | | Write the process id after startup locking |
 | `--log <path>` | | Append logs to a file |
-| `--port <port>` | `6881` | Incoming peer port |
+| `--port <port>` | picked on first run | Incoming peer port. A random port is chosen once and kept with the session. |
 | `--no-port-mapping` | | Do not request NAT-PMP/UPnP mappings |
 | `--encryption <mode>` | `prefer` | `disable`, `prefer` or `require` |
 | `--no-encryption` | | Shorthand for `--encryption disable` |

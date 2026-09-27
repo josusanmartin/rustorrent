@@ -184,6 +184,12 @@ pub struct UiState {
     pub incoming_port: u16,
     pub natpmp_status: String,
     pub upnp_status: String,
+    /// The public address the router reports for itself.
+    pub router_external_ip: String,
+    /// The public address trackers saw our announces come from (BEP 24).
+    pub tracker_external_ip: String,
+    pub inbound_public_peers: u64,
+    pub firewall_status: String,
     pub files: Vec<UiFile>,
     pub queue_len: usize,
     pub last_added: String,
@@ -522,6 +528,16 @@ fn handle_connection(
                     Err(err) => send_api_error(stream, &err),
                 }
             }
+            "/network/allow-firewall" => {
+                return match crate::firewall::allow() {
+                    Ok(_) => {
+                        let status = crate::firewall::status();
+                        lock_state(&state).firewall_status = status.to_string();
+                        send_api_ok(stream)
+                    }
+                    Err(err) => send_api_error(stream, &err),
+                };
+            }
             "/select-download-dir" => {
                 return match handle_select_download_dir() {
                     Ok(path) => send_api_ok_with_path(stream, path.as_deref().unwrap_or("")),
@@ -690,6 +706,7 @@ fn post_body_limit(path: &str) -> Option<usize> {
         | "/torrent/archive"
         | "/torrent/delete"
         | "/select-download-dir"
+        | "/network/allow-firewall"
         | "/torrent/recheck" => Some(0),
         _ => None,
     }
@@ -2219,10 +2236,24 @@ fn shell_html() -> String {
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
             "<meta name=\"rustorrent-api-token\" content=\"{token}\">",
             "<title>Rustorrent</title>",
-            "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>",
-            "<linearGradient id='g' x2='1' y2='1'><stop stop-color='%234f8cff'/><stop offset='1' stop-color='%231d4ed8'/></linearGradient>",
-            "<rect width='32' height='32' rx='8' fill='url(%23g)'/><path d='M16 7v13m-5-5 5 5 5-5M10 25h12' ",
-            "fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/></svg>\">",
+            "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='8 6 112 112'>",
+            "<linearGradient id='g' x2='1' y2='1'><stop stop-color='%23ff8a4c'/>",
+            "<stop offset='1' stop-color='%23c2410c'/></linearGradient>",
+            "<rect x='8' y='6' width='112' height='112' rx='28' fill='url(%23g)'/>",
+            "<g fill='%23fff' stroke='%23fff' opacity='.25'>",
+            "<rect x='59' y='15' width='10' height='13' rx='3'/>",
+            "<rect x='59' y='15' width='10' height='13' rx='3' transform='rotate(36 64 62)'/>",
+            "<rect x='59' y='15' width='10' height='13' rx='3' transform='rotate(72 64 62)'/>",
+            "<rect x='59' y='15' width='10' height='13' rx='3' transform='rotate(108 64 62)'/>",
+            "<rect x='59' y='15' width='10' height='13' rx='3' transform='rotate(144 64 62)'/>",
+            "<rect x='59' y='15' width='10' height='13' rx='3' transform='rotate(180 64 62)'/>",
+            "<rect x='59' y='15' width='10' height='13' rx='3' transform='rotate(216 64 62)'/>",
+            "<rect x='59' y='15' width='10' height='13' rx='3' transform='rotate(252 64 62)'/>",
+            "<rect x='59' y='15' width='10' height='13' rx='3' transform='rotate(288 64 62)'/>",
+            "<rect x='59' y='15' width='10' height='13' rx='3' transform='rotate(324 64 62)'/>",
+            "<circle cx='64' cy='62' r='38' fill='none' stroke-width='6'/></g>",
+            "<path d='M54.5 37v45M46.5 74l8 8 8-8M54.5 37h13a12 12 0 0 1 0 24h-13M68.5 61l13 21' fill='none' stroke='%23fff' stroke-width='10' stroke-linecap='round' stroke-linejoin='round'/>",
+            "</svg>\">",
             "<script>{boot}</script><link rel=\"stylesheet\" href=\"/app.css\">",
             "<script src=\"/app.js\" defer></script></head>",
             "<body><div id=\"app\"></div><noscript>Rustorrent needs JavaScript.</noscript></body></html>"
@@ -2360,6 +2391,10 @@ fn push_session_fields(json: &mut JsonObject<'_>, state: &UiState) {
         .num("incoming_port", state.incoming_port)
         .str("natpmp_status", &state.natpmp_status)
         .str("upnp_status", &state.upnp_status)
+        .str("router_external_ip", &state.router_external_ip)
+        .str("tracker_external_ip", &state.tracker_external_ip)
+        .num("inbound_public_peers", state.inbound_public_peers)
+        .str("firewall_status", &state.firewall_status)
         .num("peer_connected", state.peer_connected)
         .num("peer_disconnected", state.peer_disconnected)
         .float("disk_read_ms_avg", state.disk_read_ms_avg, 3)
