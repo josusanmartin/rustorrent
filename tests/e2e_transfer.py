@@ -35,8 +35,8 @@ def bencode(value):
     return b'd' + b''.join(bencode(k) + bencode(v) for k, v in sorted(value.items())) + b'e'
 
 
-def make_torrent(name=b'fixture.bin', multi=False):
-    info = {b'name': name, b'piece length': PIECE, b'private': 1,
+def make_torrent(name=b'fixture.bin', multi=False, private=True):
+    info = {b'name': name, b'piece length': PIECE, b'private': 1 if private else 0,
             b'pieces': b''.join(hashlib.sha1(PAYLOAD[i:i+PIECE]).digest() for i in range(0, len(PAYLOAD), PIECE))}
     if multi:
         info[b'files'] = [{b'length': PIECE * 2, b'path': [b'first.bin']},
@@ -95,9 +95,9 @@ class App:
         self.log = open(self.root / 'process.log', 'ab', buffering=0)
         self.process = None
 
-    def start(self, extra=None):
+    def start(self, extra=None, utp=False):
         self.process = subprocess.Popen([BINARY, '--ui', '--ui-addr', f'127.0.0.1:{self.ui}',
-            '--port', str(self.port), '--no-port-mapping', '--no-utp',
+            '--port', str(self.port), '--no-port-mapping'] + ([] if utp else ['--no-utp']) + [
             '--max-peers', '4', '--max-peers-torrent', '2', '--download-dir', str(self.root)] + (extra or []),
             stdout=self.log, stderr=self.log)
         wait_for(lambda: self.get('/status'))
@@ -374,6 +374,78 @@ class TransferTests(unittest.TestCase):
                 self.assertEqual(errors, [])
             finally:
                 proxy.shutdown()
+
+
+def holepunch_msg(kind, addr, code=0):
+    host, port = addr
+    return bytes([kind, 0]) + socket.inet_aton(host) + struct.pack('!HI', port, code)
+
+
+class HolepunchTests(unittest.TestCase):
+    """BEP 55 over real sockets: Rustorrent as the relay and as the target."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='rustorrent-e2e-')
+        self.app = App(self.temp.name)
+        self.app.start(utp=True)
+        torrent, self.info_hash, _ = make_torrent(private=False)
+        self.app.add(torrent)
+
+    def tearDown(self):
+        try:
+            self.app.stop()
+        finally:
+            self.app.log.close()
+            if os.environ.get('RUSTORRENT_E2E_LOG'):
+                print((self.app.root / 'process.log').read_text(errors='replace')[-16000:])
+            self.temp.cleanup()
+
+    def punch_peer(self, ext_id):
+        """Connects, advertises ut_holepunch and returns the peer's own
+        ut_holepunch ID from Rustorrent's extended handshake."""
+        sock = self.app.peer(self.info_hash)
+        send(sock, 20, b'\0' + bencode({b'm': {b'ut_holepunch': ext_id}}))
+        while True:
+            msg = message(sock)
+            if msg[:2] == b'\x14\x00':
+                found = re.search(br'12:ut_holepunchi([0-9]+)e', msg)
+                self.assertIsNotNone(found, 'ut_holepunch not advertised')
+                return sock, int(found.group(1))
+
+    def next_holepunch(self, sock, ext_id):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            msg = message(sock)
+            if msg[:2] == bytes([20, ext_id]):
+                return msg[2:]
+        self.fail('no ut_holepunch message')
+
+    def test_relay_introduces_two_connected_peers(self):
+        first, their_id = self.punch_peer(5)
+        second, _ = self.punch_peer(6)
+        with first, second:
+            first_addr = first.getsockname()
+            second_addr = second.getsockname()
+            time.sleep(.3)
+            send(first, 20, bytes([their_id]) + holepunch_msg(0, second_addr))
+            self.assertEqual(self.next_holepunch(first, 5), holepunch_msg(1, second_addr))
+            self.assertEqual(self.next_holepunch(second, 6), holepunch_msg(1, first_addr))
+            send(first, 20, bytes([their_id]) + holepunch_msg(0, ('127.0.0.1', 9)))
+            self.assertEqual(self.next_holepunch(first, 5), holepunch_msg(2, ('127.0.0.1', 9), 2))
+
+    def test_connect_message_opens_a_connection_to_the_target(self):
+        target = socket.socket()
+        target.bind(('127.0.0.1', 0))
+        target.listen(1)
+        target.settimeout(10)
+        relay, their_id = self.punch_peer(5)
+        with relay, target:
+            send(relay, 20, bytes([their_id]) + holepunch_msg(1, target.getsockname()))
+            conn, _ = target.accept()
+            with conn:
+                conn.settimeout(5)
+                handshake = read_exact(conn, 68)
+                self.assertEqual(handshake[28:48], self.info_hash)
 
 
 if __name__ == '__main__':

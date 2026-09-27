@@ -3,6 +3,7 @@ mod bencode;
 mod dht;
 mod firewall;
 mod geoip;
+mod holepunch;
 mod http;
 mod ip_filter;
 #[cfg(feature = "lpd")]
@@ -859,6 +860,9 @@ struct TorrentContext {
     metadata: Arc<Vec<u8>>,
     peer_queue: Arc<Mutex<PeerQueue>>,
     allow_pex: bool,
+    /// BEP 55 needs uTP, direct connections and a public torrent.
+    allow_holepunch: bool,
+    holepunch: holepunch::Holepunch,
     piece_buffer_budgets: piece::PieceBufferBudgets,
     ui_state: Option<Arc<Mutex<ui::UiState>>>,
     global_peer_slots: Arc<PeerSlots>,
@@ -4669,6 +4673,10 @@ fn run_torrent_once(
         metadata: Arc::clone(&metadata),
         peer_queue: Arc::clone(&peer_queue),
         allow_pex: !meta.info.private,
+        allow_holepunch: !meta.info.private
+            && connect_cfg.utp.is_some()
+            && connect_cfg.proxy.is_none(),
+        holepunch: holepunch::Holepunch::default(),
         piece_buffer_budgets: piece_buffer_budgets.clone(),
         ui_state: ui_state.clone(),
         global_peer_slots: Arc::clone(peer_slots),
@@ -4811,6 +4819,10 @@ fn run_torrent_once(
                         break;
                     }
                 }
+            }
+
+            for addr in context.holepunch.take_connects() {
+                spawn_holepunch_connect(&context, &connect_cfg, addr);
             }
 
             let (is_complete, completed_pieces, completed_bytes) = {
@@ -6443,10 +6455,25 @@ fn expected_metadata_piece_len(total: usize, piece: usize) -> Option<usize> {
 }
 
 fn build_ext_handshake(metadata_size: Option<usize>, allow_pex: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64);
+    build_ext_handshake_with(metadata_size, allow_pex, false)
+}
+
+fn build_ext_handshake_with(
+    metadata_size: Option<usize>,
+    allow_pex: bool,
+    holepunch: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(80);
     out.push(b'd');
     out.extend_from_slice(b"1:m");
     out.push(b'd');
+    // Keys sort bytewise: ut_holepunch < ut_metadata < ut_pex.
+    if holepunch {
+        out.extend_from_slice(b"12:ut_holepunch");
+        out.push(b'i');
+        out.extend_from_slice(holepunch::EXT_ID.to_string().as_bytes());
+        out.push(b'e');
+    }
     out.extend_from_slice(b"11:ut_metadatai1e");
     if allow_pex {
         out.extend_from_slice(b"6:ut_pexi2e");
@@ -6555,6 +6582,25 @@ fn request_metadata_pieces<W: Write>(
         sent += 1;
     }
     Ok(sent)
+}
+
+/// The peer's ut_holepunch ID and listening port from its extended handshake.
+fn parse_holepunch_caps(payload: &[u8]) -> (Option<u8>, Option<u16>) {
+    let Ok((dict, _)) = parse_bencode_dict(payload) else {
+        return (None, None);
+    };
+    let ext_id = match dict_get(&dict, b"m") {
+        Some(Value::Dict(items)) => items.iter().find_map(|(key, value)| match value {
+            Value::Int(id) if key == b"ut_holepunch" => u8::try_from(*id).ok(),
+            _ => None,
+        }),
+        _ => None,
+    };
+    let port = match dict_get(&dict, b"p") {
+        Some(Value::Int(port)) => u16::try_from(*port).ok(),
+        _ => None,
+    };
+    (ext_id.filter(|&id| id != 0), port.filter(|&port| port != 0))
 }
 
 fn parse_extended_handshake(payload: &[u8]) -> Result<ExtendedHandshakeCaps, String> {
@@ -6845,6 +6891,25 @@ impl PeerQueue {
 
     fn finish(&mut self, addr: SocketAddr) {
         self.inflight.remove(&addr);
+    }
+
+    /// Claims `addr` for a connection opened outside the queue; false when it
+    /// is filtered or a connection to it is already under way.
+    fn start_direct(&mut self, addr: SocketAddr) -> bool {
+        let addr = normalize_peer_addr(addr);
+        if self.inflight.contains(&addr)
+            || self.is_local_self_peer(addr)
+            || self.is_filtered(addr)
+            || self.is_banned(addr)
+        {
+            return false;
+        }
+        if self.queued.remove(&addr) {
+            self.queue.retain(|queued| *queued != addr);
+        }
+        self.deferred.retain(|deferred| deferred.addr != addr);
+        self.inflight.insert(addr);
+        true
     }
 
     fn note_failure(&mut self, addr: SocketAddr) -> Option<Duration> {
@@ -8241,6 +8306,45 @@ fn apply_piece_to_files(
     }
 }
 
+/// A relay told both sides to connect now: open the connection straight away,
+/// outside the worker queue, so both uTP SYNs cross while the NATs are open.
+fn spawn_holepunch_connect(
+    ctx: &Arc<TorrentContext>,
+    connect_cfg: &ConnectionConfig,
+    addr: SocketAddr,
+) {
+    if !lock_or_recover(&ctx.peer_queue).start_direct(addr) {
+        return;
+    }
+    let (Some(torrent_slot), Some(global_slot)) = (
+        ctx.torrent_peer_slots.try_acquire(),
+        ctx.global_peer_slots.try_acquire(),
+    ) else {
+        lock_or_recover(&ctx.peer_queue).finish(addr);
+        return;
+    };
+    let ctx_for_worker = Arc::clone(ctx);
+    let cfg = connect_cfg.clone();
+    let spawned = spawn_worker(
+        format!("holepunch-{}", ctx.id),
+        PEER_THREAD_STACK,
+        Box::new(move || {
+            let _slots = (torrent_slot, global_slot);
+            let ctx = ctx_for_worker;
+            let peer_tag = ctx.peer_tags.fetch_add(1, Ordering::SeqCst);
+            let result = download_from_peer_concurrent(addr, &ctx, peer_tag, &cfg, None);
+            record_peer_result(&mut lock_or_recover(&ctx.peer_queue), addr, &result);
+            if let Err(err) = &result {
+                log_debug!("holepunch peer {addr} error: {err}");
+                let _ = err;
+            }
+        }),
+    );
+    if spawned.is_err() {
+        lock_or_recover(&ctx.peer_queue).finish(addr);
+    }
+}
+
 fn peer_worker_loop(ctx: &TorrentContext, connect_cfg: &ConnectionConfig) {
     loop {
         if torrent_stop_requested(&ctx.stop_requested) {
@@ -8283,6 +8387,13 @@ fn peer_worker_loop(ctx: &TorrentContext, connect_cfg: &ConnectionConfig) {
         ctx.torrent_peer_slots.release();
 
         record_peer_result(&mut lock_or_recover(&ctx.peer_queue), addr, &result);
+        if let Err(err) = &result {
+            // Could not reach it directly: ask the peer that told us about
+            // it to introduce us (BEP 55).
+            if ctx.allow_holepunch && is_unreachable_peer_error(err) {
+                ctx.holepunch.request(addr, Instant::now());
+            }
+        }
         // Connection failures are routine in a swarm; they are logged for
         // diagnostics but never surfaced as a transfer error.
         if let Err(err) = &result {
@@ -10839,7 +10950,13 @@ fn download_from_peer_concurrent(
     PEER_CONNECTED.fetch_add(1, Ordering::SeqCst);
     let geo_cc = add_active_peer_session(&ctx.ui_state, ctx.id, &ctx.active_peers, addr);
 
+    if ctx.allow_holepunch {
+        ctx.holepunch.register(addr);
+    }
     let result = conn.run(&mut stream);
+    if ctx.allow_holepunch {
+        ctx.holepunch.unregister(addr);
+    }
     conn.teardown();
     remove_active_peer_session(&ctx.ui_state, ctx.id, &ctx.active_peers, geo_cc.as_deref());
     result
@@ -10905,7 +11022,11 @@ impl<'a> PeerConn<'a> {
             send_message(stream, &peer::Message::Bitfield(local_bitfield), "bitfield")?;
         }
         if extensions {
-            let payload = build_ext_handshake(Some(ctx.metadata.len()), ctx.allow_pex);
+            let payload = build_ext_handshake_with(
+                Some(ctx.metadata.len()),
+                ctx.allow_pex,
+                ctx.allow_holepunch,
+            );
             send_message(
                 stream,
                 &peer::Message::Extended { ext_id: 0, payload },
@@ -10945,6 +11066,7 @@ impl<'a> PeerConn<'a> {
             if let PeerStep::Close = self.fill_requests(stream)? {
                 return Ok(());
             }
+            self.send_holepunch(stream)?;
 
             let mut source = ReadAheadStream {
                 stream: &mut *stream,
@@ -10974,6 +11096,27 @@ impl<'a> PeerConn<'a> {
                 }
             }
         }
+    }
+
+    /// Sends ut_holepunch messages other connections queued for this peer.
+    fn send_holepunch(&mut self, stream: &mut PeerStream) -> Result<(), String> {
+        if !self.ctx.allow_holepunch {
+            return Ok(());
+        }
+        let Some((ext_id, messages)) = self.ctx.holepunch.take_outbox(self.addr) else {
+            return Ok(());
+        };
+        for msg in messages {
+            let payload = holepunch::encode(msg);
+            send_message(
+                stream,
+                &peer::Message::Extended { ext_id, payload },
+                "holepunch",
+            )?;
+        }
+        self.last_sent = Instant::now();
+        let _ = stream.flush();
+        Ok(())
     }
 
     fn teardown(&mut self) {
@@ -11441,6 +11584,10 @@ impl<'a> PeerConn<'a> {
                             self.peer_ut_pex = ut_pex;
                         }
                     }
+                    if ctx.allow_holepunch {
+                        let (ext_id, listen_port) = parse_holepunch_caps(&payload);
+                        ctx.holepunch.set_caps(self.addr, ext_id, listen_port);
+                    }
                 } else if ext_id == 1 {
                     if let Some(response_id) = self.peer_metadata_id {
                         serve_metadata_request(
@@ -11451,8 +11598,15 @@ impl<'a> PeerConn<'a> {
                             &mut self.metadata_bytes_served,
                         )?;
                     }
+                } else if ctx.allow_holepunch && ext_id == holepunch::EXT_ID {
+                    if let Some(msg) = holepunch::decode(&payload) {
+                        ctx.holepunch.on_message(self.addr, msg, Instant::now());
+                    }
                 } else if ctx.allow_pex && ext_id == 2 {
                     if let Ok(peers) = parse_ut_pex(&payload) {
+                        if ctx.allow_holepunch {
+                            ctx.holepunch.note_pex(self.addr, &peers);
+                        }
                         if !peers.is_empty() {
                             lock_or_recover(&ctx.peer_queue)
                                 .enqueue_with_source(peers, PeerSource::Pex);
@@ -12647,6 +12801,11 @@ fn is_retryable_peer_error(err: &str) -> bool {
         || err.contains("peer timed out")
         || err.contains("peer snubbed")
         || err == "connect failed"
+}
+
+/// Failed before a BitTorrent handshake started: nothing answered.
+fn is_unreachable_peer_error(err: &str) -> bool {
+    !err.contains("handshake") && !err.contains("self peer") && !err.contains("blocked")
 }
 
 fn record_peer_result(queue: &mut PeerQueue, addr: SocketAddr, result: &Result<(), String>) {
@@ -14293,6 +14452,34 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
     }
 
     #[test]
+    fn extended_handshake_advertises_holepunch_in_sorted_order() {
+        let payload = build_ext_handshake_with(Some(4096), true, true);
+        assert!(payload.starts_with(b"d1:md12:ut_holepunchi3e11:ut_metadatai1e6:ut_pexi2ee"));
+        assert_eq!(parse_holepunch_caps(&payload), (Some(3), None));
+        assert!(!build_ext_handshake(None, true)
+            .windows(12)
+            .any(|w| w == b"ut_holepunch"));
+        let libtorrent = b"d1:md12:ut_holepunchi4e6:ut_pexi1ee1:pi51413ee";
+        assert_eq!(parse_holepunch_caps(libtorrent), (Some(4), Some(51413)));
+        assert_eq!(
+            parse_holepunch_caps(b"d1:md12:ut_holepunchi0eee"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn holepunch_connect_claims_a_queued_peer() {
+        let mut queue = PeerQueue::new(None);
+        let addr: SocketAddr = "8.8.8.8:6881".parse().unwrap();
+        queue.enqueue_with_source([addr], PeerSource::Pex);
+        assert!(queue.start_direct(addr));
+        assert!(!queue.start_direct(addr), "already connecting");
+        assert_eq!(queue.pop(), None, "no second connection from the queue");
+        queue.finish(addr);
+        assert!(queue.start_direct(addr));
+    }
+
+    #[test]
     fn extended_handshake_roundtrip() {
         let payload = build_ext_handshake(Some(4096), true);
         let (ut_metadata, ut_pex, metadata_size) = parse_extended_handshake(&payload).unwrap();
@@ -14843,6 +15030,8 @@ mod core_helpers_tests {
             metadata: Arc::new(torrent::info_bytes(&torrent_bytes).unwrap().to_vec()),
             peer_queue: Arc::new(Mutex::new(PeerQueue::new(None))),
             allow_pex: true,
+            allow_holepunch: true,
+            holepunch: holepunch::Holepunch::default(),
             piece_buffer_budgets: piece::PieceBufferBudgets::new(
                 Arc::new(piece::PieceBufferBudget::new(MAX_GLOBAL_PIECE_BUFFER_BYTES)),
                 Arc::new(piece::PieceBufferBudget::new(

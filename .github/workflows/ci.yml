@@ -150,7 +150,7 @@ jobs:
       - name: Install test tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y transmission-daemon
+          sudo apt-get install -y transmission-daemon python3-libtorrent
           sudo systemctl stop transmission-daemon || true
           npm ci
           npx playwright install --with-deps chromium
@@ -160,5 +160,7 @@ jobs:
         run: python3 tests/e2e_transfer.py
       - name: Transmission interoperability, including required encryption
         run: python3 tests/e2e_transmission.py
+      - name: libtorrent uTP interoperability
+        run: python3 tests/e2e_libtorrent.py
       - name: Browser flows and accessibility
         run: npm run test:e2e

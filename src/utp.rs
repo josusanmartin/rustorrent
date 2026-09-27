@@ -9,6 +9,12 @@ use std::time::{Duration, Instant};
 const UTP_VERSION: u8 = 1;
 const UTP_HEADER_LEN: usize = 20;
 const UTP_PAYLOAD_MAX: usize = 1200;
+/// Largest payload accepted from a peer. We send at most UTP_PAYLOAD_MAX, but
+/// libtorrent and others fill the path MTU (about 1450 bytes on Ethernet, and
+/// much more on loopback).
+const UTP_RECV_PAYLOAD_MAX: usize = 16 * 1024;
+/// Room for the header and any extension headers in front of the payload.
+const UTP_RECV_DATAGRAM_MAX: usize = UTP_RECV_PAYLOAD_MAX + 1024;
 const UTP_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 const UTP_SYN_RETRY: Duration = Duration::from_secs(1);
 const UTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -664,7 +670,7 @@ fn utp_loop(
         accept_tx,
         waker,
     };
-    let mut buf = [0u8; 2048];
+    let mut buf = vec![0u8; UTP_RECV_DATAGRAM_MAX];
     let mut poll = None;
     let mut last_scan = Instant::now();
     let mut scan_due = false;
@@ -1166,7 +1172,7 @@ fn receive_overflow(conn: &mut ConnState) -> DataPacketOutcome {
 }
 
 fn handle_data_packet(conn: &mut ConnState, seq: u16, payload: &[u8]) -> DataPacketOutcome {
-    if payload.is_empty() || payload.len() > UTP_PAYLOAD_MAX {
+    if payload.is_empty() || payload.len() > UTP_RECV_PAYLOAD_MAX {
         conn.state = ConnStatus::Closed;
         return DataPacketOutcome::Reset;
     }
@@ -1605,10 +1611,17 @@ mod tests {
 
         let (mut conn, _stream) = receive_test_conn(0);
         assert_eq!(
-            handle_data_packet(&mut conn, 1, &vec![0; UTP_PAYLOAD_MAX + 1]),
+            handle_data_packet(&mut conn, 1, &vec![0; UTP_RECV_PAYLOAD_MAX + 1]),
             DataPacketOutcome::Reset
         );
         assert_eq!(conn.recv_budget.remaining_window(), RECEIVE_BUFFER_BYTES);
+        // libtorrent fills an Ethernet MTU: 1500 - IP - UDP - uTP headers.
+        let (mut conn, _stream) = receive_test_conn(0);
+        assert_eq!(
+            handle_data_packet(&mut conn, 1, &[3; 1452]),
+            DataPacketOutcome::State
+        );
+        assert_eq!(conn.recv_seq, 1);
     }
 
     #[test]
