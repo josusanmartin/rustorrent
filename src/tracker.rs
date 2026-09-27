@@ -42,7 +42,10 @@ pub(crate) fn announce_with_private_until(
     if private {
         query.push_str("&private=1");
     }
-    announce_query(announce_url, &query, proxy, deadline, true)
+    // Self-hosted and LAN trackers are normal, and UDP trackers already reach
+    // them. Through a proxy, local names would resolve on the proxy host, so
+    // only public targets are sent there.
+    announce_query(announce_url, &query, proxy, deadline, proxy.is_some())
 }
 
 #[cfg(test)]

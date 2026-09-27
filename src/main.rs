@@ -4682,7 +4682,6 @@ fn run_torrent_once(
         let mut last_progress_at = Instant::now();
         let mut rates = RateWindow::default();
         let mut round: Option<AnnounceRound> = None;
-        let mut tracker_error: Option<String> = None;
         // Track per-tracker failures for exponential backoff: url -> (fail_count, last_failure)
         let mut tracker_failures: HashMap<String, (u32, Instant)> = HashMap::new();
         let torrent_id = request.id;
@@ -4921,12 +4920,11 @@ fn run_torrent_once(
                 }
                 if current.pending == 0 || now >= current.deadline {
                     if current.any_success {
-                        tracker_error = None;
+                        // A tracker answered, so an earlier failure note is stale.
+                        announce_error.get_or_insert_with(String::new);
                         if current.completed_event {
                             completed_sent = true;
                         }
-                    } else {
-                        tracker_error = current.last_error.take();
                     }
                     round = None;
                 }
@@ -4941,8 +4939,6 @@ fn run_torrent_once(
                 "checking"
             } else if is_complete {
                 "seeding"
-            } else if tracker_error.is_some() && known_count == 0 && active_count == 0 {
-                "error"
             } else if round.is_some() && active_count == 0 {
                 "announcing"
             } else if active_count == 0 && known_count > 0 {
@@ -6958,17 +6954,16 @@ fn is_viable_peer_addr(addr: SocketAddr, source: PeerSource) -> bool {
             {
                 return false;
             }
-            let is_private = ip.is_private();
-            if matches!(source, PeerSource::Lpd) {
-                return true;
-            }
-            !is_private
+            // Home and office swarms run on private addresses, so trackers,
+            // PEX and magnet links may name them. The DHT is open to anyone
+            // and never has a reason to point at a private network.
+            !ip.is_private() || !matches!(source, PeerSource::Dht)
         }
         SocketAddr::V6(addr) => {
             let ip = *addr.ip();
             let segments = ip.segments();
             if (segments[0] & 0xfe00) == 0xfc00 {
-                return matches!(source, PeerSource::Lpd);
+                return !matches!(source, PeerSource::Dht);
             }
             (segments[0] & 0xe000) == 0x2000
                 && !(segments[0] == 0x2001 && (segments[1] & 0xfe00) == 0)
@@ -14034,21 +14029,25 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
     }
 
     #[test]
-    fn magnet_parser_rejects_explicit_peers_outside_public_scope() {
+    fn magnet_parser_rejects_explicit_peers_outside_routable_scope() {
         let link = "\
 magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
 &x.pe=127.0.0.1:6881\
 &x.pe=10.0.0.1:6881\
 &x.pe=169.254.1.1:6881\
 &x.pe=192.0.0.1:6881\
-&x.pe=[::ffff:192.168.1.1]:6881\
-&x.pe=[fc00::1]:6881\
 &x.pe=[fe80::1]:6881\
 &x.pe=8.8.8.8:0\
 &x.pe=[::ffff:8.8.8.8]:6881";
 
         let parsed = parse_magnet(link).unwrap();
-        assert_eq!(parsed.peers, vec!["8.8.8.8:6881".parse().unwrap()]);
+        assert_eq!(
+            parsed.peers,
+            vec![
+                "10.0.0.1:6881".parse().unwrap(),
+                "8.8.8.8:6881".parse().unwrap()
+            ]
+        );
     }
 
     #[test]
@@ -17838,7 +17837,6 @@ mod core_helpers_tests {
             [
                 "0.0.0.0:0".parse().unwrap(),
                 "127.0.0.1:6881".parse().unwrap(),
-                "10.0.0.2:6881".parse().unwrap(),
                 "169.254.1.9:6881".parse().unwrap(),
                 "203.0.113.10:6881".parse().unwrap(),
                 "8.8.8.8:6881".parse().unwrap(),
@@ -17870,7 +17868,6 @@ mod core_helpers_tests {
         let added = queue.enqueue_with_source(
             [
                 "[::ffff:127.0.0.1]:6881".parse().unwrap(),
-                "[::ffff:192.168.1.1]:6881".parse().unwrap(),
                 "[::ffff:169.254.1.1]:6881".parse().unwrap(),
                 "[::ffff:203.0.113.9]:6881".parse().unwrap(),
                 "[64:ff9b:1::c0a8:1]:6881".parse().unwrap(),
@@ -17893,15 +17890,30 @@ mod core_helpers_tests {
     }
 
     #[test]
+    fn lan_peers_are_accepted_from_everything_but_the_dht() {
+        for lan_peer in [
+            "10.0.0.2:6881",
+            "[::ffff:192.168.1.5]:51413",
+            "[fd00::5]:6881",
+        ] {
+            let addr: SocketAddr = lan_peer.parse().unwrap();
+            for source in [PeerSource::Tracker, PeerSource::Pex, PeerSource::Magnet] {
+                assert!(
+                    safe_metadata_peer(addr, source, None).is_some(),
+                    "{lan_peer}"
+                );
+            }
+            assert!(safe_metadata_peer(addr, PeerSource::Dht, None).is_none());
+        }
+    }
+
+    #[test]
     fn metadata_discovery_filters_tracker_dht_and_magnet_scope_before_connecting() {
         for unsafe_peer in [
             "127.0.0.1:6881",
-            "10.0.0.1:6881",
             "169.254.1.1:6881",
             "192.0.0.1:6881",
-            "[::ffff:192.168.1.1]:6881",
             "[64:ff9b:1::c0a8:1]:6881",
-            "[fc00::1]:6881",
             "[fe80::1]:6881",
         ] {
             assert!(

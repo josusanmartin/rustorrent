@@ -5,6 +5,7 @@ python3 tests/e2e_transmission.py [path/to/rustorrent]
 """
 import base64
 import http.client
+import ipaddress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -15,26 +16,30 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from urllib.parse import parse_qs, urlsplit
 
 from e2e_transfer import App, PAYLOAD, bencode, free_port, make_torrent, wait_for
 
 
 class InteropTests(unittest.TestCase):
-    def run_transfer(self, rustorrent_seeds, encryption=1):
+    def run_transfer(self, rustorrent_seeds, encryption=1, dial_out=False):
         with tempfile.TemporaryDirectory(prefix='rustorrent-transmission-') as directory:
             root = Path(directory)
             rust_root, tr_root, config = (root / name for name in ('rustorrent', 'transmission', 'config'))
             for folder in (rust_root, tr_root, config):
                 folder.mkdir()
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+                route.connect(('192.0.2.1', 9))
+                peer_ip = route.getsockname()[0]
+            if dial_out and not any(ipaddress.ip_address(peer_ip) in ipaddress.ip_network(net)
+                                   for net in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')):
+                self.skipTest(f'needs a LAN address, this host has {peer_ip}')
             app = App(rust_root)
             if rustorrent_seeds:
                 (rust_root / 'fixture.bin').write_bytes(PAYLOAD)
             else:
                 (tr_root / 'fixture.bin').write_bytes(PAYLOAD)
-            rpc_port = free_port()
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
-                route.connect(('192.0.2.1', 9))
-                peer_ip = route.getsockname()[0]
+            rpc_port, tr_port = free_port(), free_port()
             settings = {'rpc-authentication-required': False, 'rpc-whitelist-enabled': True,
                         'rpc-whitelist': '127.0.0.1', 'rpc-host-whitelist-enabled': False,
                         'rpc-bind-address': '127.0.0.1', 'peer-exchange-enabled': False,
@@ -45,7 +50,15 @@ class InteropTests(unittest.TestCase):
 
             class Tracker(BaseHTTPRequestHandler):
                 def do_GET(self):
-                    peers = socket.inet_aton(peer_ip) + struct.pack('!H', app.port)
+                    # dial_out tells only Rustorrent about Transmission, over
+                    # the LAN address, so the seed has to connect out itself.
+                    port = parse_qs(urlsplit(self.path).query).get('port', [''])[0]
+                    if not dial_out:
+                        peers = socket.inet_aton(peer_ip) + struct.pack('!H', app.port)
+                    elif port == str(app.port):
+                        peers = socket.inet_aton(peer_ip) + struct.pack('!H', tr_port)
+                    else:
+                        peers = b''
                     body = bencode({b'interval': 1, b'peers': peers, b'complete': 1, b'incomplete': 1})
                     self.send_response(200)
                     self.send_header('Content-Length', str(len(body)))
@@ -86,7 +99,7 @@ class InteropTests(unittest.TestCase):
                 app.start()
                 tid = app.add(torrent)
                 daemon = subprocess.Popen(['transmission-daemon', '--foreground', '--config-dir', str(config),
-                    '--port', str(rpc_port), '--peerport', str(free_port()), '--no-portmap', '--no-dht', '--no-lpd',
+                    '--port', str(rpc_port), '--peerport', str(tr_port), '--no-portmap', '--no-dht', '--no-lpd',
                     '--no-utp', '--no-auth'], stdout=log, stderr=log)
                 wait_for(lambda: rpc('session-get'), seconds=15)
                 rpc('session-set', {'encryption': 'required' if encryption == 2 else 'preferred'})
@@ -115,6 +128,9 @@ class InteropTests(unittest.TestCase):
 
     def test_upload_to_transmission(self):
         self.run_transfer(True)
+
+    def test_seed_connects_out_to_lan_leecher(self):
+        self.run_transfer(True, dial_out=True)
 
     def test_download_from_transmission(self):
         self.run_transfer(False)

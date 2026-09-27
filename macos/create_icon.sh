@@ -1,100 +1,81 @@
 #!/bin/bash
-# Creates a simple app icon for Rustorrent using ImageMagick or a fallback
+# Builds macos/AppIcon.icns from macos/AppIcon.svg, the Rustorrent mark on the
+# macOS icon grid (the same mark as docs/assets/logo.svg and the web UI).
+#
+# Needs python3 with Pillow, plus one SVG renderer: rsvg-convert, or a
+# Chromium-based browser (set CHROME=/path/to/chrome, otherwise Google
+# Chrome.app or chromium on PATH). The SVG is rendered once at 1024 px and
+# scaled down; large sizes are palette-quantized to keep the DMG small.
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ICONSET_DIR="$SCRIPT_DIR/AppIcon.iconset"
-ICON_OUTPUT="$SCRIPT_DIR/AppIcon.icns"
+SVG="$SCRIPT_DIR/AppIcon.svg"
+OUTPUT="$SCRIPT_DIR/AppIcon.icns"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
 
-mkdir -p "$ICONSET_DIR"
-
-# Function to create icon using Python (available on macOS)
-create_icon_python() {
-    python3 << 'PYTHON_SCRIPT'
-import os
-import struct
-import zlib
-
-def create_png(width, height, filename):
-    """Create a simple PNG icon with 'R' letter and gradient background"""
-
-    def write_chunk(f, chunk_type, data):
-        chunk = chunk_type + data
-        f.write(struct.pack('>I', len(data)))
-        f.write(chunk)
-        f.write(struct.pack('>I', zlib.crc32(chunk) & 0xffffffff))
-
-    # Create pixel data with gradient and 'R' letter
-    pixels = []
-    for y in range(height):
-        row = [0]  # Filter byte
-        for x in range(width):
-            # Gradient background (orange to red)
-            r = min(255, 200 + int(55 * x / width))
-            g = max(0, 100 - int(100 * y / height))
-            b = 50
-
-            # Draw 'R' letter in white
-            cx, cy = x - width//4, y - height//4
-            w, h = width//2, height//2
-            in_letter = False
-
-            # Vertical bar of R
-            if 0.15*w <= cx <= 0.35*w and 0.1*h <= cy <= 0.9*h:
-                in_letter = True
-            # Top curve of R
-            elif 0.35*w <= cx <= 0.7*w and 0.1*h <= cy <= 0.25*h:
-                in_letter = True
-            elif 0.35*w <= cx <= 0.7*w and 0.4*h <= cy <= 0.55*h:
-                in_letter = True
-            elif 0.6*w <= cx <= 0.75*w and 0.2*h <= cy <= 0.45*h:
-                in_letter = True
-            # Diagonal leg of R
-            elif 0.35*w <= cx <= 0.75*w and 0.5*h <= cy <= 0.9*h:
-                diag = (cy - 0.5*h) / (0.4*h)
-                if 0.35*w + diag*0.25*w <= cx <= 0.55*w + diag*0.25*w:
-                    in_letter = True
-
-            if in_letter:
-                r, g, b = 255, 255, 255
-
-            row.extend([r, g, b, 255])
-        pixels.append(bytes(row))
-
-    raw_data = b''.join(pixels)
-    compressed = zlib.compress(raw_data, 9)
-
-    with open(filename, 'wb') as f:
-        # PNG signature
-        f.write(b'\x89PNG\r\n\x1a\n')
-        # IHDR
-        ihdr_data = struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0)
-        write_chunk(f, b'IHDR', ihdr_data)
-        # IDAT
-        write_chunk(f, b'IDAT', compressed)
-        # IEND
-        write_chunk(f, b'IEND', b'')
-
-sizes = [16, 32, 64, 128, 256, 512, 1024]
-iconset_dir = os.environ.get('ICONSET_DIR', 'AppIcon.iconset')
-
-for size in sizes:
-    create_png(size, size, f'{iconset_dir}/icon_{size}x{size}.png')
-    if size <= 512:
-        create_png(size*2, size*2, f'{iconset_dir}/icon_{size}x{size}@2x.png')
-
-print("Icon PNGs created successfully")
-PYTHON_SCRIPT
+find_chrome() {
+  if [[ -n "${CHROME:-}" ]]; then echo "$CHROME"; return; fi
+  local app="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  if [[ -x "$app" ]]; then echo "$app"; return; fi
+  command -v chromium || command -v chromium-browser || command -v google-chrome || true
 }
 
-echo "Creating icon images..."
-ICONSET_DIR="$ICONSET_DIR" create_icon_python
+if command -v rsvg-convert >/dev/null; then
+  rsvg-convert -w 1024 -h 1024 "$SVG" -o "$WORK/master.png"
+else
+  chrome="$(find_chrome)"
+  if [[ -z "$chrome" ]]; then
+    echo "install rsvg-convert (brew install librsvg) or set CHROME" >&2
+    exit 1
+  fi
+  { printf '<html><style>body{margin:0}svg{display:block;width:1024px;height:1024px}</style><body>'
+    cat "$SVG"; } > "$WORK/page.html"
+  sandbox=()
+  [[ "$(id -u)" == 0 ]] && sandbox=(--no-sandbox)
+  # Headless viewports are shorter than the window, so leave room and crop.
+  "$chrome" --headless "${sandbox[@]}" --disable-gpu --hide-scrollbars --force-device-scale-factor=1 \
+    --default-background-color=00000000 --window-size=1024,1280 \
+    --screenshot="$WORK/master.png" "file://$WORK/page.html" >/dev/null 2>&1
+fi
 
-echo "Converting to icns..."
-iconutil -c icns "$ICONSET_DIR" -o "$ICON_OUTPUT"
+# An .icns file is a list of (type, length, PNG) records.
+python3 - "$WORK/master.png" "$OUTPUT" <<'PYTHON'
+import io, struct, sys
+from PIL import Image, ImageChops
 
-echo "Cleaning up..."
-rm -rf "$ICONSET_DIR"
+master = Image.open(sys.argv[1]).convert('RGBA').crop((0, 0, 1024, 1024))
 
-echo "Icon created: $ICON_OUTPUT"
+def dithered(image):
+    # A light 4x4 ordered dither hides palette banding in the gradient.
+    bayer = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
+    cell = Image.new('L', (4, 4))
+    cell.putdata([int(128 + (v - 7.5) * 0.6) for v in bayer])
+    noise = Image.new('L', image.size)
+    for y in range(0, image.height, 4):
+        for x in range(0, image.width, 4):
+            noise.paste(cell, (x, y))
+    r, g, b, a = image.split()
+    shift = lambda band: ImageChops.add(band, noise, 1, -128)
+    return Image.merge('RGBA', (shift(r), shift(g), shift(b), a))
+
+def png(size):
+    image = master.resize((size, size), Image.LANCZOS)
+    if size >= 256:
+        image = dithered(image).quantize(256, method=Image.Quantize.FASTOCTREE)
+    out = io.BytesIO()
+    image.save(out, 'PNG', optimize=True)
+    return out.getvalue()
+
+types = [('icp4', 16), ('icp5', 32), ('ic11', 32), ('icp6', 64), ('ic12', 64),
+         ('ic07', 128), ('ic08', 256), ('ic13', 256), ('ic09', 512), ('ic14', 512), ('ic10', 1024)]
+cache = {}
+body = b''
+for kind, size in types:
+    data = cache.setdefault(size, png(size))
+    body += kind.encode() + struct.pack('>I', len(data) + 8) + data
+open(sys.argv[2], 'wb').write(b'icns' + struct.pack('>I', len(body) + 8) + body)
+PYTHON
+
+echo "wrote $OUTPUT ($(wc -c < "$OUTPUT") bytes)"

@@ -54,7 +54,7 @@ input[type=checkbox]{width:15px;height:15px;margin:0;accent-color:var(--accent-b
 .app{display:grid;grid-template-columns:212px minmax(0,1fr);height:100vh;height:100dvh}
 .side{display:flex;flex-direction:column;gap:2px;min-height:0;padding:14px 10px 10px;background:var(--bg);border-right:1px solid var(--line);overflow-y:auto}
 .brand{display:flex;align-items:center;gap:9px;padding:2px 8px 14px;font-weight:650;font-size:14px;letter-spacing:-.01em}
-.logo{display:grid;place-items:center;width:24px;height:24px;border-radius:7px;background:var(--accent-bg);color:#fff}
+.logo{display:grid;place-items:center;width:24px;height:24px;border-radius:7px;background:linear-gradient(135deg,#4f8cff,#1d4ed8);color:#fff}
 .logo .i{width:15px;height:15px;stroke-width:2.2}
 .nav-h{padding:14px 8px 4px}
 .nav{display:flex;align-items:center;gap:9px;width:100%;height:30px;padding:0 8px;border:0;border-radius:6px;background:none;color:var(--fg);text-align:left;cursor:pointer;transition:background .15s}
