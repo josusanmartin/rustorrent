@@ -96,17 +96,36 @@ enum Command {
 
 pub fn start(bind_port: u16, download_dir: &Path) -> Dht {
     let (cmd_tx, cmd_rx) = mpsc::channel();
-    let cache = match NodeCache::new(download_dir) {
+    let cache = open_cache(download_dir);
+    thread::spawn(move || {
+        if let Some(socket) = bind_socket(bind_port) {
+            let _ = socket.set_read_timeout(Some(DHT_POLL_INTERVAL));
+            dht_thread(socket, None, cmd_rx, cache, Vec::new());
+        }
+    });
+    Dht { cmd_tx }
+}
+
+/// Runs the DHT on uTP's socket: it sends through the clone and receives the
+/// datagrams the uTP loop hands over. The shared socket's read timeout
+/// belongs to uTP and is left alone.
+pub fn start_shared(shared: crate::utp::SharedUdp, download_dir: &Path) -> Dht {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let cache = open_cache(download_dir);
+    thread::spawn(move || {
+        dht_thread(shared.socket, Some(shared.rx), cmd_rx, cache, Vec::new());
+    });
+    Dht { cmd_tx }
+}
+
+fn open_cache(download_dir: &Path) -> Option<NodeCache> {
+    match NodeCache::new(download_dir) {
         Ok(cache) => Some(cache),
         Err(err) => {
             crate::log_stderr(format_args!("dht cache disabled: {err}"));
             None
         }
-    };
-    thread::spawn(move || {
-        dht_thread(bind_port, cmd_rx, cache, Vec::new());
-    });
-    Dht { cmd_tx }
+    }
 }
 
 #[cfg(test)]
@@ -124,7 +143,10 @@ pub fn start_with_test_candidate(
         last_seen: Instant::now(),
     };
     thread::spawn(move || {
-        dht_thread(bind_port, cmd_rx, cache, vec![candidate]);
+        if let Some(socket) = bind_socket(bind_port) {
+            let _ = socket.set_read_timeout(Some(DHT_POLL_INTERVAL));
+            dht_thread(socket, None, cmd_rx, cache, vec![candidate]);
+        }
     });
     Dht { cmd_tx }
 }
@@ -1464,31 +1486,59 @@ fn collect_bootstrap_resolutions_at(
     }
 }
 
-fn dht_thread(
-    bind_port: u16,
-    cmd_rx: mpsc::Receiver<Command>,
-    cache: Option<NodeCache>,
-    test_candidates: Vec<Node>,
-) {
-    let socket = match UdpSocket::bind(("0.0.0.0", bind_port)) {
-        Ok(socket) => socket,
+fn bind_socket(bind_port: u16) -> Option<UdpSocket> {
+    match UdpSocket::bind(("0.0.0.0", bind_port)) {
+        Ok(socket) => Some(socket),
         Err(_) => match UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, bind_port)) {
-            Ok(socket) => socket,
+            Ok(socket) => Some(socket),
             Err(err) => {
                 crate::log_stderr(format_args!(
                     "dht bind {bind_port} failed: {err}, using ephemeral port"
                 ));
                 match UdpSocket::bind("0.0.0.0:0") {
-                    Ok(socket) => socket,
+                    Ok(socket) => Some(socket),
                     Err(err) => {
                         crate::log_stderr(format_args!("dht bind failed: {err}"));
-                        return;
+                        None
                     }
                 }
             }
         },
+    }
+}
+
+/// One datagram for the DHT: from its own socket, or from uTP's loop when the
+/// socket is shared. Waits at most DHT_POLL_INTERVAL.
+fn receive(
+    socket: &UdpSocket,
+    shared_rx: Option<&mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+    buf: &mut [u8],
+) -> Option<(usize, SocketAddr)> {
+    let Some(rx) = shared_rx else {
+        return socket.recv_from(buf).ok();
     };
-    let _ = socket.set_read_timeout(Some(DHT_POLL_INTERVAL));
+    match rx.recv_timeout(DHT_POLL_INTERVAL) {
+        Ok((packet, from)) if packet.len() <= buf.len() => {
+            buf[..packet.len()].copy_from_slice(&packet);
+            Some((packet.len(), from))
+        }
+        Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => None,
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            // uTP's loop is gone; keep the DHT's timers ticking at the
+            // normal pace instead of spinning.
+            thread::sleep(DHT_POLL_INTERVAL);
+            None
+        }
+    }
+}
+
+fn dht_thread(
+    socket: UdpSocket,
+    shared_rx: Option<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+    cmd_rx: mpsc::Receiver<Command>,
+    cache: Option<NodeCache>,
+    test_candidates: Vec<Node>,
+) {
     // Remote public nodes are admitted only after BEP 42 validation. Our own
     // ID remains random because this process does not yet have a trustworthy
     // consensus view of its externally mapped address; guessing from one
@@ -1677,7 +1727,7 @@ fn dht_thread(
         }
 
         let mut buf = [0u8; 1500];
-        if let Ok((n, addr)) = socket.recv_from(&mut buf) {
+        if let Some((n, addr)) = receive(&socket, shared_rx.as_ref(), &mut buf) {
             let addr = normalize_dht_addr(addr);
             if let Ok(Value::Dict(dict)) = bencode::parse(&buf[..n]) {
                 if let Some(Value::Bytes(y)) = dict_get(&dict, b"y") {

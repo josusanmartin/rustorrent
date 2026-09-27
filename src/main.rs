@@ -51,6 +51,10 @@ mod dht {
         Dht
     }
 
+    pub fn start_shared(_shared: crate::utp::SharedUdp, _download_dir: &Path) -> Dht {
+        Dht
+    }
+
     pub fn disabled() -> Dht {
         Dht
     }
@@ -209,8 +213,14 @@ mod utp {
     #[derive(Clone)]
     pub struct UtpStream;
 
-    pub fn start(_port: u16) -> (UtpConnector, UtpListener) {
-        (UtpConnector, UtpListener)
+    #[allow(dead_code)]
+    pub struct SharedUdp {
+        pub socket: std::net::UdpSocket,
+        pub rx: std::sync::mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    }
+
+    pub fn start_shared(_port: u16) -> (UtpConnector, UtpListener, Option<SharedUdp>) {
+        (UtpConnector, UtpListener, None)
     }
 
     impl UtpConnector {
@@ -3087,8 +3097,10 @@ fn run() -> Result<(), String> {
         None
     };
     let mut utp_listener_handle = None;
+    let mut shared_udp = None;
     let utp_connector = if args.enable_utp && direct_discovery {
-        let (connector, listener) = utp::start(args.port);
+        let (connector, listener, shared) = utp::start_shared(args.port);
+        shared_udp = shared;
         match start_utp_listener(listener, registry.clone(), inbound.clone()) {
             Ok(handle) => utp_listener_handle = Some(handle),
             Err(err) => {
@@ -3100,11 +3112,16 @@ fn run() -> Result<(), String> {
         None
     };
     let dht = if direct_discovery {
-        // uTP and DHT are different protocols over UDP. Until they share a
-        // demultiplexing socket, reserve the configured/mapped UDP port for
-        // uTP and let DHT advertise its own ephemeral source port.
-        let dht_port = if args.enable_utp { 0 } else { args.port };
-        dht::start(dht_port, &args.download_dir)
+        // DHT and uTP share the forwarded UDP port: the uTP loop passes DHT
+        // datagrams on. If uTP could not open it, DHT tries on its own and
+        // keeps the port free for uTP only when uTP is actually running.
+        match shared_udp {
+            Some(shared) => dht::start_shared(shared, &args.download_dir),
+            None => dht::start(
+                if args.enable_utp { 0 } else { args.port },
+                &args.download_dir,
+            ),
+        }
     } else {
         dht::disabled()
     };

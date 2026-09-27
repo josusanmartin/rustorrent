@@ -25,6 +25,7 @@ const INITIAL_CWND: usize = 4;
 const MAX_CWND: usize = 64;
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_PENDING_ACCEPTS: usize = 128;
+const MAX_PENDING_DHT_DATAGRAMS: usize = 1024;
 const MAX_INBOUND_CONNECTIONS: usize = 256;
 const MAX_INBOUND_CONNECTIONS_PER_IP: usize = 16;
 const RECEIVE_BUFFER_BYTES: usize = 64 * 1024;
@@ -91,17 +92,57 @@ impl Waker {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn start(port: u16) -> (UtpConnector, UtpListener) {
+    let (connector, listener, _) = start_inner(port, false);
+    (connector, listener)
+}
+
+/// uTP's UDP socket lent to the DHT: a clone for sending, and the DHT
+/// datagrams the uTP loop receives on it.
+#[cfg_attr(not(feature = "dht"), allow(dead_code))]
+pub struct SharedUdp {
+    pub socket: UdpSocket,
+    pub rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+}
+
+/// Starts uTP on `port` and hands DHT traffic arriving on the same socket to
+/// the returned channel, so both protocols share one (forwarded) UDP port the
+/// way other clients do. None when the socket could not be opened.
+pub fn start_shared(port: u16) -> (UtpConnector, UtpListener, Option<SharedUdp>) {
+    start_inner(port, true)
+}
+
+fn start_inner(port: u16, share: bool) -> (UtpConnector, UtpListener, Option<SharedUdp>) {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (accept_tx, accept_rx) = mpsc::sync_channel(MAX_PENDING_ACCEPTS);
     let socket = UdpSocket::bind(("0.0.0.0", port))
         .or_else(|_| UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port)));
     let waker = Arc::new(Waker::new(socket.as_ref().ok()));
+    let mut shared = None;
     if let Ok(socket) = socket {
+        let mut dht_tx = None;
+        if share {
+            if let Ok(send) = socket.try_clone() {
+                let (tx, rx) = mpsc::sync_channel(MAX_PENDING_DHT_DATAGRAMS);
+                dht_tx = Some(tx);
+                shared = Some(SharedUdp { socket: send, rx });
+            }
+        }
         let waker = Arc::clone(&waker);
-        thread::spawn(move || utp_loop(socket, cmd_rx, accept_tx, waker));
+        thread::spawn(move || utp_loop(socket, cmd_rx, accept_tx, waker, dht_tx));
     }
-    (UtpConnector { cmd_tx, waker }, UtpListener { accept_rx })
+    (
+        UtpConnector { cmd_tx, waker },
+        UtpListener { accept_rx },
+        shared,
+    )
+}
+
+/// DHT messages are bencoded dictionaries, so they start with `d`. A uTP
+/// header starts with (type << 4) | version 1, and no uTP type maps to `d`.
+fn is_dht_datagram(packet: &[u8]) -> bool {
+    packet.first() == Some(&b'd')
 }
 
 impl UtpConnector {
@@ -611,6 +652,7 @@ fn utp_loop(
     cmd_rx: mpsc::Receiver<Command>,
     accept_tx: mpsc::SyncSender<UtpStream>,
     waker: Arc<Waker>,
+    dht_tx: Option<mpsc::SyncSender<(Vec<u8>, SocketAddr)>>,
 ) {
     let mut state = Loop {
         io: Io {
@@ -645,6 +687,13 @@ fn utp_loop(
         }
         match socket.recv_from(&mut buf) {
             Ok((0, from)) if normalize_ip(from.ip()).is_loopback() => scan_due = true,
+            Ok((n, from)) if dht_tx.is_some() && is_dht_datagram(&buf[..n]) => {
+                // A full queue means the DHT is behind; dropping a UDP
+                // datagram is what the network would do anyway.
+                if let Some(tx) = &dht_tx {
+                    let _ = tx.try_send((buf[..n].to_vec(), from));
+                }
+            }
             Ok((n, from)) => state.handle_datagram(&buf[..n], from),
             Err(_) => scan_due = true,
         }
@@ -1698,6 +1747,36 @@ mod tests {
         let left: Vec<u16> = conn.inflight.iter().map(|packet| packet.seq).collect();
         assert_eq!(left, vec![11, 12, 14]);
         assert_eq!(conn.inflight_bytes, 300);
+    }
+
+    #[test]
+    fn shared_socket_hands_dht_datagrams_over_and_keeps_utp() {
+        let port = free_port();
+        let (_connector, listener, shared) = start_shared(port);
+        let shared = shared.expect("shared socket");
+        assert_eq!(shared.socket.local_addr().unwrap().port(), port);
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let target: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        let ping = b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe";
+        peer.send_to(ping, target).unwrap();
+        let (received, from) = shared.rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(received, ping);
+        assert_eq!(from, peer.local_addr().unwrap());
+        // The DHT answers through its clone, from the same port.
+        shared.socket.send_to(b"d1:y1:re", from).unwrap();
+        let mut reply = [0u8; 16];
+        let (n, source) = peer.recv_from(&mut reply).unwrap();
+        assert_eq!((&reply[..n], source.port()), (&b"d1:y1:re"[..], port));
+
+        // uTP on the same port still accepts connections.
+        peer.send_to(&packet(TYPE_SYN, 700, 1000, 0, &[]), target)
+            .unwrap();
+        let (bytes, _) = recv_packet(&peer);
+        assert_eq!(parse_packet(&bytes).unwrap().ty, TYPE_STATE);
+        accept_within(&listener, Duration::from_secs(3));
+        assert!(shared.rx.try_recv().is_err(), "uTP stays with uTP");
     }
 
     #[test]
