@@ -68,6 +68,8 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let webViewLoadTimeout: TimeInterval = 10
     private let curlOutputLimit = 64 * 1024
     private let openUiOnLaunchKey = "open_ui_on_launch"
+    private let menuBarOnlyKey = "menu_bar_only_when_closed"
+    private let menuBarOnlyItemTag = 4201
     private let downloadDirectoryKey = "download_directory"
 
     private let toolbarIdentifier = NSToolbar.Identifier("RustorrentToolbar")
@@ -89,6 +91,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private var preferencesWindow: NSWindow?
     private var openUiCheckbox: NSButton?
+    private var menuBarOnlyCheckbox: NSButton?
     private var downloadDirField: NSTextField?
     private var mainWindow: NSWindow?
     private var webView: WKWebView?
@@ -111,6 +114,9 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         buildStatusItem()
         collectStartupTorrentFiles(from: CommandLine.arguments)
         openUiWhenReady = openUiOnLaunchEnabled() || !pendingTorrentFiles.isEmpty
+        if !openUiWhenReady {
+            updateDockPresence()
+        }
         if openUiWhenReady {
             showMainWindow()
             loadPlaceholderPage(
@@ -174,6 +180,9 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     @objc
     private func showPreferencesWindow() {
+        if NSApp.activationPolicy() != .regular {
+            NSApp.setActivationPolicy(.regular)
+        }
         if let window = preferencesWindow {
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -181,7 +190,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 220),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 250),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -189,6 +198,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         window.center()
         window.title = "Rustorrent Preferences"
         window.isReleasedWhenClosed = false
+        window.delegate = self
 
         let content = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = content
@@ -198,8 +208,16 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
             target: self,
             action: #selector(toggleOpenUiOnLaunch(_:))
         )
-        openUi.frame = NSRect(x: 20, y: 170, width: 500, height: 24)
+        openUi.frame = NSRect(x: 20, y: 206, width: 500, height: 24)
         content.addSubview(openUi)
+
+        let menuBarOnly = NSButton(
+            checkboxWithTitle: "Keep only the menu bar icon when the window is closed",
+            target: self,
+            action: #selector(toggleMenuBarOnly(_:))
+        )
+        menuBarOnly.frame = NSRect(x: 20, y: 176, width: 500, height: 24)
+        content.addSubview(menuBarOnly)
 
         let dirLabel = NSTextField(labelWithString: "Download Directory")
         dirLabel.frame = NSRect(x: 20, y: 130, width: 200, height: 18)
@@ -230,6 +248,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
 
         preferencesWindow = window
         openUiCheckbox = openUi
+        menuBarOnlyCheckbox = menuBarOnly
         downloadDirField = dirField
         refreshPreferencesControls()
 
@@ -307,6 +326,16 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
     @objc
     private func toggleOpenUiOnLaunch(_ sender: NSButton) {
         setOpenUiOnLaunchEnabled(sender.state == .on)
+    }
+
+    @objc
+    private func toggleMenuBarOnly(_ sender: NSButton) {
+        setMenuBarOnlyEnabled(sender.state == .on)
+    }
+
+    @objc
+    private func toggleMenuBarOnlyFromMenu() {
+        setMenuBarOnlyEnabled(!menuBarOnlyEnabled())
     }
 
     @objc
@@ -517,6 +546,16 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         refresh.target = self
         menu.addItem(refresh)
 
+        let menuBarOnly = NSMenuItem(
+            title: "Hide Dock Icon When Window Is Closed",
+            action: #selector(toggleMenuBarOnlyFromMenu),
+            keyEquivalent: ""
+        )
+        menuBarOnly.target = self
+        menuBarOnly.tag = menuBarOnlyItemTag
+        menuBarOnly.state = menuBarOnlyEnabled() ? .on : .off
+        menu.addItem(menuBarOnly)
+
         menu.addItem(NSMenuItem.separator())
 
         let quit = NSMenuItem(title: "Quit Rustorrent", action: #selector(quitFromMenu), keyEquivalent: "")
@@ -571,6 +610,10 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
     private func showMainWindow() {
         createMainWindowIfNeeded()
         log("showing main window")
+        // Bring the Dock icon and app menus back while a window is open.
+        if NSApp.activationPolicy() != .regular {
+            NSApp.setActivationPolicy(.regular)
+        }
         mainWindow?.orderFrontRegardless()
         mainWindow?.makeKey()
         mainWindow?.makeMain()
@@ -653,6 +696,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private func refreshPreferencesControls() {
         openUiCheckbox?.state = openUiOnLaunchEnabled() ? .on : .off
+        menuBarOnlyCheckbox?.state = menuBarOnlyEnabled() ? .on : .off
         downloadDirField?.stringValue = currentDownloadDirectoryURL().path
     }
 
@@ -1139,6 +1183,36 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         UserDefaults.standard.set(enabled, forKey: openUiOnLaunchKey)
     }
 
+    /// On by default: closing the window leaves Rustorrent running as a menu
+    /// bar icon only, with no Dock icon or app menus.
+    private func menuBarOnlyEnabled() -> Bool {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: menuBarOnlyKey) == nil {
+            return true
+        }
+        return defaults.bool(forKey: menuBarOnlyKey)
+    }
+
+    private func setMenuBarOnlyEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: menuBarOnlyKey)
+        for menu in [statusItem?.menu, dockMenu] {
+            menu?.item(withTag: menuBarOnlyItemTag)?.state = enabled ? .on : .off
+        }
+        refreshPreferencesControls()
+        updateDockPresence()
+    }
+
+    /// Shows the Dock icon while a window is open, or always when the menu bar
+    /// only option is off.
+    private func updateDockPresence() {
+        let windowOpen = mainWindow?.isVisible == true || preferencesWindow?.isVisible == true
+        let policy: NSApplication.ActivationPolicy =
+            menuBarOnlyEnabled() && !windowOpen ? .accessory : .regular
+        if NSApp.activationPolicy() != policy {
+            NSApp.setActivationPolicy(policy)
+        }
+    }
+
     private func currentDownloadDirectoryURL() -> URL {
         if let path = UserDefaults.standard.string(forKey: downloadDirectoryKey), !path.isEmpty {
             return URL(fileURLWithPath: path, isDirectory: true)
@@ -1305,6 +1379,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
+        updateDockPresence()
         return false
     }
 
