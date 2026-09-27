@@ -87,6 +87,20 @@ pub fn decode(payload: &[u8]) -> Option<Msg> {
     }
 }
 
+/// One spelling per address: a dual-stack listener reports IPv4 peers as
+/// IPv4-mapped IPv6, while PEX and holepunch messages name them as IPv4.
+fn canon(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
+fn canon_msg(msg: Msg) -> Msg {
+    match msg {
+        Msg::Rendezvous(addr) => Msg::Rendezvous(canon(addr)),
+        Msg::Connect(addr) => Msg::Connect(canon(addr)),
+        Msg::Error(addr, code) => Msg::Error(canon(addr), code),
+    }
+}
+
 struct Peer {
     /// The peer's ID for ut_holepunch; None when it does not support it.
     ext_id: Option<u8>,
@@ -119,6 +133,7 @@ impl Holepunch {
     }
 
     pub fn register(&self, addr: SocketAddr) {
+        let addr = canon(addr);
         self.lock().peers.insert(
             addr,
             Peer {
@@ -130,6 +145,7 @@ impl Holepunch {
     }
 
     pub fn unregister(&self, addr: SocketAddr) {
+        let addr = canon(addr);
         if let Some(peer) = self.lock().peers.remove(&addr) {
             self.queued.fetch_sub(peer.outbox.len(), Ordering::SeqCst);
         }
@@ -137,6 +153,7 @@ impl Holepunch {
 
     /// Records what the peer's extended handshake said.
     pub fn set_caps(&self, addr: SocketAddr, ext_id: Option<u8>, listen_port: Option<u16>) {
+        let addr = canon(addr);
         if let Some(peer) = self.lock().peers.get_mut(&addr) {
             peer.ext_id = ext_id.filter(|&id| id != 0);
             peer.listen_port = listen_port.filter(|&port| port != 0);
@@ -149,7 +166,7 @@ impl Holepunch {
             return None;
         }
         let mut state = self.lock();
-        let peer = state.peers.get_mut(&addr)?;
+        let peer = state.peers.get_mut(&canon(addr))?;
         let ext_id = peer.ext_id?;
         if peer.outbox.is_empty() {
             return None;
@@ -162,8 +179,9 @@ impl Holepunch {
     /// Remembers that `relay` is connected to these peers (it told us about
     /// them over PEX), in case we cannot reach them directly.
     pub fn note_pex(&self, relay: SocketAddr, targets: &[SocketAddr]) {
+        let relay = canon(relay);
         let mut state = self.lock();
-        for &target in targets {
+        for target in targets.iter().copied().map(canon) {
             if state.relays.len() >= MAX_RELAYS && !state.relays.contains_key(&target) {
                 break;
             }
@@ -174,6 +192,7 @@ impl Holepunch {
     /// Initiator role: after a failed connection to `target`, asks the peer
     /// that knows it to introduce us. True when a request was queued.
     pub fn request(&self, target: SocketAddr, now: Instant) -> bool {
+        let target = canon(target);
         let mut state = self.lock();
         let Some(&relay) = state.relays.get(&target) else {
             return false;
@@ -190,6 +209,7 @@ impl Holepunch {
 
     /// Handles a ut_holepunch message from `from`.
     pub fn on_message(&self, from: SocketAddr, msg: Msg, now: Instant) {
+        let (from, msg) = (canon(from), canon_msg(msg));
         let mut state = self.lock();
         match msg {
             Msg::Rendezvous(target) => {
@@ -351,6 +371,31 @@ mod tests {
             ))
         );
         assert_eq!(hp.queued.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dual_stack_addresses_match_their_ipv4_form() {
+        let hp = Holepunch::default();
+        let (a, b) = (addr("[::ffff:1.1.1.1]:1000"), addr("[::ffff:2.2.2.2]:2000"));
+        let now = Instant::now();
+        for peer in [a, b] {
+            hp.register(peer);
+            hp.set_caps(peer, Some(5), None);
+        }
+        hp.on_message(a, Msg::Rendezvous(addr("2.2.2.2:2000")), now);
+        assert_eq!(
+            hp.take_outbox(addr("1.1.1.1:1000")),
+            Some((5, vec![Msg::Connect(addr("2.2.2.2:2000"))]))
+        );
+        assert_eq!(
+            hp.take_outbox(b),
+            Some((5, vec![Msg::Connect(addr("1.1.1.1:1000"))]))
+        );
+        assert_eq!(
+            encode(Msg::Connect(addr("1.1.1.1:1000")))[1],
+            0,
+            "IPv4 peers are introduced as IPv4"
+        );
     }
 
     #[test]
