@@ -426,9 +426,16 @@ class HolepunchTests(unittest.TestCase):
         with first, second:
             first_addr = first.getsockname()
             second_addr = second.getsockname()
-            time.sleep(.3)
-            send(first, 20, bytes([their_id]) + holepunch_msg(0, second_addr))
-            self.assertEqual(self.next_holepunch(first, 5), holepunch_msg(1, second_addr))
+            # Both connections register with the relay asynchronously; until
+            # the second one has, the answer is "not connected" (error 2).
+            deadline = time.monotonic() + 10
+            while True:
+                send(first, 20, bytes([their_id]) + holepunch_msg(0, second_addr))
+                reply = self.next_holepunch(first, 5)
+                if reply != holepunch_msg(2, second_addr, 2) or time.monotonic() > deadline:
+                    break
+                time.sleep(.1)
+            self.assertEqual(reply, holepunch_msg(1, second_addr))
             self.assertEqual(self.next_holepunch(second, 6), holepunch_msg(1, first_addr))
             send(first, 20, bytes([their_id]) + holepunch_msg(0, ('127.0.0.1', 9)))
             self.assertEqual(self.next_holepunch(first, 5), holepunch_msg(2, ('127.0.0.1', 9), 2))
