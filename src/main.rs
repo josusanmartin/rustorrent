@@ -440,6 +440,10 @@ static UPSTREAM_MAPPING_STARTED: AtomicBool = AtomicBool::new(false);
 /// Peers with public addresses that connected to us: proof that the incoming
 /// port is reachable from the internet.
 static INBOUND_PUBLIC_PEERS: AtomicU64 = AtomicU64::new(0);
+static STARTED_AT: OnceLock<Instant> = OnceLock::new();
+/// Without a peer connecting in after this long, outgoing connections are the
+/// only way to reach peers, so more of them are opened.
+const OUTGOING_ONLY_AFTER: Duration = Duration::from_secs(5 * 60);
 static SEED_RATIO_BITS: AtomicU64 = AtomicU64::new(0);
 static MAX_SEED_TIME_SECS: AtomicU64 = AtomicU64::new(0);
 static SUPER_SEED: AtomicBool = AtomicBool::new(false);
@@ -626,7 +630,6 @@ impl PeerProfile {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn from_code(code: usize) -> Self {
         match code {
             0 => Self::Conservative,
@@ -703,6 +706,23 @@ impl PeerRuntimeSettings {
 
     fn max_peers_torrent(&self) -> usize {
         self.max_peers_torrent.load(Ordering::SeqCst)
+    }
+
+    /// (global, per torrent) limits in force. While no peer can connect in,
+    /// the Balanced and Aggressive profiles open more outgoing connections,
+    /// closer to qBittorrent's defaults; limits set by hand are kept.
+    fn effective_limits(&self, outgoing_only: bool) -> (usize, usize) {
+        let (global, torrent) = (self.max_peers_global(), self.max_peers_torrent());
+        let profile = PeerProfile::from_code(self.profile.load(Ordering::SeqCst));
+        let tuning = profile.tuning();
+        if !outgoing_only
+            || profile == PeerProfile::Conservative
+            || global != tuning.max_peers_global
+            || torrent != tuning.max_peers_torrent
+        {
+            return (global, torrent);
+        }
+        (global + global / 2, torrent * 2)
     }
 
     fn apply_profile(&self, profile: PeerProfile) -> PeerProfileTuning {
@@ -2955,6 +2975,7 @@ fn run() -> Result<(), String> {
         args.max_peers_torrent,
     ));
     let peer_slots = Arc::new(PeerSlots::new(peer_settings.max_peers_global()));
+    STARTED_AT.get_or_init(Instant::now);
     let global_piece_buffer_budget =
         Arc::new(piece::PieceBufferBudget::new(MAX_GLOBAL_PIECE_BUFFER_BYTES));
     let session_store = Arc::new(SessionStore::load(&args.download_dir)?);
@@ -4791,13 +4812,14 @@ fn run_torrent_once(
                 apply_late_lifecycle_request(&context, session_store, action);
             }
             reap_finished_workers(&mut handles, "peer");
-            let desired_workers = peer_settings.max_peers_torrent();
+            let (global_limit, desired_workers) = peer_settings.effective_limits(outgoing_only());
+            context.global_peer_slots.set_max(global_limit);
             let startup_burst = downloaded.load(Ordering::SeqCst) < STARTUP_BURST_BYTES;
             let live_target = if startup_burst {
                 desired_workers
                     .saturating_mul(STARTUP_BURST_MULTIPLIER)
                     .max(STARTUP_BURST_MIN_WORKERS)
-                    .min(peer_settings.max_peers_global())
+                    .min(global_limit)
             } else {
                 desired_workers
             };
@@ -12803,6 +12825,15 @@ fn is_retryable_peer_error(err: &str) -> bool {
         || err == "connect failed"
 }
 
+/// No peer has connected in from the internet since start-up, long enough to
+/// rule out a slow first peer.
+fn outgoing_only() -> bool {
+    INBOUND_PUBLIC_PEERS.load(Ordering::Relaxed) == 0
+        && STARTED_AT
+            .get()
+            .is_some_and(|started| started.elapsed() >= OUTGOING_ONLY_AFTER)
+}
+
 /// Failed before a BitTorrent handshake started: nothing answered.
 fn is_unreachable_peer_error(err: &str) -> bool {
     !err.contains("handshake") && !err.contains("self peer") && !err.contains("blocked")
@@ -18433,6 +18464,17 @@ mod core_helpers_tests {
             40
         );
         assert_eq!(request_queue_depth_for_rate(0.0), 64);
+    }
+
+    #[test]
+    fn outgoing_only_raises_profile_limits_but_not_manual_ones() {
+        let settings = PeerRuntimeSettings::new(PeerProfile::Balanced, 200, 80, 200, 30);
+        assert_eq!(settings.effective_limits(false), (200, 30));
+        assert_eq!(settings.effective_limits(true), (300, 60));
+        settings.apply_profile(PeerProfile::Conservative);
+        assert_eq!(settings.effective_limits(true), (80, 12));
+        let manual = PeerRuntimeSettings::new(PeerProfile::Balanced, 200, 80, 4, 2);
+        assert_eq!(manual.effective_limits(true), (4, 2));
     }
 
     #[test]

@@ -668,22 +668,23 @@ const rssAct=(url,body,title)=>act(url,body,title).then(d=>{loadRss();return d})
 
 /* reachability: whether other peers can connect to us, and what to do if not */
 const sharedIp=ip=>/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(ip||'');
+const OUT=' You can still download and upload: Rustorrent connects out to more peers and uses hole punching to reach others behind routers.';
 function reach(){
   const fw=G.firewall_status,n=G.inbound_public_peers||0,port=G.incoming_port,maps=[G.natpmp_status,G.upnp_status],rip=G.router_external_ip,tip=G.tracker_external_ip;
   if(fw==='block-all')return['err','Firewall blocks incoming connections','“Block all incoming connections” is on in System Settings › Network › Firewall, so peers cannot reach you. Turn it off to seed.','Blocked by firewall'];
   if(fw==='blocked'||fw==='unlisted')return['err','The macOS firewall is blocking Rustorrent','Peers cannot connect to you, so seeding waits. Allow Rustorrent to accept incoming connections.','Blocked by firewall',1];
   if(n)return['ok','Reachable',`${plural(n,'peer')} connected to you from the internet this session.`,'Reachable'];
   const ups=G.upstream_status||'',cgnat=/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(rip||'')||!sharedIp(rip)&&rip&&tip&&!tip.includes(':')&&tip!==rip;
-  if(cgnat)return['warn','Behind your provider\'s shared address',`Your internet provider shares one public address between customers (carrier-grade NAT), so peers cannot connect in and no router setting can change that. Ask your provider for a public IPv4 address. Uploads still reach peers that Rustorrent connects to.`,'Not reachable'];
+  if(cgnat)return['warn','Behind your provider\'s shared address',`Your internet provider shares one public address between customers (carrier-grade NAT), so peers cannot connect in and no router setting can change that.${OUT} For more peers, ask your provider for a public IPv4 address.`,'Outgoing only'];
   if(sharedIp(rip)){
     if(ups.startsWith('mapped '))return['warn','Port open on both routers',`Your router sits behind another router or modem, and Rustorrent opened ${ups.match(/port \d+/)[0]} on both. Waiting for the first peer to connect in.`,'Waiting for peers'];
-    return['warn','Behind a second router',`Your router's internet address (${rip}) is private, so another router or your provider's modem sits in front of it${ups?' and did not accept a request to open the port':''}. On that device (usually at ${rip.replace(/\.\d+$/,'.1')}): turn on bridge mode, or forward port ${port} (TCP and UDP) to ${rip}, or make ${rip} its DMZ host. Until then, uploads only reach peers that Rustorrent connects to.`,'Not reachable'];
+    return['warn','Behind a second router',`Your router's internet address (${rip}) is private, so another router or your provider's modem sits in front of it${ups?' and did not accept a request to open the port':''}. On that device (usually at ${rip.replace(/\.\d+$/,'.1')}): turn on bridge mode, or forward port ${port} (TCP and UDP) to ${rip}, or make ${rip} its DMZ host.${OUT}`,'Outgoing only'];
   }
   const m=maps.find(m=>m&&m.startsWith('mapped '));
   if(m)return['warn','Port open on your router',`Your router forwards ${m.match(/port \d+/)[0]} to Rustorrent over ${m.includes('upnp')?'UPnP':'NAT-PMP'}. Waiting for the first peer to connect in.`,'Waiting for peers'];
   if(maps.some(m=>m==='pending'))return['warn','Checking your router…','','Checking…'];
-  if(maps.every(m=>m&&m.startsWith('disabled')))return['warn','Automatic port forwarding is off',`Rustorrent is not asking your router to open a port. Forward port ${port} (TCP and UDP) to this computer so peers can connect in.`,'Not reachable'];
-  return['warn','Incoming port not open',`Your router did not accept a UPnP or NAT-PMP request. Turn one of them on in the router settings, or forward port ${port} (TCP and UDP) to this computer. Until then only peers that Rustorrent connects to can download from you.`,'Not reachable'];
+  if(maps.every(m=>m&&m.startsWith('disabled')))return['warn','Automatic port forwarding is off',`Rustorrent is not asking your router to open a port. Forward port ${port} (TCP and UDP) to this computer so peers can connect in.${OUT}`,'Outgoing only'];
+  return['warn','Incoming port not open',`Your router did not accept a UPnP or NAT-PMP request. Turn one of them on in the router settings, or forward port ${port} (TCP and UDP) to this computer.${OUT}`,'Outgoing only'];
 }
 function renderReach(){
   const [k,title,detail,short,fix]=reach(),net=$('net');

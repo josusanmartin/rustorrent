@@ -1159,29 +1159,29 @@ pub fn reachability(s: &Json) -> String {
         .any(|status| status.starts_with("mapped "));
     match s.s("firewall_status") {
         "block-all" | "blocked" | "unlisted" => {
-            "no: the macOS firewall blocks incoming connections (allow Rustorrent in Settings)"
+            "outgoing only: the macOS firewall blocks incoming connections (allow Rustorrent in Settings)"
                 .into()
         }
         _ if inbound > 0 => format!(
             "yes: {inbound} peer{} connected in",
             if inbound == 1 { "" } else { "s" }
         ),
-        _ if cgnat => "no: your provider shares one public address between customers \
+        _ if cgnat => "outgoing only: your provider shares one public address between customers \
                        (carrier-grade NAT); ask it for a public IPv4 address"
             .into(),
         _ if second_router && s.s("upstream_status").starts_with("mapped ") => {
             "not confirmed yet: the port is forwarded on both routers".into()
         }
         _ if second_router => format!(
-            "no: a second router or modem sits in front of yours; on it, turn on bridge mode, \
+            "outgoing only: a second router or modem sits in front of yours; on it, turn on bridge mode, \
              or forward port {port} to {router}, or make {router} its DMZ host"
         ),
         _ if mapped => "not confirmed yet: the router forwards the port".into(),
         _ if s.s("upnp_status").starts_with("disabled") => {
-            format!("no: automatic port forwarding is off; forward port {port} to this computer")
+            format!("outgoing only: automatic port forwarding is off; forward port {port} to this computer")
         }
         _ => format!(
-            "no: the router did not open the port; enable UPnP or NAT-PMP, or forward port {port}"
+            "outgoing only: the router did not open the port; enable UPnP or NAT-PMP, or forward port {port}"
         ),
     }
 }
