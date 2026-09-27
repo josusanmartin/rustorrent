@@ -71,11 +71,22 @@ class LibtorrentUtpTests(unittest.TestCase):
         tid = self.app.add(self.torrent)
         e2e.wait_for(lambda: self.app.torrent(tid)['percent'] == 10000)
         handle = self.add_to_libtorrent()
+        # Slow enough that the Peers tab can be read mid-transfer.
+        handle.set_download_limit(30000)
         handle.connect_peer(('127.0.0.1', self.app.port))
+
+        def uploading_peer():
+            return next((p for p in self.app.get(f'/torrent/peers?id={tid}')['peers']
+                         if p['interested'] and p['uploading_to'] and p['uploaded'] > 0), None)
+        peer = e2e.wait_for(uploading_peer)
+        self.assertTrue(peer['client'].startswith('libtorrent'), peer)
+        self.assertEqual((peer['utp'], peer['incoming']), (1, 1))
+        self.assertLess(peer['progress'], 1)
+
+        handle.set_download_limit(-1)
         e2e.wait_for(lambda: handle.status().is_seeding, seconds=30)
         self.assertEqual((self.lt_dir / 'fixture.bin').read_bytes(), e2e.PAYLOAD)
         e2e.wait_for(lambda: self.app.torrent(tid)['uploaded_bytes'] >= len(e2e.PAYLOAD))
-
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

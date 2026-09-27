@@ -87,6 +87,10 @@ impl PeerStream {
     }
 
     #[allow(dead_code)]
+    pub fn is_utp(&self) -> bool {
+        matches!(self.inner, PeerStreamInner::Utp(_))
+    }
+
     pub fn is_encrypted(&self) -> bool {
         self.cipher.is_some()
     }

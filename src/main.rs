@@ -2485,6 +2485,14 @@ impl UploadManager {
         }
     }
 
+    /// (uploaded, downloaded) bytes for one connection.
+    fn totals(&self, peer_id: u64) -> (u64, u64) {
+        lock_or_recover(&self.inner)
+            .peers
+            .get(&peer_id)
+            .map_or((0, 0), |info| (info.uploaded_total, info.downloaded_total))
+    }
+
     fn should_unchoke(&self, peer_id: u64) -> bool {
         let mut state = lock_or_recover(&self.inner);
         let now = Instant::now();
@@ -7071,6 +7079,67 @@ impl PeerQueue {
     }
 }
 
+/// A readable client name from a peer ID: "-qB4650-..." is qBittorrent 4.6.5.
+fn client_name(peer_id: &[u8; 20]) -> String {
+    if peer_id[0] == b'-' && peer_id[7] == b'-' {
+        let name = match &peer_id[1..3] {
+            b"qB" => "qBittorrent",
+            b"TR" => "Transmission",
+            b"UT" => "\u{b5}Torrent",
+            b"UM" => "\u{b5}Torrent Mac",
+            b"BT" => "BitTorrent",
+            b"DE" => "Deluge",
+            b"LT" => "libtorrent",
+            b"lt" => "rTorrent",
+            b"AZ" => "Vuze",
+            b"BI" => "BiglyBT",
+            b"KT" => "KTorrent",
+            b"TX" => "Tixati",
+            b"FD" => "Free Download Manager",
+            b"PI" => "PicoTorrent",
+            b"WW" => "WebTorrent",
+            b"WD" => "WebTorrent Desktop",
+            b"RT" => "Rustorrent",
+            b"LR" => "LibreTorrent",
+            b"FL" => "Flud",
+            b"XL" => "Xunlei",
+            b"SD" => "Thunder",
+            b"MG" => "MediaGet",
+            b"BC" => "BitComet",
+            b"TB" => "Torch",
+            _ => "",
+        };
+        let digit = |byte: u8| match byte {
+            b'0'..=b'9' => Some(u32::from(byte - b'0')),
+            b'A'..=b'Z' => Some(u32::from(byte - b'A') + 10),
+            _ => None,
+        };
+        let version: Option<Vec<u32>> = peer_id[3..6].iter().map(|&b| digit(b)).collect();
+        let prefix = String::from_utf8_lossy(&peer_id[1..3]).into_owned();
+        let name = if name.is_empty() {
+            prefix.as_str()
+        } else {
+            name
+        };
+        return match version {
+            Some(v) => format!("{name} {}.{}.{}", v[0], v[1], v[2]),
+            None => name.to_string(),
+        };
+    }
+    if peer_id[0] == b'M' && peer_id[1..8].contains(&b'-') {
+        return "BitTorrent (Mainline)".to_string();
+    }
+    let printable = peer_id[..8]
+        .iter()
+        .take_while(|b| b.is_ascii_graphic())
+        .count();
+    if printable >= 4 {
+        String::from_utf8_lossy(&peer_id[..printable]).into_owned()
+    } else {
+        "Unknown".to_string()
+    }
+}
+
 fn normalize_peer_addr(addr: SocketAddr) -> SocketAddr {
     match addr {
         SocketAddr::V6(addr_v6) => addr_v6
@@ -10790,6 +10859,8 @@ fn generate_peer_id() -> [u8; 20] {
 /// announced again (see `PeerConn::maintain`).
 const HAVE_REPEAT_AFTER: Duration = Duration::from_secs(10);
 const PEER_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
+const PEER_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
+const PEER_RATE_WINDOW_SNAPSHOTS: usize = 5;
 /// Socket read size for the peer loop. One read can deliver several blocks,
 /// which are then handled without re-running the housekeeping pass.
 const PEER_READ_AHEAD_BYTES: usize = 64 * 1024;
@@ -10923,6 +10994,11 @@ struct PeerConn<'a> {
     out: Vec<u8>,
     opened_at: Instant,
     haves_repeated: bool,
+    /// Shown in the Peers tab: client name, how the connection was made, and
+    /// recent (time, uploaded, downloaded) totals for rates.
+    client: String,
+    incoming: bool,
+    snapshots: VecDeque<(Instant, u64, u64)>,
 }
 
 /// Outcome of a step of the peer loop.
@@ -10940,6 +11016,7 @@ fn download_from_peer_concurrent(
     connect_cfg: &ConnectionConfig,
     established: Option<(PeerStream, peer::Handshake)>,
 ) -> Result<(), String> {
+    let incoming = established.is_some();
     let (mut stream, handshake, _cancellation) = match established {
         Some((stream, handshake)) => {
             let cancellation =
@@ -10966,6 +11043,8 @@ fn download_from_peer_concurrent(
     log_debug!("peer: {addr} id {}", hex(&handshake.peer_id));
 
     let mut conn = PeerConn::new(ctx, addr, peer_tag);
+    conn.client = client_name(&handshake.peer_id);
+    conn.incoming = incoming;
     conn.send_opening(&mut stream, handshake.supports_extensions())?;
 
     ctx.upload_manager.register(peer_tag);
@@ -11020,6 +11099,9 @@ impl<'a> PeerConn<'a> {
             out: Vec::new(),
             opened_at: now,
             haves_repeated: false,
+            client: String::new(),
+            incoming: false,
+            snapshots: VecDeque::new(),
         }
     }
 
@@ -11143,6 +11225,7 @@ impl<'a> PeerConn<'a> {
 
     fn teardown(&mut self) {
         let ctx = self.ctx;
+        ui::remove_peer(ctx.id, self.peer_tag);
         {
             let mut pieces = lock_or_recover(&ctx.pieces);
             abandon_inflight(&mut pieces, &mut self.pending, &self.active_pieces);
@@ -11200,9 +11283,71 @@ impl<'a> PeerConn<'a> {
         drop(released);
     }
 
+    /// Publishes this connection for the Peers tab about once a second.
+    fn publish_snapshot(&mut self, stream: &PeerStream, now: Instant) {
+        if self
+            .snapshots
+            .back()
+            .is_some_and(|(at, ..)| now.saturating_duration_since(*at) < PEER_SNAPSHOT_INTERVAL)
+        {
+            return;
+        }
+        let ctx = self.ctx;
+        let (uploaded, downloaded) = ctx.upload_manager.totals(self.peer_tag);
+        // Rates over the last few seconds: data moves in 16 KiB blocks, so a
+        // slow peer often gets nothing in any single second.
+        let (upload_bps, download_bps) = match self.snapshots.front() {
+            Some(&(at, up, down)) => {
+                let secs = now.saturating_duration_since(at).as_secs_f64().max(1e-3);
+                (
+                    uploaded.saturating_sub(up) as f64 / secs,
+                    downloaded.saturating_sub(down) as f64 / secs,
+                )
+            }
+            None => (0.0, 0.0),
+        };
+        if self.snapshots.len() >= PEER_RATE_WINDOW_SNAPSHOTS {
+            self.snapshots.pop_front();
+        }
+        self.snapshots.push_back((now, uploaded, downloaded));
+        let piece_count = lock_or_recover(&ctx.pieces).piece_count();
+        let have = self.bitfield.as_ref().map_or(0, |bits| {
+            bits.iter()
+                .map(|byte| byte.count_ones() as usize)
+                .sum::<usize>()
+        });
+        let progress = if piece_count == 0 {
+            0.0
+        } else {
+            (have.min(piece_count) as f64 / piece_count as f64).min(1.0)
+        };
+        ui::set_peer(
+            ctx.id,
+            self.peer_tag,
+            ui::UiPeer {
+                addr: normalize_peer_addr(self.addr).to_string(),
+                client: self.client.clone(),
+                utp: stream.is_utp(),
+                incoming: self.incoming,
+                encrypted: stream.is_encrypted(),
+                progress,
+                download_bps,
+                upload_bps,
+                interested: self.peer_interested,
+                uploading_to: !self.am_choking,
+                downloading_from: !self.choked,
+                downloaded,
+                uploaded,
+            },
+        );
+    }
+
     fn maintain(&mut self, stream: &mut PeerStream, now: Instant) -> Result<PeerStep, String> {
         let ctx = self.ctx;
         self.flush_download_record();
+        if ctx.ui_state.is_some() {
+            self.publish_snapshot(stream, now);
+        }
 
         // Transmission occasionally loses a bitfield that arrives right after
         // an encrypted handshake and then never becomes interested. Repeating
@@ -14480,6 +14625,21 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
         )
         .unwrap_err()
         .contains("SHA-1"));
+    }
+
+    #[test]
+    fn client_names_come_from_the_peer_id() {
+        let id = |text: &[u8]| {
+            let mut id = [b'x'; 20];
+            id[..text.len()].copy_from_slice(text);
+            id
+        };
+        assert_eq!(client_name(&id(b"-qB4650-")), "qBittorrent 4.6.5");
+        assert_eq!(client_name(&id(b"-TR4050-")), "Transmission 4.0.5");
+        assert_eq!(client_name(&id(b"-LT2010-")), "libtorrent 2.0.1");
+        assert_eq!(client_name(&id(b"-ZZ1230-")), "ZZ 1.2.3");
+        assert_eq!(client_name(&id(b"M7-4-3--")), "BitTorrent (Mainline)");
+        assert_eq!(client_name(&[0u8; 20]), "Unknown");
     }
 
     #[test]

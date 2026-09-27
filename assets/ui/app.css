@@ -182,6 +182,9 @@ input[type=checkbox]{width:15px;height:15px;margin:0;accent-color:var(--accent-b
 .tbl .n{text-align:right;white-space:nowrap}
 .tbl td:first-child{max-width:0;width:48%}
 .tbl .t{font-weight:550}
+.ptbl td:first-child{width:28%}
+.ptbl small{display:block;color:var(--muted);font-size:11px}
+.ptbl .up{color:var(--ok)}
 .sort{display:inline-flex;align-items:center;gap:3px;padding:0;border:0;background:none;color:inherit;font:inherit;letter-spacing:inherit;text-transform:inherit;cursor:pointer}
 .sort .i{width:12px;height:12px}
 .badge{display:inline-block;margin-left:6px;vertical-align:1px;padding:0 6px;border-radius:4px;background:var(--neutral-soft);color:var(--neutral);font-size:11px;font-weight:600}
@@ -278,6 +281,7 @@ kbd{display:inline-block;padding:0 5px;border:1px solid var(--line2);border-bott
   .pad{padding:16px 12px 28px}
   .field{grid-template-columns:1fr}
   .field small{grid-column:1}
-  .tbl th:nth-child(2),.tbl td:nth-child(2),.tbl th:nth-child(5),.tbl td:nth-child(5),.tbl th:nth-child(6),.tbl td:nth-child(6){display:none}
+  .tbl:not(.ptbl) th:nth-child(2),.tbl:not(.ptbl) td:nth-child(2),.tbl:not(.ptbl) th:nth-child(5),.tbl:not(.ptbl) td:nth-child(5),.tbl:not(.ptbl) th:nth-child(6),.tbl:not(.ptbl) td:nth-child(6){display:none}
+  .ptbl th:nth-child(2),.ptbl td:nth-child(2),.ptbl th:nth-child(3),.ptbl td:nth-child(3){display:none}
 }
 @media (prefers-reduced-motion:reduce){*,::before,::after{animation:none!important;transition:none!important}}

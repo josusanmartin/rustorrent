@@ -319,7 +319,8 @@ function makeDetail(r){
   r.panels.trackers.append(r.trk,h('form.inline',{'data-f':'tracker'},h('input.in',{'aria-label':'Tracker URL',placeholder:'udp://tracker.example.org:1337/announce'}),h('button.btn',{text:'Add tracker'})));
   let dl;[dl,r.peers]=kv([['conn','Connected'],['known','Known'],['int','Interested in us'],['served','Requests served'],['down','Download'],['up','Upload']]);
   r.cc=h('div.chips');r.diag=h('p.mono');
-  r.panels.peers.append(dl,r.ccs=h('div.sect',{hidden:true},h('h3',{text:'Peers by country'}),r.cc),r.diags=h('div.sect',{hidden:true},h('h3',{text:'Diagnostics'}),r.diag));
+  r.pl=h('div',empty('Loading peers…'));
+  r.panels.peers.append(dl,h('div.sect',h('h3',{text:'Connected peers'}),r.pl),r.ccs=h('div.sect',{hidden:true},h('h3',{text:'Peers by country'}),r.cc),r.diags=h('div.sect',{hidden:true},h('h3',{text:'Diagnostics'}),r.diag));
   [dl,r.info]=kv([['dir','Save to'],['size','Size'],['pieces','Pieces'],['down','Downloaded'],['up','Uploaded'],['ratio','Ratio'],['hash','Info hash'],['ver','Format'],['pre','Preallocated']]);
   r.info.hash.className='mono';
   r.labelIn=h('input.in',{'aria-label':'Transfer label',placeholder:'No label',maxlength:'128'});
@@ -354,8 +355,28 @@ function updateDetail(r,t,s){
     txt(f.down,rate(t.download_rate_bps));txt(f.up,rate(t.upload_rate_bps));
     r.ccs.hidden=!cc.length;
     if(r.cc.dataset.k!==key){r.cc.dataset.k=key;r.cc.replaceChildren(...cc.map(c=>h('span.badge',{text:`${c.flag||''} ${c.code} · ${c.count}`.trim()})))}
-    r.diags.hidden=!diag;txt(r.diag,diag);
+    r.diags.hidden=!diag;txt(r.diag,diag);loadPeers(r);
   }else if(t.files_rev!==r.frev)loadFiles(r);
+}
+// Peer lists are fetched at most once a second while the Peers tab is open.
+function loadPeers(r){
+  const now=Date.now();if(r.pBusy||now-(r.pAt||0)<900)return;r.pBusy=r.pAt=now;
+  getJSON('/torrent/peers?id='+r.id).then(d=>renderPeers(r,d.peers||[]),e=>r.pl.replaceChildren(h('p.err',{text:'Could not load peers: '+e.message}))).finally(()=>{r.pBusy=0});
+}
+// What the peer is doing with us: the answer to "why am I not uploading?".
+function peerState(p){
+  if(p.interested)return p.uploading_to?['Downloading from you','.up']:['Waiting for an upload slot',''];
+  return [p.progress>=1?'Has everything (seed)':'Wants nothing from you yet',''];
+}
+function renderPeers(r,ps){
+  if(!ps.length)return r.pl.replaceChildren(...empty('No peers connected.'));
+  const n=v=>h('td.n',{text:v});
+  r.pl.replaceChildren(h('table.tbl.ptbl',h('thead',h('tr',h('th',{text:'Peer'}),h('th',{text:'Client'}),h('th.n',{text:'Has'}),h('th.n',{text:'Down'}),h('th.n',{text:'Up'}),h('th',{text:'State'}))),
+    h('tbody',ps.map(p=>{
+      const [state,cls]=peerState(p),how=[p.utp?'uTP':'TCP',p.incoming?'incoming':'outgoing',p.encrypted&&'encrypted'].filter(Boolean).join(' · ');
+      return h('tr',h('td',h('div.t.mono',{title:p.addr,text:p.addr}),h('small',{text:how})),h('td',{text:p.client}),
+        n(p.progress>=1?'100%':(p.progress*100).toFixed(1)+'%'),n(p.download_bps>0?rate(p.download_bps):'–'),n(p.upload_bps>0?rate(p.upload_bps):'–'),h('td'+cls,{text:state}));
+    }))));
 }
 // File lists are fetched on demand while the Files tab is open, not streamed.
 function loadFiles(r){

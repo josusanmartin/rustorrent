@@ -246,6 +246,95 @@ pub struct UiTorrent {
     pub meta_version: u8,
 }
 
+/// One connected peer, as the Peers tab shows it.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct UiPeer {
+    pub addr: String,
+    pub client: String,
+    pub utp: bool,
+    pub incoming: bool,
+    pub encrypted: bool,
+    /// Share of the torrent the peer has, 0.0 to 1.0.
+    pub progress: f64,
+    pub download_bps: f64,
+    pub upload_bps: f64,
+    /// The peer wants data from us.
+    pub interested: bool,
+    /// We let the peer download from us (unchoked).
+    pub uploading_to: bool,
+    /// The peer lets us download from it.
+    pub downloading_from: bool,
+    pub downloaded: u64,
+    pub uploaded: u64,
+}
+
+/// Connected peers per torrent, keyed by connection. Kept apart from the
+/// status snapshot, which every client polls, and served only on request.
+static PEERS: Mutex<std::collections::BTreeMap<u64, HashMap<u64, UiPeer>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+fn lock_peers() -> MutexGuard<'static, std::collections::BTreeMap<u64, HashMap<u64, UiPeer>>> {
+    PEERS.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+pub fn set_peer(torrent_id: u64, connection: u64, peer: UiPeer) {
+    lock_peers()
+        .entry(torrent_id)
+        .or_default()
+        .insert(connection, peer);
+}
+
+pub fn remove_peer(torrent_id: u64, connection: u64) {
+    let mut peers = lock_peers();
+    if let Some(torrent) = peers.get_mut(&torrent_id) {
+        torrent.remove(&connection);
+        if torrent.is_empty() {
+            peers.remove(&torrent_id);
+        }
+    }
+}
+
+/// Peers of one torrent, busiest first.
+fn torrent_peers_json(torrent_id: u64) -> String {
+    let mut peers: Vec<UiPeer> = lock_peers()
+        .get(&torrent_id)
+        .map(|peers| peers.values().cloned().collect())
+        .unwrap_or_default();
+    peers.sort_by(|a, b| {
+        (b.download_bps + b.upload_bps)
+            .total_cmp(&(a.download_bps + a.upload_bps))
+            .then_with(|| a.addr.cmp(&b.addr))
+    });
+    let mut out = String::with_capacity(64 + peers.len() * 256);
+    let mut json = JsonObject::new(&mut out);
+    json.num("id", torrent_id);
+    let list = json.key("peers");
+    list.push('[');
+    for (index, peer) in peers.iter().enumerate() {
+        if index > 0 {
+            list.push(',');
+        }
+        let mut item = JsonObject::new(list);
+        item.str("addr", &peer.addr)
+            .str("client", &peer.client)
+            .num("utp", u8::from(peer.utp))
+            .num("incoming", u8::from(peer.incoming))
+            .num("encrypted", u8::from(peer.encrypted))
+            .float("progress", peer.progress, 4)
+            .float("download_bps", peer.download_bps, 0)
+            .float("upload_bps", peer.upload_bps, 0)
+            .num("interested", u8::from(peer.interested))
+            .num("uploading_to", u8::from(peer.uploading_to))
+            .num("downloading_from", u8::from(peer.downloading_from))
+            .num("downloaded", peer.downloaded)
+            .num("uploaded", peer.uploaded);
+        item.finish();
+    }
+    list.push(']');
+    json.finish();
+    out
+}
+
 fn lock_state(state: &Arc<Mutex<UiState>>) -> MutexGuard<'_, UiState> {
     match state.lock() {
         Ok(guard) => guard,
@@ -594,9 +683,8 @@ fn handle_connection(
     if request.method == "HEAD" {
         let content_type = match path.as_str() {
             "/" | "/index.html" => "text/html; charset=utf-8",
-            "/status" | "/search/status" | "/search/catalog" | "/rss/status" | "/torrent/files" => {
-                "application/json"
-            }
+            "/status" | "/search/status" | "/search/catalog" | "/rss/status" | "/torrent/files"
+            | "/torrent/peers" => "application/json",
             _ => return send_api_error_with_status(stream, 404, "unknown endpoint"),
         };
         return send_head(stream, content_type);
@@ -621,6 +709,19 @@ fn handle_connection(
         return send_json_body(stream, 200, &body);
     }
 
+    if path == "/torrent/peers" {
+        let id = query_value(&query, "id").and_then(|value| value.parse::<u64>().ok());
+        let known = id.is_some_and(|id| {
+            lock_state(&state)
+                .torrents
+                .iter()
+                .any(|torrent| torrent.id == id)
+        });
+        return match id.filter(|_| known) {
+            Some(id) => send_json_body(stream, 200, &torrent_peers_json(id)),
+            None => send_api_error_with_status(stream, 404, "unknown torrent"),
+        };
+    }
     if path == "/torrent/files" {
         let body = query_value(&query, "id")
             .and_then(|value| value.parse::<u64>().ok())
@@ -2615,6 +2716,30 @@ fn escape_json_into(out: &mut String, input: &str) {
 }
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn peers_are_listed_busiest_first_and_removed_on_disconnect() {
+        let torrent = 987_654;
+        let peer = |addr: &str, down: f64| UiPeer {
+            addr: addr.to_string(),
+            client: "qBittorrent 4.6.5".to_string(),
+            download_bps: down,
+            progress: 1.0,
+            ..UiPeer::default()
+        };
+        set_peer(torrent, 1, peer("1.1.1.1:1", 10.0));
+        set_peer(torrent, 2, peer("2.2.2.2:2", 500.0));
+        let json = torrent_peers_json(torrent);
+        assert!(json.find("2.2.2.2:2").unwrap() < json.find("1.1.1.1:1").unwrap());
+        assert!(json.contains("\"client\":\"qBittorrent 4.6.5\""));
+        assert!(json.contains("\"progress\":1.0000"));
+        remove_peer(torrent, 1);
+        remove_peer(torrent, 2);
+        assert_eq!(
+            torrent_peers_json(torrent),
+            format!("{{\"id\":{torrent},\"peers\":[]}}")
+        );
+    }
     use super::*;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
