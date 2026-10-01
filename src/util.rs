@@ -62,3 +62,47 @@ mod tests {
         }
     }
 }
+
+/// `fetch_update` under another name. Rust 1.99 deprecates `fetch_update` for
+/// `try_update`, which Rust 1.89 (the minimum) lacks; this is the same
+/// compare-exchange loop.
+pub(crate) trait AtomicUpdate {
+    type Value: Copy;
+
+    fn update_with(
+        &self,
+        set_order: std::sync::atomic::Ordering,
+        fetch_order: std::sync::atomic::Ordering,
+        f: impl FnMut(Self::Value) -> Option<Self::Value>,
+    ) -> Result<Self::Value, Self::Value>;
+}
+
+macro_rules! impl_atomic_update {
+    ($($atomic:ty => $value:ty),*) => {$(
+        impl AtomicUpdate for $atomic {
+            type Value = $value;
+
+            fn update_with(
+                &self,
+                set_order: std::sync::atomic::Ordering,
+                fetch_order: std::sync::atomic::Ordering,
+                mut f: impl FnMut($value) -> Option<$value>,
+            ) -> Result<$value, $value> {
+                let mut prev = self.load(fetch_order);
+                while let Some(next) = f(prev) {
+                    match self.compare_exchange_weak(prev, next, set_order, fetch_order) {
+                        Ok(value) => return Ok(value),
+                        Err(actual) => prev = actual,
+                    }
+                }
+                Err(prev)
+            }
+        }
+    )*};
+}
+
+impl_atomic_update!(
+    std::sync::atomic::AtomicUsize => usize,
+    std::sync::atomic::AtomicU32 => u32,
+    std::sync::atomic::AtomicU64 => u64
+);

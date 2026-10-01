@@ -307,6 +307,7 @@ mod mse {
     }
 }
 
+use crate::util::AtomicUpdate;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
@@ -2278,7 +2279,7 @@ impl PeerSlots {
 
     fn try_acquire(self: &Arc<Self>) -> Option<PeerSlotGuard> {
         self.active
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+            .update_with(Ordering::SeqCst, Ordering::SeqCst, |active| {
                 let max = self.max.load(Ordering::SeqCst);
                 (max == 0 || active < max).then_some(active + 1)
             })
@@ -8419,7 +8420,7 @@ fn peer_worker_loop(ctx: &TorrentContext, connect_cfg: &ConnectionConfig) {
         if max != 0
             && ctx
                 .peer_workers
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |workers| {
+                .update_with(Ordering::SeqCst, Ordering::SeqCst, |workers| {
                     (workers > max).then(|| workers - 1)
                 })
                 .is_ok()
@@ -10603,7 +10604,7 @@ impl Drop for TrackerWorkerGuard {
 
 fn try_acquire_tracker_worker() -> Option<TrackerWorkerGuard> {
     ACTIVE_TRACKER_WORKERS
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+        .update_with(Ordering::SeqCst, Ordering::SeqCst, |active| {
             (active < MAX_GLOBAL_TRACKER_WORKERS).then_some(active + 1)
         })
         .ok()
@@ -12015,7 +12016,7 @@ impl<'a> PeerConn<'a> {
             log_warn!("piece hash mismatch: index={index}");
             self.ban("piece hash mismatch");
             for counter in [&SESSION_DOWNLOADED_BYTES, &*ctx.downloaded] {
-                let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                let _ = counter.update_with(Ordering::SeqCst, Ordering::SeqCst, |value| {
                     Some(value.saturating_sub(piece_len))
                 });
             }
@@ -14136,7 +14137,7 @@ fn set_peer_interest(
     if interested {
         interested_peers.fetch_add(1, Ordering::SeqCst);
     } else {
-        let _ = interested_peers.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+        let _ = interested_peers.update_with(Ordering::SeqCst, Ordering::SeqCst, |value| {
             Some(value.saturating_sub(1))
         });
     }
@@ -14227,7 +14228,7 @@ fn remove_active_peer_session(
     geo_cc: Option<&str>,
 ) {
     let previous = active_peers
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+        .update_with(Ordering::SeqCst, Ordering::SeqCst, |value| {
             Some(value.saturating_sub(1))
         })
         .unwrap_or_else(|value| value);

@@ -1,3 +1,4 @@
+use crate::util::AtomicUpdate;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -684,7 +685,7 @@ fn resolve_host_budget(
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
     if ACTIVE_RESOLVERS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+        .update_with(Ordering::AcqRel, Ordering::Acquire, |active| {
             (active < MAX_RESOLVER_WORKERS).then_some(active + 1)
         })
         .is_err()

@@ -220,6 +220,25 @@ struct ReceiveBudget {
     window_update_wanted: AtomicBool,
 }
 
+/// `fetch_update` under another name. Rust 1.99 deprecates `fetch_update` for
+/// `try_update`, which Rust 1.89 (the minimum) lacks; this is the same
+/// compare-exchange loop.
+fn update_usize(
+    atomic: &AtomicUsize,
+    set_order: Ordering,
+    fetch_order: Ordering,
+    mut f: impl FnMut(usize) -> Option<usize>,
+) -> Result<usize, usize> {
+    let mut prev = atomic.load(fetch_order);
+    while let Some(next) = f(prev) {
+        match atomic.compare_exchange_weak(prev, next, set_order, fetch_order) {
+            Ok(value) => return Ok(value),
+            Err(actual) => prev = actual,
+        }
+    }
+    Err(prev)
+}
+
 impl ReceiveBudget {
     fn new() -> Self {
         Self {
@@ -233,37 +252,45 @@ impl ReceiveBudget {
         if amount == 0 || amount > RECEIVE_BUFFER_BYTES {
             return false;
         }
-        self.bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        update_usize(
+            &self.bytes,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| {
                 current
                     .checked_add(amount)
                     .filter(|next| *next <= RECEIVE_BUFFER_BYTES)
-            })
-            .is_ok()
+            },
+        )
+        .is_ok()
     }
 
     fn release_bytes(&self, amount: usize) {
-        let _ = self
-            .bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(amount))
-            });
+        let _ = update_usize(
+            &self.bytes,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| Some(current.saturating_sub(amount)),
+        );
     }
 
     fn try_reserve_channel_chunk(&self) -> bool {
-        self.channel_chunks
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < RECEIVE_CHANNEL_CHUNKS).then_some(current + 1)
-            })
-            .is_ok()
+        update_usize(
+            &self.channel_chunks,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| (current < RECEIVE_CHANNEL_CHUNKS).then_some(current + 1),
+        )
+        .is_ok()
     }
 
     fn release_channel_chunk(&self) {
-        let _ = self
-            .channel_chunks
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(1))
-            });
+        let _ = update_usize(
+            &self.channel_chunks,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| Some(current.saturating_sub(1)),
+        );
     }
 
     fn remaining_window(&self) -> usize {

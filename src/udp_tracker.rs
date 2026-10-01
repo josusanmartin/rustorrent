@@ -1,3 +1,4 @@
+use crate::util::AtomicUpdate;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
@@ -660,7 +661,7 @@ fn next_transaction_id() -> u32 {
     INIT.get_or_init(|| {
         SEED.store(crate::system_entropy_u64() as u32, Ordering::Relaxed);
     });
-    SEED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |mut x| {
+    SEED.update_with(Ordering::Relaxed, Ordering::Relaxed, |mut x| {
         x ^= x << 13;
         x ^= x >> 17;
         x ^= x << 5;

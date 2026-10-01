@@ -1,3 +1,4 @@
+use crate::util::AtomicUpdate;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -177,7 +178,7 @@ impl PieceBufferBudget {
 
     fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<BudgetCounterPermit> {
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .update_with(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|next| *next <= self.limit)
             })
             .ok()?;
