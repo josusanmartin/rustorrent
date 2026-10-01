@@ -20,9 +20,16 @@ use crate::sha1;
 const DHT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How often each torrent runs an iterative get_peers lookup (and announce).
 const QUERY_INTERVAL: Duration = Duration::from_secs(120);
+/// Lookup interval while the routing table is still nearly empty: the first
+/// lookups often reach only dead nodes, and waiting QUERY_INTERVAL after each
+/// left a new transfer without DHT peers for minutes.
+const STARVED_QUERY_INTERVAL: Duration = Duration::from_secs(5);
+/// Below this many nodes the table counts as nearly empty.
+const STARVED_TABLE_NODES: usize = K * 2;
 /// Concurrent get_peers lookups across all torrents.
 const MAX_PEER_LOOKUPS: usize = 8;
-const BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(60);
+/// Bootstrapping stops on its own once the table holds STARVED_TABLE_NODES.
+const BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(5);
 const SAVE_INTERVAL: Duration = Duration::from_secs(300);
 const K: usize = 8;
 const NUM_BUCKETS: usize = 160;
@@ -47,10 +54,12 @@ const MAX_REPLACEMENT_PROBE_ATTEMPTS: u8 = 2;
 const MAX_DEFERRED_REPLACEMENTS: usize = 128;
 const DEFERRED_REPLACEMENT_TTL: Duration = Duration::from_secs(5 * 60);
 const REFRESH_LOOKUP_ALPHA: usize = 3;
+const LOOKUP_SLOW_QUERY: Duration = Duration::from_secs(3);
 const MAX_REFRESH_LOOKUP_QUERIES: usize = 32;
 const MAX_REFRESH_LOOKUP_CANDIDATES: usize = 64;
 const REFRESH_LOOKUP_DEADLINE: Duration = Duration::from_secs(2 * 60);
 const MAX_CACHED_NODE_CANDIDATES: usize = 64;
+const MAX_SEED_NODES: usize = 64;
 const MAX_TRANSACTION_ID_LEN: usize = 16;
 const MAX_BOOTSTRAP_ADDRESSES_PER_HOST: usize = 8;
 const MAX_BOOTSTRAP_ADDRESSES: usize = BOOTSTRAP_NODES.len() * MAX_BOOTSTRAP_ADDRESSES_PER_HOST;
@@ -72,10 +81,11 @@ static NEXT_CACHE_TEMP: AtomicU64 = AtomicU64::new(0);
 static BOOTSTRAP_RESOLVER_IN_FLIGHT: [AtomicBool; BOOTSTRAP_NODES.len()] =
     [const { AtomicBool::new(false) }; BOOTSTRAP_NODES.len()];
 
-static BOOTSTRAP_NODES: [&str; 3] = [
+static BOOTSTRAP_NODES: [&str; 4] = [
     "router.bittorrent.com:6881",
     "router.utorrent.com:6881",
     "dht.transmissionbt.com:6881",
+    "dht.libtorrent.org:25401",
 ];
 
 #[derive(Clone)]
@@ -189,6 +199,9 @@ struct RoutingTable {
     bucket_refreshed_at: Vec<Instant>,
     bucket_refresh_attempted_at: Vec<Instant>,
     failures: HashMap<SocketAddr, u8>,
+    /// Unverified nodes from bootstrap replies. Lookups start from them
+    /// while the table is still small; they are never handed to other nodes.
+    seeds: Vec<Node>,
 }
 
 impl RoutingTable {
@@ -204,7 +217,47 @@ impl RoutingTable {
             bucket_refreshed_at: vec![now; NUM_BUCKETS],
             bucket_refresh_attempted_at: vec![now; NUM_BUCKETS],
             failures: HashMap::new(),
+            seeds: Vec::new(),
         }
+    }
+
+    fn remember_seeds(&mut self, nodes: &[Node]) {
+        for node in nodes {
+            let addr = normalize_dht_addr(node.addr);
+            if node.id == self.own_id
+                || addr.port() == 0
+                || !is_global_dht_address(addr.ip())
+                || self
+                    .seeds
+                    .iter()
+                    .any(|seed| seed.id == node.id || seed.addr == addr)
+            {
+                continue;
+            }
+            if self.seeds.len() >= MAX_SEED_NODES {
+                self.seeds.remove(0);
+            }
+            self.seeds.push(Node { addr, ..*node });
+        }
+    }
+
+    /// Where a lookup towards `target` starts: the closest table nodes, topped
+    /// up with bootstrap seeds until the table can fill a lookup on its own.
+    fn lookup_start(&self, target: &[u8; 20]) -> Vec<Node> {
+        let mut nodes = self.closest(target, K);
+        if nodes.len() < K {
+            for seed in &self.seeds {
+                if !nodes
+                    .iter()
+                    .any(|node| node.id == seed.id || node.addr == seed.addr)
+                {
+                    nodes.push(*seed);
+                }
+            }
+            crate::util::sort_by_key(&mut nodes, |node| xor_distance(&node.id, target));
+            nodes.truncate(MAX_REFRESH_LOOKUP_CANDIDATES);
+        }
+        nodes
     }
 
     fn bucket_index(&self, id: &[u8; 20]) -> usize {
@@ -1662,8 +1715,13 @@ fn dht_thread(
                     }
                 }
             }
+            let query_interval = if rt.node_count() < STARVED_TABLE_NODES {
+                STARVED_QUERY_INTERVAL
+            } else {
+                QUERY_INTERVAL
+            };
             for (info_hash, entry) in torrents.iter_mut() {
-                if entry.last_query.elapsed() >= QUERY_INTERVAL
+                if entry.last_query.elapsed() >= query_interval
                     && start_peer_lookup(
                         *info_hash,
                         crate::announce_port(entry.port),
@@ -1820,20 +1878,10 @@ fn handle_response(
         );
         return;
     }
-    let trusted_responder = node_id_matches_address(&responder_id, *addr);
-    if !trusted_responder {
-        fail_pending_query(
-            rt,
-            pending_query,
-            pending,
-            socket,
-            node_id,
-            deferred_replacements,
-            refresh_lookups,
-            None,
-        );
-        return;
-    }
+    // BEP 42 decides who may join the routing table, not whose answers count.
+    // The bootstrap routers and about a third of the live DHT use IDs that do
+    // not match their address; dropping their replies left the table empty.
+    let bep42_responder = node_id_matches_address(&responder_id, *addr);
     let verified_node = Node {
         id: responder_id,
         addr: *addr,
@@ -1843,7 +1891,8 @@ fn handle_response(
     if matches!(
         pending_query.kind,
         PendingKind::VerifyNode | PendingKind::RefreshBucket(_)
-    ) && !inserted
+    ) && bep42_responder
+        && !inserted
         && !rt.contains_endpoint(*addr)
     {
         queue_deferred_replacement(deferred_replacements, verified_node);
@@ -1889,6 +1938,9 @@ fn handle_response(
                         .take(MAX_NODE_CANDIDATES_PER_RESPONSE - candidates.len()),
                 );
             }
+        }
+        if matches!(pending_query.kind, PendingKind::FindNode) {
+            rt.remember_seeds(&candidates);
         }
         schedule_node_verifications(
             candidates,
@@ -2490,7 +2542,7 @@ fn bootstrap_nodes(
     rt: &mut RoutingTable,
     pending: &mut HashMap<Vec<u8>, PendingQuery>,
 ) -> bool {
-    if rt.node_count() > K * 2 {
+    if rt.node_count() >= STARVED_TABLE_NODES {
         return true;
     }
     if bootstrap_addrs.is_empty() {
@@ -2553,7 +2605,7 @@ fn schedule_bucket_refresh(
         RefreshLookup {
             bucket_idx,
             target,
-            candidates: rt.closest(&target, K),
+            candidates: rt.lookup_start(&target),
             queried: HashSet::new(),
             outstanding: 0,
             authenticated_responses: 0,
@@ -2580,7 +2632,7 @@ fn start_peer_lookup(
         .values()
         .filter(|lookup| lookup.peers.is_some())
         .count();
-    let candidates = rt.closest(&info_hash, K);
+    let candidates = rt.lookup_start(&info_hash);
     if active >= MAX_PEER_LOOKUPS
         || candidates.is_empty()
         || refresh_lookups
@@ -2681,18 +2733,25 @@ fn advance_refresh_lookup(
         return;
     };
 
-    while lookup.outstanding < REFRESH_LOOKUP_ALPHA
+    // About a quarter of DHT nodes never answer. A query still unanswered
+    // after LOOKUP_SLOW_QUERY stops holding one of the ALPHA slots, so dead
+    // nodes cannot stall the lookup until MAX_PENDING_AGE; a late answer is
+    // still accepted.
+    let now = Instant::now();
+    let mut in_flight = pending
+        .values()
+        .filter(|query| {
+            matches!(query.kind, PendingKind::RefreshBucket(id) if id == lookup_id)
+                && now.duration_since(query.sent_at) < LOOKUP_SLOW_QUERY
+        })
+        .count();
+    while in_flight < REFRESH_LOOKUP_ALPHA
         && lookup.queried.len() < MAX_REFRESH_LOOKUP_QUERIES
         && pending.len() < MAX_PENDING_QUERIES
     {
         let mut selected = None;
-        let mut blocked = false;
         for candidate in &lookup.candidates {
             if lookup.queried.contains(&candidate.addr) {
-                continue;
-            }
-            if pending.values().any(|query| query.addr == candidate.addr) {
-                blocked = true;
                 continue;
             }
             if !rt.contains_endpoint(candidate.addr)
@@ -2705,9 +2764,6 @@ fn advance_refresh_lookup(
             break;
         }
         let Some(candidate) = selected else {
-            if blocked {
-                return;
-            }
             break;
         };
         lookup.queried.insert(candidate.addr);
@@ -2730,6 +2786,7 @@ fn advance_refresh_lookup(
                 },
             );
             lookup.outstanding += 1;
+            in_flight += 1;
         }
     }
 
@@ -2738,7 +2795,9 @@ fn advance_refresh_lookup(
             .candidates
             .iter()
             .all(|candidate| lookup.queried.contains(&candidate.addr));
-    if lookup.outstanding == 0 && exhausted {
+    // Only queries to silent nodes left: finish now rather than when they
+    // time out, so the next lookup can start. A late answer is dropped.
+    if (lookup.outstanding == 0 || in_flight == 0) && exhausted {
         if let Some(lookup) = refresh_lookups.remove(&lookup_id) {
             finish_lookup(lookup, rt, socket, node_id);
         }
@@ -2796,7 +2855,6 @@ fn complete_refresh_query(
             || candidate.addr.ip().is_unspecified()
             || !(is_global_dht_address(candidate.addr.ip())
                 || (allow_local && is_local_dht_address(candidate.addr.ip())))
-            || !node_id_matches_address(&candidate.id, candidate.addr)
             || lookup
                 .candidates
                 .iter()
@@ -4219,6 +4277,145 @@ mod tests {
         assert_eq!(
             dict_get(args, b"target"),
             Some(&Value::Bytes(target.to_vec()))
+        );
+    }
+
+    #[test]
+    fn non_bep42_bootstrap_reply_seeds_lookups_without_joining_the_table() {
+        // Routers such as dht.transmissionbt.com answer with IDs that do not
+        // match their address. Their nodes must still start our lookups.
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let router: SocketAddr = "87.98.162.88:6881".parse().unwrap();
+        let router_id = [2u8; 20];
+        assert!(!node_id_matches_address(&router_id, router));
+        let mut rt = RoutingTable::new([0u8; 20]);
+        let mut pending = HashMap::from([(
+            b"boot".to_vec(),
+            PendingQuery {
+                kind: PendingKind::FindNode,
+                addr: router,
+                expected_id: None,
+                sent_at: Instant::now(),
+            },
+        )]);
+        let returned = [
+            node(0x30, [8, 8, 4, 4], 6881),
+            node(0x31, [1, 1, 1, 1], 6882),
+        ];
+        let mut compact = Vec::new();
+        for returned in &returned {
+            let IpAddr::V4(ip) = returned.addr.ip() else {
+                panic!("test node was not IPv4");
+            };
+            compact.extend_from_slice(&returned.id);
+            compact.extend_from_slice(&ip.octets());
+            compact.extend_from_slice(&returned.addr.port().to_be_bytes());
+        }
+        let response = vec![
+            (b"t".to_vec(), Value::Bytes(b"boot".to_vec())),
+            (
+                b"r".to_vec(),
+                Value::Dict(vec![
+                    (b"id".to_vec(), Value::Bytes(router_id.to_vec())),
+                    (b"nodes".to_vec(), Value::Bytes(compact)),
+                ]),
+            ),
+        ];
+
+        handle_response_test(
+            &response,
+            &router,
+            &mut rt,
+            &mut pending,
+            &socket,
+            &[9u8; 20],
+            &mut PeerStore::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(rt.node_count(), 0, "BEP 42 still guards the table");
+        let start: Vec<SocketAddr> = rt
+            .lookup_start(&[0x30u8; 20])
+            .iter()
+            .map(|node| node.addr)
+            .collect();
+        assert_eq!(start, vec![returned[0].addr, returned[1].addr]);
+        // Seeds are only a starting point: they are never offered to others.
+        assert!(rt.closest(&[0x30u8; 20], K).is_empty());
+    }
+
+    #[test]
+    fn unanswered_lookup_queries_stop_holding_their_slots() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let live = Node {
+            id: [0x44u8; 20],
+            addr: receiver.local_addr().unwrap(),
+            last_seen: Instant::now(),
+        };
+        let mut rt = RoutingTable::new([0u8; 20]);
+        rt.insert(live);
+        let sent_at = crate::instant_ago(LOOKUP_SLOW_QUERY + Duration::from_secs(1));
+        let mut lookup = peer_lookup([0x45u8; 20], vec![live]);
+        let mut pending = HashMap::new();
+        for (index, silent) in ["203.0.113.1:1", "203.0.113.2:1", "203.0.113.3:1"]
+            .into_iter()
+            .enumerate()
+        {
+            let addr: SocketAddr = silent.parse().unwrap();
+            lookup.queried.insert(addr);
+            pending.insert(
+                vec![index as u8],
+                PendingQuery {
+                    kind: PendingKind::RefreshBucket(1),
+                    addr,
+                    expected_id: None,
+                    sent_at,
+                },
+            );
+        }
+        lookup.outstanding = REFRESH_LOOKUP_ALPHA;
+        let mut lookups = HashMap::from([(1, lookup)]);
+
+        advance_refresh_lookup(1, &mut rt, &mut pending, &socket, &[9u8; 20], &mut lookups);
+
+        let mut packet = [0u8; 1500];
+        receiver
+            .recv_from(&mut packet)
+            .expect("three silent nodes must not stall the lookup");
+        assert_eq!(pending.len(), 4);
+        // The silent queries still count until they time out, so the lookup
+        // keeps waiting for late answers instead of finishing early.
+        assert_eq!(lookups[&1].outstanding, REFRESH_LOOKUP_ALPHA + 1);
+    }
+
+    #[test]
+    fn exhausted_lookup_finishes_without_waiting_for_silent_nodes() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut rt = RoutingTable::new([0u8; 20]);
+        let silent: SocketAddr = "203.0.113.9:1".parse().unwrap();
+        let mut lookup = peer_lookup([0x46u8; 20], vec![node(0x46, [203, 0, 113, 9], 1)]);
+        lookup.queried.insert(silent);
+        lookup.outstanding = 1;
+        let mut pending = HashMap::from([(
+            b"slow".to_vec(),
+            PendingQuery {
+                kind: PendingKind::RefreshBucket(1),
+                addr: silent,
+                expected_id: None,
+                sent_at: crate::instant_ago(LOOKUP_SLOW_QUERY + Duration::from_secs(1)),
+            },
+        )]);
+        let mut lookups = HashMap::from([(1, lookup)]);
+
+        advance_refresh_lookup(1, &mut rt, &mut pending, &socket, &[9u8; 20], &mut lookups);
+
+        assert!(
+            lookups.is_empty(),
+            "the next lookup must not wait for the timeout"
         );
     }
 

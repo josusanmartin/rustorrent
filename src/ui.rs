@@ -72,6 +72,10 @@ pub enum UiCommand {
         profile: String,
         reply: mpsc::Sender<UiCommandResult>,
     },
+    SetTorrentPeerLimit {
+        limit: usize,
+        reply: mpsc::Sender<UiCommandResult>,
+    },
     SetLabel {
         torrent_id: u64,
         label: String,
@@ -645,6 +649,7 @@ fn handle_connection(
             "/torrent/recheck" => handle_torrent_recheck(&query, &cmd_tx).map(|_| None),
             "/settings/seed-ratio" => handle_set_seed_ratio(&request, &cmd_tx).map(|_| None),
             "/settings/peer-profile" => handle_set_peer_profile(&request, &cmd_tx).map(|_| None),
+            "/settings/peer-limit" => handle_set_peer_limit(&request, &cmd_tx).map(|_| None),
             "/torrent/set-label" => handle_set_label(&request, &state, &cmd_tx).map(|_| None),
             "/torrent/add-tracker" => handle_add_tracker(&request, &cmd_tx).map(|_| None),
             "/torrent/remove-tracker" => handle_remove_tracker(&request, &cmd_tx).map(|_| None),
@@ -794,6 +799,7 @@ fn post_body_limit(path: &str) -> Option<usize> {
         | "/rate-limits"
         | "/settings/seed-ratio"
         | "/settings/peer-profile"
+        | "/settings/peer-limit"
         | "/torrent/set-label"
         | "/torrent/add-tracker"
         | "/torrent/remove-tracker"
@@ -1758,6 +1764,26 @@ fn handle_set_peer_profile(
         return Err("invalid peer profile".to_string());
     }
     dispatch_command_ok(cmd_tx, |reply| UiCommand::SetPeerProfile { profile, reply })
+}
+
+/// Most connections one transfer may keep open. qBittorrent allows 100.
+pub const MAX_TORRENT_PEER_LIMIT: usize = 1000;
+
+fn handle_set_peer_limit(
+    request: &HttpRequest,
+    cmd_tx: &Option<mpsc::Sender<UiCommand>>,
+) -> Result<(), String> {
+    let form = form_pairs(request);
+    let limit = query_value(&form, "per_torrent")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|limit| (1..=MAX_TORRENT_PEER_LIMIT).contains(limit))
+        .ok_or_else(|| {
+            format!("connections per transfer must be between 1 and {MAX_TORRENT_PEER_LIMIT}")
+        })?;
+    dispatch_command_ok(cmd_tx, |reply| UiCommand::SetTorrentPeerLimit {
+        limit,
+        reply,
+    })
 }
 
 fn handle_set_label(
@@ -3072,6 +3098,44 @@ mod tests {
         command_thread.join().expect("join archive command thread");
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"ok\":true"));
+    }
+
+    #[test]
+    fn peer_limit_setting_dispatches_command_and_rejects_out_of_range() {
+        let post = |body: &str, cmd_tx| {
+            let host = "127.0.0.1:19006";
+            let request = format!(
+                "POST /settings/peer-limit HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nX-Rustorrent-Token: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+                api_token(),
+                body.len(),
+                body
+            );
+            run_single_request(request.as_bytes(), cmd_tx)
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>();
+        let command_thread = thread::spawn(move || match cmd_rx.recv() {
+            Ok(UiCommand::SetTorrentPeerLimit { limit, reply }) => {
+                assert_eq!(limit, 150);
+                let _ = reply.send(Ok(UiCommandSuccess::Ok));
+            }
+            _ => panic!("expected set peer limit command"),
+        });
+        let response = post("per_torrent=150", Some(cmd_tx));
+        command_thread.join().expect("join peer limit command");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+
+        for body in ["per_torrent=0", "per_torrent=1001", "per_torrent=many", ""] {
+            let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>();
+            let response = post(body, Some(cmd_tx));
+            assert!(
+                !response.starts_with("HTTP/1.1 200 OK"),
+                "{body}: {response}"
+            );
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "{body} must not reach the engine"
+            );
+        }
     }
 
     #[test]

@@ -246,17 +246,21 @@ even the proxy's own DNS lookup must stay on the host.
 
 ```sh
 rustorrent --peer-profile conservative ubuntu.torrent
-rustorrent --max-peers 500 --max-peers-torrent 80 ubuntu.torrent
+rustorrent --max-peers 800 --max-peers-torrent 150 ubuntu.torrent
 rustorrent --ui --max-active 2        # at most two downloads at once
 ```
 
 | Profile | Global peers | Per torrent | Tracker `numwant` | Magnet metadata peers |
 |---|---|---|---|---|
-| `conservative` | 80 | 12 | 50 | 20 |
-| `balanced` (default) | 200 | 30 | 200 | 80 |
-| `aggressive` | 500 | 80 | 500 | 160 |
+| `conservative` | 120 | 30 | 50 | 20 |
+| `balanced` (default) | 500 | 100 | 200 | 80 |
+| `aggressive` | 1000 | 200 | 500 | 160 |
 
-Explicit `--max-peers`, `--max-peers-torrent` and `--numwant` flags override the profile.
+Balanced matches qBittorrent's defaults. Peers that connect to you get their own slots, up to the
+same per-torrent limit, so outgoing connections cannot crowd them out. In the web interface,
+**Settings › Connections › Connections per transfer** changes the per-torrent limit and remembers
+it; choosing a profile there goes back to the profile's value. Explicit `--max-peers`,
+`--max-peers-torrent` and `--numwant` flags, or the same keys in a config file, override both.
 Seeding and paused torrents do not count toward `--max-active`.
 </details>
 
@@ -354,8 +358,8 @@ but trackers, DHT and LPD announce the v1 swarm identifier.
 | `--no-encryption` | | Shorthand for `--encryption disable` |
 | `--utp` / `--no-utp` | on | Micro transport protocol |
 | `--peer-profile <name>` | `balanced` | `conservative`, `balanced` or `aggressive` |
-| `--max-peers <n>` | `200` | Global peer limit |
-| `--max-peers-torrent <n>` | `30` | Per-torrent peer limit |
+| `--max-peers <n>` | `500` | Global peer limit |
+| `--max-peers-torrent <n>` | `100` | Per-torrent peer limit |
 | `--max-active <n>` | `4` | Concurrently loading or downloading transfers |
 | `--numwant <n>` | `200` | Peers requested from trackers |
 | `--retry-interval <secs>` | `60` | Tracker retry interval |

@@ -139,7 +139,7 @@ $('app').outerHTML=`<div class="app" id="app">
   <section class="card"><h2>Connectivity</h2><div class="reach" id="reach" role="status"><i></i><div><b id="reachT"></b><p id="reachD"></p></div></div><button class="btn" id="fwBtn" data-a="fw" hidden>Allow incoming connections</button></section>
   <section class="card"><h2>Bandwidth</h2><p class="muted">Limits apply to all transfers. Use 0 for unlimited.</p>${field('limDown','Download limit',num('limDown',102400,64,'KiB/s'))}${field('limUp','Upload limit',num('limUp',102400,64,'KiB/s'))}</section>
   <section class="card"><h2>Seeding</h2>${field('ratio','Stop seeding at ratio',num('ratio',10,0.1,'0 = keep seeding'))}</section>
-  <section class="card"><h2>Connections</h2>${field('profile','Peer profile',choice('profile',[['conservative','Conservative'],['balanced','Balanced'],['aggressive','Aggressive']]),'<span id="profileNote"></span>')}</section>
+  <section class="card"><h2>Connections</h2>${field('profile','Peer profile',choice('profile',[['conservative','Conservative'],['balanced','Balanced'],['aggressive','Aggressive']]),'<span id="profileNote"></span>')}${field('peersTorrent','Connections per transfer',num('peersTorrent',1000,10,'peers'),'More connections find more peers to upload to. qBittorrent uses 100.')}</section>
   <section class="card"><h2>Appearance</h2>${field('appearance','Theme',choice('appearance',[['system','Match system'],['light','Light'],['dark','Dark']]))}</section>
   <section class="card"><h2>Session</h2><dl class="kv" id="session"></dl></section>
   <section class="card"><h2>Keyboard shortcuts</h2><p class="muted">${[['/','filter'],['A','add'],['↑ ↓','move'],['Enter','details'],['Space','pause or resume'],['Delete','remove'],['Esc','close']].map(([k,v])=>`<kbd>${k}</kbd> ${v}`).join(' · ')}</p></section>
@@ -720,7 +720,8 @@ function renderSettings(force){
   const set=(id,v)=>{const e=$(id);if(force||document.activeElement!==e&&!e.dataset.dirty)e.value=v};
   set('limDown',Math.round((G.global_download_limit_bps||0)/1024));set('limUp',Math.round((G.global_upload_limit_bps||0)/1024));
   set('ratio',G.seed_ratio||0);set('profile',G.peer_profile||'balanced');
-  txt($('profileNote'),G.peer_profile_global_limit?`Up to ${G.peer_profile_global_limit} peers in total, ${G.peer_profile_torrent_limit} per transfer.`:'');
+  set('peersTorrent',G.peer_profile_torrent_limit||100);
+  txt($('profileNote'),G.peer_profile_global_limit?`Up to ${G.peer_profile_global_limit} peers in total.`:'');
   const maps=[G.natpmp_status,G.upnp_status].filter(Boolean),mapped=maps.filter(m=>m.startsWith('mapped ')),sum=k=>[...T.values()].reduce((a,t)=>a+t[k],0);
   const pairs=[['Version',G.version],['Default save location',G.download_dir],['Downloaded this session',bytes(G.session_downloaded_bytes)],['Uploaded this session',bytes(G.session_uploaded_bytes)],
     ['Peers',`${sum('active_peers')} connected · ${sum('tracker_peers')} known`],['Connections',`${G.peer_connected||0} opened · ${G.peer_disconnected||0} closed`],
@@ -801,6 +802,7 @@ on('change',e=>{
   else if(id==='limDown'||id==='limUp')act('/rate-limits',{download_kbps:clampInput($('limDown'),102400,Math.round),upload_kbps:clampInput($('limUp'),102400,Math.round)},'Bandwidth limits saved');
   else if(id==='ratio')act('/settings/seed-ratio',{ratio:clampInput(t,10,v=>Math.round(v*100)/100)},'Seeding limit saved');
   else if(id==='profile'){delete t.dataset.dirty;act('/settings/peer-profile',{profile:t.value},'Peer profile saved')}
+  else if(id==='peersTorrent'){const v=Math.max(1,clampInput(t,1000,Math.round));t.value=v;act('/settings/peer-limit',{per_torrent:v},'Connections per transfer saved')}
   else if(id==='appearance'){const v=t.value==='system'?'':t.value;store.set('theme',v||null);applyTheme(v)}
   else if(id==='scat')store.set('scat',t.value);
   else if(t.dataset.plugin)store.set('search-plugins',JSON.stringify([...document.querySelectorAll('[data-plugin]')].filter(c=>c.checked&&!c.disabled).map(c=>c.dataset.plugin)));

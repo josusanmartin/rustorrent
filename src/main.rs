@@ -350,6 +350,8 @@ const UNCHOKE_INTERVAL: Duration = Duration::from_secs(10);
 const OPTIMISTIC_UNCHOKE_INTERVAL: Duration = Duration::from_secs(30);
 const METADATA_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const TRANSFER_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a uTP connection attempt runs alone before TCP is tried too.
+const UTP_CONNECT_HEAD_START: Duration = Duration::from_secs(1);
 const MAX_PEER_RETRIES: u32 = 8;
 const MAX_KNOWN_PEERS: usize = 4096;
 const MAX_PEX_PEERS_PER_MESSAGE: usize = 100;
@@ -359,7 +361,6 @@ const PEER_BAN_SECS: u64 = 60;
 const PEER_RETRY_EXHAUSTED_BAN_SECS: u64 = 15 * 60;
 const PEER_RETRY_MAX_SECS: u64 = 30;
 const PEER_THREAD_STACK: usize = 512 * 1024; // 512KB
-const TRACKER_ANNOUNCE_WAIT_BUDGET: Duration = Duration::from_secs(4);
 /// Budget for periodic announces, which run in the background. It leaves
 /// room for BEP 15 UDP retransmission and slow HTTPS trackers.
 const TRACKER_ANNOUNCE_BUDGET: Duration = Duration::from_secs(20);
@@ -369,6 +370,7 @@ const TORRENT_LOOP_INTERVAL: Duration = Duration::from_millis(200);
 const PEER_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STALL_REANNOUNCE_SECS: u64 = 30;
 const STARTUP_BURST_MIN_WORKERS: usize = 24;
+const STARTUP_BURST_MAX_WORKERS: usize = 120;
 const STARTUP_BURST_MULTIPLIER: usize = 3;
 const STARTUP_BURST_BYTES: u64 = 8 * 1024 * 1024;
 const REQUEST_QUEUE_TIME_SECS: f64 = 2.0;
@@ -396,6 +398,8 @@ const MAX_INBOUND_HANDLER_SLOTS: usize = 1024;
 const METADATA_PIECE_LEN: usize = 16 * 1024;
 const METADATA_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
+/// Peers asked for metadata at the same time while resolving a magnet.
+const METADATA_PARALLEL_PEERS: usize = 12;
 const MAGNET_RETRY_MIN: Duration = Duration::from_secs(5);
 const MAGNET_RETRY_MAX: Duration = Duration::from_secs(60);
 const METADATA_REQUEST_RETRY: Duration = Duration::from_secs(3);
@@ -441,9 +445,8 @@ static UPSTREAM_MAPPING_STARTED: AtomicBool = AtomicBool::new(false);
 /// port is reachable from the internet.
 static INBOUND_PUBLIC_PEERS: AtomicU64 = AtomicU64::new(0);
 static STARTED_AT: OnceLock<Instant> = OnceLock::new();
-/// Without a peer connecting in after this long, outgoing connections are the
-/// only way to reach peers, so more of them are opened.
-const OUTGOING_ONLY_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Port the incoming listener accepted on, or 0 when there is none.
+static LISTEN_PORT: AtomicU16 = AtomicU16::new(0);
 static SEED_RATIO_BITS: AtomicU64 = AtomicU64::new(0);
 static MAX_SEED_TIME_SECS: AtomicU64 = AtomicU64::new(0);
 static SUPER_SEED: AtomicBool = AtomicBool::new(false);
@@ -650,20 +653,21 @@ impl PeerProfile {
         match self {
             Self::Conservative => PeerProfileTuning {
                 numwant: 50,
-                max_peers_global: 80,
-                max_peers_torrent: 12,
+                max_peers_global: 120,
+                max_peers_torrent: 30,
                 metadata_peer_limit: 20,
             },
+            // qBittorrent's defaults: 100 connections per transfer, 500 in all.
             Self::Balanced => PeerProfileTuning {
                 numwant: 200,
-                max_peers_global: 200,
-                max_peers_torrent: 30,
+                max_peers_global: 500,
+                max_peers_torrent: 100,
                 metadata_peer_limit: 80,
             },
             Self::Aggressive => PeerProfileTuning {
                 numwant: 500,
-                max_peers_global: 500,
-                max_peers_torrent: 80,
+                max_peers_global: 1000,
+                max_peers_torrent: 200,
                 metadata_peer_limit: 160,
             },
         }
@@ -708,21 +712,8 @@ impl PeerRuntimeSettings {
         self.max_peers_torrent.load(Ordering::SeqCst)
     }
 
-    /// (global, per torrent) limits in force. While no peer can connect in,
-    /// the Balanced and Aggressive profiles open more outgoing connections,
-    /// closer to qBittorrent's defaults; limits set by hand are kept.
-    fn effective_limits(&self, outgoing_only: bool) -> (usize, usize) {
-        let (global, torrent) = (self.max_peers_global(), self.max_peers_torrent());
-        let profile = PeerProfile::from_code(self.profile.load(Ordering::SeqCst));
-        let tuning = profile.tuning();
-        if !outgoing_only
-            || profile == PeerProfile::Conservative
-            || global != tuning.max_peers_global
-            || torrent != tuning.max_peers_torrent
-        {
-            return (global, torrent);
-        }
-        (global + global / 2, torrent * 2)
+    fn set_max_peers_torrent(&self, limit: usize) {
+        self.max_peers_torrent.store(limit, Ordering::SeqCst);
     }
 
     fn apply_profile(&self, profile: PeerProfile) -> PeerProfileTuning {
@@ -887,6 +878,10 @@ struct TorrentContext {
     ui_state: Option<Arc<Mutex<ui::UiState>>>,
     global_peer_slots: Arc<PeerSlots>,
     torrent_peer_slots: Arc<PeerSlots>,
+    /// Peers that connected to us. They get their own slots: outgoing
+    /// connections, mostly to seeds, would otherwise fill every slot and turn
+    /// away the peers that came to download from us.
+    inbound_peer_slots: Arc<PeerSlots>,
     pieces: Arc<Mutex<piece::PieceManager>>,
     storage: Arc<Mutex<storage::Storage>>,
     completed_log: Arc<Mutex<Vec<u32>>>,
@@ -2904,6 +2899,14 @@ fn run() -> Result<(), String> {
     if args.port_is_default {
         args.port = saved_listen_port(&args.download_dir);
     }
+    // A limit chosen in Settings applies unless the command line or config
+    // file set one.
+    if args.max_peers_torrent == args.peer_profile.tuning().max_peers_torrent {
+        if let Some(limit) = saved_torrent_peer_limit(&args.download_dir) {
+            log_info!("connections per transfer: {limit} (from Settings)");
+            args.max_peers_torrent = limit;
+        }
+    }
 
     // Write the optional PID file only after this instance owns the session.
     let _pid_file_guard = if let Some(pid_path) = args.pid_file.as_ref() {
@@ -3120,7 +3123,10 @@ fn run() -> Result<(), String> {
     let direct_discovery = args.proxy.is_none();
     let inbound_listener_handle = if direct_discovery {
         match start_inbound_listener(args.port, registry.clone(), inbound.clone()) {
-            Ok(handle) => Some(handle),
+            Ok(handle) => {
+                LISTEN_PORT.store(args.port, Ordering::Relaxed);
+                Some(handle)
+            }
             Err(err) => {
                 log_warn!("inbound listener failed: {err}");
                 None
@@ -3733,6 +3739,9 @@ fn run_ui_command(
         Command::SetPeerProfile { profile, reply } => {
             let result = parse_peer_profile(&profile).map(|profile| {
                 let tuning = peer_settings.apply_profile(profile);
+                if let Err(err) = save_torrent_peer_limit(&args.download_dir, None) {
+                    log_warn!("{err}");
+                }
                 peer_slots.set_max(tuning.max_peers_global);
                 inbound.set_max_handlers(inbound_handler_slots(tuning.max_peers_global));
                 log_info!(
@@ -3751,6 +3760,13 @@ fn run_ui_command(
                 });
             });
             (Some("peer profile"), result, reply)
+        }
+        Command::SetTorrentPeerLimit { limit, reply } => {
+            peer_settings.set_max_peers_torrent(limit);
+            let result = save_torrent_peer_limit(&args.download_dir, Some(limit));
+            log_info!("connections per transfer changed via ui: {limit}");
+            update_ui(ui_state, |state| state.peer_profile_torrent_limit = limit);
+            (Some("connections per transfer"), result, reply)
         }
         Command::SetLabel {
             torrent_id,
@@ -4689,6 +4705,7 @@ fn run_torrent_once(
             .to_vec(),
     );
     let per_torrent_slots = Arc::new(PeerSlots::new(peer_settings.max_peers_torrent()));
+    let inbound_slots = Arc::new(PeerSlots::new(peer_settings.max_peers_torrent()));
     let upload_manager = Arc::new(UploadManager::new(UPLOAD_SLOTS));
     let active_peers = Arc::new(AtomicUsize::new(0));
     let interested_peers = Arc::new(AtomicUsize::new(0));
@@ -4710,6 +4727,7 @@ fn run_torrent_once(
         ui_state: ui_state.clone(),
         global_peer_slots: Arc::clone(peer_slots),
         torrent_peer_slots: Arc::clone(&per_torrent_slots),
+        inbound_peer_slots: Arc::clone(&inbound_slots),
         pieces: Arc::clone(&pieces),
         storage: Arc::clone(&storage),
         completed_log: Arc::clone(&completed_log),
@@ -4820,18 +4838,23 @@ fn run_torrent_once(
                 apply_late_lifecycle_request(&context, session_store, action);
             }
             reap_finished_workers(&mut handles, "peer");
-            let (global_limit, desired_workers) = peer_settings.effective_limits(outgoing_only());
+            let (global_limit, desired_workers) = (
+                peer_settings.max_peers_global(),
+                peer_settings.max_peers_torrent(),
+            );
             context.global_peer_slots.set_max(global_limit);
             let startup_burst = downloaded.load(Ordering::SeqCst) < STARTUP_BURST_BYTES;
             let live_target = if startup_burst {
                 desired_workers
                     .saturating_mul(STARTUP_BURST_MULTIPLIER)
-                    .max(STARTUP_BURST_MIN_WORKERS)
+                    .clamp(STARTUP_BURST_MIN_WORKERS, STARTUP_BURST_MAX_WORKERS)
+                    .max(desired_workers)
                     .min(global_limit)
             } else {
                 desired_workers
             };
             per_torrent_slots.set_max(live_target);
+            inbound_slots.set_max(desired_workers);
             while context.peer_workers.load(Ordering::SeqCst) < live_target {
                 let worker_context = Arc::clone(&context);
                 let worker_connect_cfg = connect_cfg.clone();
@@ -5674,88 +5697,30 @@ fn fetch_torrent_from_magnet(
                 .to_string()
         }));
     }
-    if !meta.peers.is_empty() {
-        let peer_id = generate_peer_id();
-        log_info!("magnet: fetching metadata from explicit peers");
-        for addr in &meta.peers {
-            if Instant::now() >= deadline {
-                break;
-            }
-            log_info!("metadata: trying explicit peer {addr}");
-            if torrent_stop_requested(cancel) {
-                return Err("metadata fetch cancelled".to_string());
-            }
-            match fetch_metadata_from_peer(
-                *addr,
-                expected_hashes,
-                peer_id,
-                deadline,
-                connect_cfg,
-                cancel,
-            ) {
-                Ok(info_bytes) => {
-                    log_info!("metadata: explicit peer {addr} delivered metadata");
-                    let data = wrap_torrent_with_info(&info_bytes, &meta.trackers, &meta.web_seeds);
-                    return Ok(data);
-                }
-                Err(err) => {
-                    log_warn!("metadata: explicit peer {addr} failed: {err}");
-                    if metadata_err.is_none() {
-                        metadata_err = Some(err);
-                    }
-                }
-            }
-        }
-    }
-    if !meta.trackers.is_empty() {
-        let peer_id = generate_peer_id();
-        log_info!("magnet: fetching metadata from trackers");
-        match fetch_metadata_from_trackers(
+    if !meta.peers.is_empty() || !meta.trackers.is_empty() || connect_cfg.proxy.is_none() {
+        log_info!("magnet: fetching metadata from peers");
+        match fetch_metadata_from_swarm(
             expected_hashes,
-            peer_id,
+            generate_peer_id(),
             port,
-            &meta.trackers,
+            MetadataSources {
+                explicit_peers: &meta.peers,
+                trackers: &meta.trackers,
+                dht,
+            },
             deadline,
             connect_cfg,
             metadata_peer_limit,
             cancel,
         ) {
             Ok(info_bytes) => {
-                log_info!("magnet: metadata fetched from trackers");
+                log_info!("magnet: metadata fetched from peers");
                 let data = wrap_torrent_with_info(&info_bytes, &meta.trackers, &meta.web_seeds);
                 return Ok(data);
             }
             Err(err) => {
-                log_warn!("magnet: tracker metadata failed: {err}");
-                if metadata_err.is_none() {
-                    metadata_err = Some(err);
-                }
-            }
-        }
-    }
-    if connect_cfg.proxy.is_none() && !torrent_stop_requested(cancel) {
-        let peer_id = generate_peer_id();
-        log_info!("magnet: fetching metadata from dht");
-        match fetch_metadata_from_dht(
-            expected_hashes,
-            peer_id,
-            port,
-            deadline,
-            dht,
-            connect_cfg,
-            metadata_peer_limit,
-            cancel,
-        ) {
-            Ok(info_bytes) => {
-                log_info!("magnet: metadata fetched from dht");
-                let data = wrap_torrent_with_info(&info_bytes, &meta.trackers, &meta.web_seeds);
-                return Ok(data);
-            }
-            Err(err) => {
-                log_warn!("magnet: dht metadata failed: {err}");
-                if metadata_err.is_none() {
-                    metadata_err = Some(err);
-                }
+                log_warn!("magnet: peer metadata failed: {err}");
+                metadata_err = Some(err);
             }
         }
     }
@@ -5940,42 +5905,72 @@ fn base32_value(ch: char) -> Option<u8> {
     }
 }
 
+fn metadata_source_label(source: PeerSource) -> &'static str {
+    match source {
+        PeerSource::Tracker => "tracker",
+        PeerSource::Dht => "dht",
+        PeerSource::Magnet => "magnet",
+        PeerSource::Lpd => "local",
+        PeerSource::Pex => "pex",
+    }
+}
+
+/// Where a magnet looks for peers to ask for metadata.
+struct MetadataSources<'a> {
+    explicit_peers: &'a [SocketAddr],
+    trackers: &'a [String],
+    dht: &'a dht::Dht,
+}
+
+/// Fetches metadata from the swarm. Peers from the magnet, its trackers and
+/// the DHT are gathered together and asked METADATA_PARALLEL_PEERS at a time;
+/// the first copy that matches the info hash wins. Asking one peer at a time
+/// spent the whole budget on peers that never answer.
 #[allow(clippy::too_many_arguments)]
-fn fetch_metadata_from_trackers(
+fn fetch_metadata_from_swarm(
     expected_hashes: ExpectedInfoHashes,
     peer_id: [u8; 20],
     port: u16,
-    trackers: &[String],
+    sources: MetadataSources<'_>,
     deadline: Instant,
     connect_cfg: &ConnectionConfig,
     metadata_peer_limit: usize,
     cancel: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
     let info_hash = expected_hashes.swarm_id()?;
-    log_info!(
-        "metadata: tracker announce start (trackers={}, deadline={}s)",
-        trackers.len(),
-        deadline.saturating_duration_since(Instant::now()).as_secs()
-    );
+    let mut last_err: Option<String> = None;
+    let mut queue: VecDeque<(SocketAddr, PeerSource)> = VecDeque::new();
+    let mut seen = HashSet::new();
+    let mut admit = |queue: &mut VecDeque<(SocketAddr, PeerSource)>, peer, source| {
+        let Some(peer) = safe_metadata_peer(peer, source, connect_cfg.ip_filter.as_deref()) else {
+            return;
+        };
+        if seen.len() < metadata_peer_limit && seen.insert(peer) {
+            queue.push_back((peer, source));
+        }
+    };
+    for peer in sources.explicit_peers {
+        admit(&mut queue, *peer, PeerSource::Magnet);
+    }
+
     let announce_trackers = TrackerSet {
-        http: trackers
+        http: sources
+            .trackers
             .iter()
-            .filter(|tracker_url| {
-                tracker_url.starts_with("http://") || tracker_url.starts_with("https://")
-            })
+            .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
             .cloned()
             .collect(),
         udp: if connect_cfg.proxy.is_none() {
-            trackers
+            sources
+                .trackers
                 .iter()
-                .filter(|tracker_url| tracker_url.starts_with("udp://"))
+                .filter(|url| url.starts_with("udp://"))
                 .cloned()
                 .collect()
         } else {
             Vec::new()
         },
     };
-    let mut last_err: Option<String> = None;
     let (announce_rx, mut announce_pending) = spawn_tracker_announces(
         &announce_trackers,
         info_hash,
@@ -5988,199 +5983,135 @@ fn fetch_metadata_from_trackers(
         metadata_peer_limit as u32,
         false,
         connect_cfg.proxy.clone(),
-        TRACKER_ANNOUNCE_WAIT_BUDGET,
+        TRACKER_ANNOUNCE_BUDGET,
     );
-    let mut seen = HashSet::new();
-    let mut unique = Vec::new();
-    let announce_deadline = Instant::now() + TRACKER_ANNOUNCE_WAIT_BUDGET;
-    while announce_pending > 0 && !torrent_stop_requested(cancel) {
-        let Some(remaining) = announce_deadline.checked_duration_since(Instant::now()) else {
-            break;
-        };
-        if remaining.is_zero() {
-            break;
-        }
-        let wait = remaining.min(TRACKER_ANNOUNCE_POLL);
-        match announce_rx.recv_timeout(wait) {
-            Ok(result) => {
-                announce_pending = announce_pending.saturating_sub(1);
-                match result.response {
-                    Ok(response) => {
-                        if result.is_udp {
-                            log_info!(
-                                "metadata: udp tracker {} returned {} peers",
-                                safe_network_url_label(&result.tracker_url),
-                                response.peers.len()
-                            );
-                        } else {
-                            log_info!(
-                                "metadata: http tracker {} returned {} peers",
-                                safe_network_url_label(&result.tracker_url),
-                                response.peers.len()
-                            );
-                        }
-                        for peer in response.peers {
-                            let Some(peer) = safe_metadata_peer(
-                                peer,
-                                PeerSource::Tracker,
-                                connect_cfg.ip_filter.as_deref(),
-                            ) else {
-                                continue;
-                            };
-                            if seen.insert(peer) {
-                                unique.push(peer);
-                                if unique.len() >= metadata_peer_limit {
-                                    break;
-                                }
-                            }
-                        }
-                        if !unique.is_empty() && unique.len() >= 8 {
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        last_err = Some(format!(
-                            "{}: {err}",
-                            safe_network_url_label(&result.tracker_url)
-                        ));
-                    }
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
+    if announce_pending > 0 {
+        log_info!(
+            "metadata: asking {announce_pending} trackers (deadline={}s)",
+            deadline.saturating_duration_since(Instant::now()).as_secs()
+        );
     }
-    if unique.is_empty() {
-        return Err(last_err.unwrap_or_else(|| "no peers returned for magnet".to_string()));
-    }
-    log_info!("metadata: {} unique peers from trackers", unique.len());
-
-    for addr in unique {
-        if Instant::now() >= deadline || torrent_stop_requested(cancel) {
-            break;
-        }
-        log_info!("metadata: trying peer {addr}");
-        match fetch_metadata_from_peer(
-            addr,
-            expected_hashes,
-            peer_id,
-            deadline,
-            connect_cfg,
-            cancel,
-        ) {
-            Ok(data) => {
-                log_info!("metadata: peer {addr} delivered metadata");
-                return Ok(data);
-            }
-            Err(err) => {
-                log_warn!("metadata: peer {addr} failed: {err}");
-                last_err = Some(err)
-            }
-        }
+    let use_dht = cfg!(feature = "dht") && connect_cfg.proxy.is_none();
+    let (dht_tx, dht_rx) = mpsc::channel();
+    if use_dht {
+        log_info!("metadata: dht add torrent for discovery");
+        sources.dht.add_torrent(info_hash, port, dht_tx);
+    } else {
+        drop(dht_tx);
     }
 
-    Err(last_err.unwrap_or_else(|| "metadata fetch timed out".to_string()))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn fetch_metadata_from_dht(
-    expected_hashes: ExpectedInfoHashes,
-    peer_id: [u8; 20],
-    port: u16,
-    deadline: Instant,
-    dht: &dht::Dht,
-    connect_cfg: &ConnectionConfig,
-    metadata_peer_limit: usize,
-    cancel: &AtomicBool,
-) -> Result<Vec<u8>, String> {
-    let info_hash = expected_hashes.swarm_id()?;
-    if !cfg!(feature = "dht") {
-        let _ = dht;
-        return Err("dht disabled".to_string());
-    }
-    if Instant::now() >= deadline {
-        return Err("metadata fetch timed out".to_string());
-    }
-    let (tx, rx) = mpsc::channel();
-    log_info!("metadata: dht add torrent for discovery");
-    dht.add_torrent(info_hash, port, tx);
-    let mut last_err: Option<String> = None;
-    let mut queue = VecDeque::new();
-    let mut seen = HashSet::new();
-    let mut result: Option<Vec<u8>> = None;
-    let mut total_seen = 0usize;
-
+    // Workers watch `stop` so they give up once a copy has arrived, the
+    // magnet is cancelled, or the deadline passes.
+    let stop = Arc::new(AtomicBool::new(false));
+    let (result_tx, result_rx) = mpsc::channel::<(SocketAddr, Result<Vec<u8>, String>)>();
+    let mut in_flight = 0usize;
+    let mut asked = 0usize;
+    let mut result = None;
     while Instant::now() < deadline {
         if torrent_stop_requested(cancel) {
             last_err = Some("metadata fetch cancelled".to_string());
             break;
         }
-
-        while let Some(addr) = queue.pop_front() {
-            if Instant::now() >= deadline || torrent_stop_requested(cancel) {
-                break;
-            }
-            log_info!("metadata: trying dht peer {addr}");
-            match fetch_metadata_from_peer(
-                addr,
-                expected_hashes,
-                peer_id,
-                deadline,
-                connect_cfg,
-                cancel,
-            ) {
-                Ok(data) => {
-                    log_info!("metadata: dht peer {addr} delivered metadata");
-                    result = Some(data);
-                    break;
+        while let Ok(outcome) = announce_rx.try_recv() {
+            announce_pending = announce_pending.saturating_sub(1);
+            let label = safe_network_url_label(&outcome.tracker_url);
+            match outcome.response {
+                Ok(response) => {
+                    log_info!(
+                        "metadata: {} tracker {label} returned {} peers",
+                        if outcome.is_udp { "udp" } else { "http" },
+                        response.peers.len()
+                    );
+                    for peer in response.peers {
+                        admit(&mut queue, peer, PeerSource::Tracker);
+                    }
                 }
                 Err(err) => {
-                    log_warn!("metadata: dht peer {addr} failed: {err}");
-                    last_err = Some(err)
+                    log_debug!("metadata: tracker {label} failed: {err}");
+                    last_err.get_or_insert_with(|| format!("{label}: {err}"));
                 }
             }
         }
-
-        if result.is_some() {
-            break;
+        while let Ok(peers) = dht_rx.try_recv() {
+            log_info!("metadata: dht returned {} peers", peers.len());
+            for peer in peers {
+                admit(&mut queue, peer, PeerSource::Dht);
+            }
         }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let wait = remaining.min(Duration::from_millis(500));
-        if wait.is_zero() {
-            break;
-        }
-        match rx.recv_timeout(wait) {
-            Ok(peers) => {
-                if !peers.is_empty() {
-                    log_info!("metadata: dht peers received batch size={}", peers.len());
+        while in_flight < METADATA_PARALLEL_PEERS {
+            let Some((addr, source)) = queue.pop_front() else {
+                break;
+            };
+            let stop = Arc::clone(&stop);
+            let result_tx = result_tx.clone();
+            let connect_cfg = connect_cfg.clone();
+            let worker: Worker = Box::new(move || {
+                let outcome = fetch_metadata_from_peer(
+                    addr,
+                    expected_hashes,
+                    peer_id,
+                    deadline,
+                    &connect_cfg,
+                    &stop,
+                );
+                let _ = result_tx.send((addr, outcome));
+            });
+            match spawn_worker("metadata".to_string(), PEER_THREAD_STACK, worker) {
+                Ok(_) => {
+                    log_info!(
+                        "metadata: trying {} peer {addr}",
+                        metadata_source_label(source)
+                    );
+                    in_flight += 1;
+                    asked += 1;
                 }
-                for peer in peers {
-                    let Some(peer) =
-                        safe_metadata_peer(peer, PeerSource::Dht, connect_cfg.ip_filter.as_deref())
-                    else {
-                        continue;
-                    };
-                    if seen.len() >= metadata_peer_limit {
-                        break;
-                    }
-                    if seen.insert(peer) {
-                        total_seen += 1;
-                        queue.push_back(peer);
-                    }
+                Err(err) => {
+                    log_warn!("metadata worker could not start: {err}");
+                    queue.push_front((addr, source));
+                    break;
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(TRACKER_ANNOUNCE_POLL);
+        match result_rx.recv_timeout(wait) {
+            Ok((addr, Ok(data))) => {
+                log_info!("metadata: peer {addr} delivered metadata");
+                result = Some(data);
+                break;
+            }
+            Ok((addr, Err(err))) => {
+                in_flight = in_flight.saturating_sub(1);
+                log_warn!("metadata: peer {addr} failed: {err}");
+                last_err = Some(err);
+            }
+            Err(_) => {}
         }
     }
-
-    dht.remove_torrent(info_hash);
-    log_info!("metadata: dht done (peers_seen={total_seen})");
+    stop.store(true, Ordering::SeqCst);
+    if use_dht {
+        sources.dht.remove_torrent(info_hash);
+    }
+    log_info!(
+        "metadata: asked {asked} of {} peers found{}",
+        seen.len(),
+        if announce_pending > 0 {
+            " (some trackers still pending)"
+        } else {
+            ""
+        }
+    );
     if let Some(data) = result {
         return Ok(data);
     }
-    Err(last_err.unwrap_or_else(|| "metadata fetch timed out".to_string()))
+    Err(last_err.unwrap_or_else(|| {
+        if seen.is_empty() {
+            "no peers found for magnet".to_string()
+        } else {
+            "metadata fetch timed out".to_string()
+        }
+    }))
 }
 
 fn fetch_metadata_from_peer(
@@ -6485,15 +6416,31 @@ fn expected_metadata_piece_len(total: usize, piece: usize) -> Option<usize> {
 }
 
 fn build_ext_handshake(metadata_size: Option<usize>, allow_pex: bool) -> Vec<u8> {
-    build_ext_handshake_with(metadata_size, allow_pex, false)
+    build_ext_handshake_with(metadata_size, allow_pex, false, None)
 }
 
+/// BEP 10 handshake. `p` tells the peer where we accept connections: without
+/// it, libtorrent and others never pass our address on through PEX, so no one
+/// else in the swarm learns how to connect in, and nothing gets uploaded.
 fn build_ext_handshake_with(
     metadata_size: Option<usize>,
     allow_pex: bool,
     holepunch: bool,
+    peer_ip: Option<std::net::IpAddr>,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(80);
+    let listen_port = LISTEN_PORT.load(Ordering::Relaxed);
+    let reachable_port = (listen_port != 0).then(|| announce_port(listen_port));
+    encode_ext_handshake(metadata_size, allow_pex, holepunch, reachable_port, peer_ip)
+}
+
+fn encode_ext_handshake(
+    metadata_size: Option<usize>,
+    allow_pex: bool,
+    holepunch: bool,
+    reachable_port: Option<u16>,
+    peer_ip: Option<std::net::IpAddr>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
     out.push(b'd');
     out.extend_from_slice(b"1:m");
     out.push(b'd');
@@ -6509,10 +6456,35 @@ fn build_ext_handshake_with(
         out.extend_from_slice(b"6:ut_pexi2e");
     }
     out.push(b'e');
+    // Top-level keys also sort bytewise: m < metadata_size < p < v < yourip.
     if let Some(size) = metadata_size {
         out.extend_from_slice(b"13:metadata_sizei");
         out.extend_from_slice(size.to_string().as_bytes());
         out.push(b'e');
+    }
+    if let Some(port) = reachable_port {
+        out.extend_from_slice(b"1:pi");
+        out.extend_from_slice(port.to_string().as_bytes());
+        out.push(b'e');
+    }
+    let version = concat!("Rustorrent ", env!("CARGO_PKG_VERSION"));
+    out.extend_from_slice(b"1:v");
+    out.extend_from_slice(version.len().to_string().as_bytes());
+    out.push(b':');
+    out.extend_from_slice(version.as_bytes());
+    if let Some(ip) = peer_ip {
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+            ip => ip,
+        };
+        let octets = match ip {
+            std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+            std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+        };
+        out.extend_from_slice(b"6:yourip");
+        out.extend_from_slice(octets.len().to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(&octets);
     }
     out.push(b'e');
     out
@@ -11130,6 +11102,7 @@ impl<'a> PeerConn<'a> {
                 Some(ctx.metadata.len()),
                 ctx.allow_pex,
                 ctx.allow_holepunch,
+                Some(self.addr.ip()),
             );
             send_message(
                 stream,
@@ -12322,6 +12295,33 @@ fn connect_peer_with_timeout(
 
     let (tx, rx) = mpsc::channel::<Result<PeerStream, String>>();
     let mut attempts = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_err: Option<String> = None;
+
+    // Like libtorrent, try uTP first. Its packets leave from our listening
+    // port, so the peer and everyone it tells over PEX learn an address that
+    // reaches us, and replies pass NATs that drop unsolicited TCP. Racing
+    // both let TCP win almost every time, and peers never connected back.
+    if let Some(connector) = connect_cfg.utp.as_ref() {
+        let result_tx = tx.clone();
+        let connector = connector.clone();
+        if let Err(err) = spawn_worker(
+            "utp-connect".to_string(),
+            0,
+            Box::new(move || {
+                let result = connector.connect(addr).map(PeerStream::utp);
+                let _ = result_tx.send(result);
+            }),
+        ) {
+            last_err = Some(format!("uTP connect worker could not start: {err}"));
+        } else {
+            match rx.recv_timeout(UTP_CONNECT_HEAD_START) {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(err)) => last_err = Some(err),
+                Err(_) => attempts += 1,
+            }
+        }
+    }
 
     attempts += 1;
     {
@@ -12342,26 +12342,8 @@ fn connect_peer_with_timeout(
         }
     }
 
-    if let Some(connector) = connect_cfg.utp.as_ref() {
-        attempts += 1;
-        let result_tx = tx.clone();
-        let connector = connector.clone();
-        if let Err(err) = spawn_worker(
-            "utp-connect".to_string(),
-            0,
-            Box::new(move || {
-                let result = connector.connect(addr).map(PeerStream::utp);
-                let _ = result_tx.send(result);
-            }),
-        ) {
-            let _ = tx.send(Err(format!("uTP connect worker could not start: {err}")));
-        }
-    }
-
     drop(tx);
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut last_err: Option<String> = None;
     for _ in 0..attempts {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             break;
@@ -12970,15 +12952,6 @@ fn is_retryable_peer_error(err: &str) -> bool {
         || err == "connect failed"
 }
 
-/// No peer has connected in from the internet since start-up, long enough to
-/// rule out a slow first peer.
-fn outgoing_only() -> bool {
-    INBOUND_PUBLIC_PEERS.load(Ordering::Relaxed) == 0
-        && STARTED_AT
-            .get()
-            .is_some_and(|started| started.elapsed() >= OUTGOING_ONLY_AFTER)
-}
-
 /// Failed before a BitTorrent handshake started: nothing answered.
 fn is_unreachable_peer_error(err: &str) -> bool {
     !err.contains("handshake") && !err.contains("self peer") && !err.contains("blocked")
@@ -13307,7 +13280,8 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
         INBOUND_PUBLIC_PEERS.fetch_add(1, Ordering::Relaxed);
     }
     let peer_tag = context.peer_tags.fetch_add(1, Ordering::SeqCst);
-    let Some(_torrent_slot) = context.torrent_peer_slots.try_acquire() else {
+    let Some(_torrent_slot) = context.inbound_peer_slots.try_acquire() else {
+        log_debug!("inbound peer {addr}: no free incoming slot");
         return;
     };
     let Some(_global_slot) = context.global_peer_slots.try_acquire() else {
@@ -13947,6 +13921,43 @@ where
 /// The incoming port picked on first run and kept with the session. A fixed
 /// default such as 6881 is throttled by some providers and is often already
 /// forwarded to another device on the same network.
+const TORRENT_PEER_LIMIT_FILE: &str = "peers-per-transfer";
+
+fn saved_torrent_peer_limit(download_dir: &Path) -> Option<usize> {
+    let path = download_dir
+        .join(".rustorrent")
+        .join(TORRENT_PEER_LIMIT_FILE);
+    read_file_limited(&path, 16, true)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| text.trim().parse::<usize>().ok())
+        .filter(|limit| (1..=ui::MAX_TORRENT_PEER_LIMIT).contains(limit))
+}
+
+/// Remembers the connections-per-transfer setting; `None` goes back to the
+/// peer profile's value.
+fn save_torrent_peer_limit(download_dir: &Path, limit: Option<usize>) -> Result<(), String> {
+    let path = download_dir
+        .join(".rustorrent")
+        .join(TORRENT_PEER_LIMIT_FILE);
+    match limit {
+        Some(limit) => write_atomic_file(
+            &path,
+            format!("{limit}\n").as_bytes(),
+            "peer limit",
+            false,
+            true,
+        )
+        .map_err(|err| format!("could not save connections per transfer: {err}")),
+        None => match remove_file_bound(&path) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                Err(format!("could not reset connections per transfer: {err}"))
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
 fn saved_listen_port(download_dir: &Path) -> u16 {
     let path = download_dir.join(".rustorrent").join("listen-port");
     let saved = read_file_limited(&path, 16, true)
@@ -14644,7 +14655,7 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
 
     #[test]
     fn extended_handshake_advertises_holepunch_in_sorted_order() {
-        let payload = build_ext_handshake_with(Some(4096), true, true);
+        let payload = build_ext_handshake_with(Some(4096), true, true, None);
         assert!(payload.starts_with(b"d1:md12:ut_holepunchi3e11:ut_metadatai1e6:ut_pexi2ee"));
         assert_eq!(parse_holepunch_caps(&payload), (Some(3), None));
         assert!(!build_ext_handshake(None, true)
@@ -14668,6 +14679,27 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
         assert_eq!(queue.pop(), None, "no second connection from the queue");
         queue.finish(addr);
         assert!(queue.start_direct(addr));
+    }
+
+    #[test]
+    fn extended_handshake_tells_peers_where_to_connect() {
+        let peer: std::net::IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        let payload = encode_ext_handshake(Some(4096), true, false, Some(31777), Some(peer));
+        let bencode::Value::Dict(dict) = bencode::parse(&payload).unwrap() else {
+            panic!("handshake is not a dictionary");
+        };
+        let keys: Vec<&[u8]> = dict.iter().map(|(key, _)| key.as_slice()).collect();
+        assert_eq!(keys, [&b"m"[..], b"metadata_size", b"p", b"v", b"yourip"]);
+        assert!(payload.windows(9).any(|w| w == b"1:pi31777"));
+        assert!(payload.ends_with(b"6:yourip4:\xcb\x00\x71\x07e"));
+        let version = format!("Rustorrent {}", env!("CARGO_PKG_VERSION"));
+        assert!(payload
+            .windows(version.len())
+            .any(|w| w == version.as_bytes()));
+        assert_eq!(parse_holepunch_caps(&payload).1, Some(31777));
+        // Without a listener there is no port to advertise.
+        let payload = encode_ext_handshake(None, false, false, None, None);
+        assert!(!payload.windows(3).any(|w| w == b"1:p"));
     }
 
     #[test]
@@ -15232,6 +15264,7 @@ mod core_helpers_tests {
             ui_state: None,
             global_peer_slots: Arc::new(PeerSlots::new(16)),
             torrent_peer_slots: Arc::new(PeerSlots::new(8)),
+            inbound_peer_slots: Arc::new(PeerSlots::new(8)),
             pieces: Arc::new(Mutex::new(piece::PieceManager::new(&meta).unwrap())),
             storage: Arc::new(Mutex::new(
                 storage::Storage::new(&meta, root, storage::StorageOptions::default()).unwrap(),
@@ -18627,17 +18660,6 @@ mod core_helpers_tests {
     }
 
     #[test]
-    fn outgoing_only_raises_profile_limits_but_not_manual_ones() {
-        let settings = PeerRuntimeSettings::new(PeerProfile::Balanced, 200, 80, 200, 30);
-        assert_eq!(settings.effective_limits(false), (200, 30));
-        assert_eq!(settings.effective_limits(true), (300, 60));
-        settings.apply_profile(PeerProfile::Conservative);
-        assert_eq!(settings.effective_limits(true), (80, 12));
-        let manual = PeerRuntimeSettings::new(PeerProfile::Balanced, 200, 80, 4, 2);
-        assert_eq!(manual.effective_limits(true), (4, 2));
-    }
-
-    #[test]
     fn peer_runtime_settings_apply_profile_updates_live_limits() {
         let settings = PeerRuntimeSettings::new(PeerProfile::Balanced, 111, 44, 222, 33);
         let tuning = settings.apply_profile(PeerProfile::Conservative);
@@ -18645,8 +18667,8 @@ mod core_helpers_tests {
         assert_eq!(settings.profile(), PeerProfile::Conservative);
         assert_eq!(settings.numwant(), 50);
         assert_eq!(settings.metadata_peer_limit(), 20);
-        assert_eq!(settings.max_peers_global(), 80);
-        assert_eq!(settings.max_peers_torrent(), 12);
+        assert_eq!(settings.max_peers_global(), 120);
+        assert_eq!(settings.max_peers_torrent(), 30);
     }
 
     #[test]
@@ -18768,13 +18790,31 @@ mod core_helpers_tests {
     }
 
     #[test]
+    fn connections_per_transfer_setting_survives_restart_until_reset() {
+        let root = std::env::temp_dir().join(format!(
+            "rustorrent-peer-limit-{}-{}",
+            std::process::id(),
+            system_entropy_u64()
+        ));
+        ensure_private_state_directory(&root).unwrap();
+        assert_eq!(saved_torrent_peer_limit(&root), None);
+        save_torrent_peer_limit(&root, Some(150)).unwrap();
+        assert_eq!(saved_torrent_peer_limit(&root), Some(150));
+        save_torrent_peer_limit(&root, None).unwrap();
+        assert_eq!(saved_torrent_peer_limit(&root), None);
+        // Resetting with nothing saved is not an error.
+        save_torrent_peer_limit(&root, None).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn peer_profile_presets_define_expected_limits() {
         assert_eq!(
             PeerProfile::Conservative.tuning(),
             PeerProfileTuning {
                 numwant: 50,
-                max_peers_global: 80,
-                max_peers_torrent: 12,
+                max_peers_global: 120,
+                max_peers_torrent: 30,
                 metadata_peer_limit: 20,
             }
         );
@@ -18782,8 +18822,8 @@ mod core_helpers_tests {
             PeerProfile::Balanced.tuning(),
             PeerProfileTuning {
                 numwant: 200,
-                max_peers_global: 200,
-                max_peers_torrent: 30,
+                max_peers_global: 500,
+                max_peers_torrent: 100,
                 metadata_peer_limit: 80,
             }
         );
@@ -18791,8 +18831,8 @@ mod core_helpers_tests {
             PeerProfile::Aggressive.tuning(),
             PeerProfileTuning {
                 numwant: 500,
-                max_peers_global: 500,
-                max_peers_torrent: 80,
+                max_peers_global: 1000,
+                max_peers_torrent: 200,
                 metadata_peer_limit: 160,
             }
         );

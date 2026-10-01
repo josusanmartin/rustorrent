@@ -266,8 +266,14 @@ test('files, trackers and settings controls reach the engine', async ({page}) =>
   await page.getByLabel('Download limit').fill('512');
   await page.getByLabel('Download limit').press('Tab');
   await expect.poll(async () => (await state()).global_download_limit_bps).toBe(512 * 1024);
+  await expect(page.getByLabel('Connections per transfer')).toHaveValue('100');
+  await page.getByLabel('Connections per transfer').fill('150');
+  await page.getByLabel('Connections per transfer').press('Tab');
+  await expect.poll(async () => (await state()).peer_profile_torrent_limit).toBe(150);
   await page.getByLabel('Peer profile').selectOption('conservative');
   await expect.poll(async () => (await state()).peer_profile).toBe('conservative');
+  // Choosing a profile replaces a hand-set limit with the profile's own.
+  await expect.poll(async () => (await state()).peer_profile_torrent_limit).toBe(30);
   await page.getByLabel('Theme', {exact: true}).selectOption('dark');
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
   await page.getByLabel('Download limit').fill('0'); await page.getByLabel('Download limit').press('Tab');
