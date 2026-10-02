@@ -26,7 +26,7 @@ const VIEWS: [&str; 4] = ["Transfers", "Search", "RSS", "Session"];
 const TABS: [&str; 3] = ["Info", "Files", "Trackers"];
 const PROFILES: [&str; 3] = ["conservative", "balanced", "aggressive"];
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Key {
     Char(char),
     Up,
@@ -90,6 +90,8 @@ struct Tui {
 
 pub fn run(client: Client) -> Result<(), String> {
     let _terminal = Terminal::enter()?;
+    #[cfg(windows)]
+    let mut input = console::KeyReader::new(_terminal.input);
     let mut tui = Tui {
         client,
         status: Json::Null,
@@ -126,7 +128,11 @@ pub fn run(client: Client) -> Result<(), String> {
             let _ = out.flush();
             last_frame = frame;
         }
-        if let Some(key) = read_key() {
+        #[cfg(windows)]
+        let key = input.read_key();
+        #[cfg(not(windows))]
+        let key = read_key();
+        if let Some(key) = key {
             match tui.handle(key) {
                 Some(true) => return Ok(()),
                 Some(false) => last_refresh = None,
@@ -993,13 +999,76 @@ impl Drop for Terminal {
     }
 }
 
-#[cfg(not(unix))]
-struct Terminal;
+#[cfg(windows)]
+struct Terminal {
+    input: *mut std::ffi::c_void,
+    output: *mut std::ffi::c_void,
+    input_mode: u32,
+    output_mode: u32,
+    input_code_page: u32,
+    output_code_page: u32,
+}
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 impl Terminal {
     fn enter() -> Result<Terminal, String> {
-        Err("the terminal UI is available on macOS and Linux; use `rustorrent remote` commands or the web UI".into())
+        let input = console::std_handle(console::STD_INPUT_HANDLE)
+            .ok_or("the terminal UI needs an interactive terminal")?;
+        let output = console::std_handle(console::STD_OUTPUT_HANDLE)
+            .ok_or("the terminal UI needs an interactive terminal")?;
+        let input_mode =
+            console::mode(input).ok_or("the terminal UI needs an interactive terminal")?;
+        let output_mode =
+            console::mode(output).ok_or("the terminal UI needs an interactive terminal")?;
+        let raw_input = console::ENABLE_EXTENDED_FLAGS;
+        let raw_output = output_mode
+            | console::ENABLE_PROCESSED_OUTPUT
+            | console::ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        if !console::set_mode(input, raw_input) || !console::set_mode(output, raw_output) {
+            let _ = console::set_mode(input, input_mode);
+            let _ = console::set_mode(output, output_mode);
+            return Err("could not switch the terminal to raw mode".into());
+        }
+        let input_code_page = console::input_code_page();
+        let output_code_page = console::output_code_page();
+        let _ = console::set_input_code_page(console::UTF8_CODE_PAGE);
+        let _ = console::set_output_code_page(console::UTF8_CODE_PAGE);
+        crate::TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J");
+        let _ = out.flush();
+        Ok(Terminal {
+            input,
+            output,
+            input_mode,
+            output_mode,
+            input_code_page,
+            output_code_page,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1049l");
+        let _ = out.flush();
+        let _ = console::set_mode(self.input, self.input_mode);
+        let _ = console::set_mode(self.output, self.output_mode);
+        let _ = console::set_input_code_page(self.input_code_page);
+        let _ = console::set_output_code_page(self.output_code_page);
+        crate::TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct Terminal;
+
+#[cfg(not(any(unix, windows)))]
+impl Terminal {
+    fn enter() -> Result<Terminal, String> {
+        Err("the terminal UI needs an interactive terminal".into())
     }
 }
 
@@ -1014,7 +1083,15 @@ fn terminal_size() -> (usize, usize) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn terminal_size() -> (usize, usize) {
+    let Some(output) = console::std_handle(console::STD_OUTPUT_HANDLE) else {
+        return (24, 80);
+    };
+    console::window_size(output).unwrap_or((24, 80))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn terminal_size() -> (usize, usize) {
     (24, 80)
 }
@@ -1027,13 +1104,351 @@ fn read_byte() -> Option<u8> {
     (n == 1).then_some(byte)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn read_byte() -> Option<u8> {
     None
 }
 
+#[cfg(windows)]
+mod console {
+    use std::ffi::c_void;
+
+    pub(super) const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
+    pub(super) const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+    pub(super) const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
+    pub(super) const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+    pub(super) const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    pub(super) const UTF8_CODE_PAGE: u32 = 65001;
+    const WAIT_OBJECT_0: u32 = 0;
+    const READ_TIMEOUT_MS: u32 = 200;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(kind: u32) -> *mut c_void;
+        fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: *mut c_void, mode: u32) -> i32;
+        fn GetConsoleScreenBufferInfo(handle: *mut c_void, info: *mut ScreenBufferInfo) -> i32;
+        fn ReadConsoleInputW(
+            handle: *mut c_void,
+            buffer: *mut InputRecord,
+            length: u32,
+            read: *mut u32,
+        ) -> i32;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn GetConsoleCP() -> u32;
+        fn GetConsoleOutputCP() -> u32;
+        fn SetConsoleCP(code_page: u32) -> i32;
+        fn SetConsoleOutputCP(code_page: u32) -> i32;
+    }
+
+    #[repr(C)]
+    struct Coord {
+        x: i16,
+        y: i16,
+    }
+
+    #[repr(C)]
+    struct SmallRect {
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+    }
+
+    #[repr(C)]
+    struct ScreenBufferInfo {
+        _size: Coord,
+        _cursor: Coord,
+        _attributes: u16,
+        window: SmallRect,
+        _maximum: Coord,
+    }
+
+    pub(super) fn std_handle(kind: u32) -> Option<*mut c_void> {
+        // SAFETY: the standard-handle identifiers are the documented constants.
+        let handle = unsafe { GetStdHandle(kind) };
+        if handle.is_null() || handle == usize::MAX as *mut c_void {
+            None
+        } else {
+            Some(handle)
+        }
+    }
+
+    pub(super) fn mode(handle: *mut c_void) -> Option<u32> {
+        let mut mode = 0u32;
+        // SAFETY: `handle` is a live console handle from `std_handle`.
+        let ok = unsafe { GetConsoleMode(handle, &mut mode) };
+        (ok != 0).then_some(mode)
+    }
+
+    pub(super) fn set_mode(handle: *mut c_void, mode: u32) -> bool {
+        // SAFETY: `handle` is a live console handle and `mode` is a flag word.
+        unsafe { SetConsoleMode(handle, mode) != 0 }
+    }
+
+    pub(super) fn input_code_page() -> u32 {
+        // SAFETY: the call has no pointer arguments.
+        unsafe { GetConsoleCP() }
+    }
+
+    pub(super) fn output_code_page() -> u32 {
+        // SAFETY: the call has no pointer arguments.
+        unsafe { GetConsoleOutputCP() }
+    }
+
+    pub(super) fn set_input_code_page(code_page: u32) -> bool {
+        // SAFETY: a code page identifier is a plain integer.
+        unsafe { SetConsoleCP(code_page) != 0 }
+    }
+
+    pub(super) fn set_output_code_page(code_page: u32) -> bool {
+        // SAFETY: a code page identifier is a plain integer.
+        unsafe { SetConsoleOutputCP(code_page) != 0 }
+    }
+
+    pub(super) fn window_size(handle: *mut c_void) -> Option<(usize, usize)> {
+        let mut info = ScreenBufferInfo {
+            _size: Coord { x: 0, y: 0 },
+            _cursor: Coord { x: 0, y: 0 },
+            _attributes: 0,
+            window: SmallRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            _maximum: Coord { x: 0, y: 0 },
+        };
+        // SAFETY: `info` matches the console screen-buffer structure.
+        if unsafe { GetConsoleScreenBufferInfo(handle, &mut info) } == 0 {
+            return None;
+        }
+        let rows = i32::from(info.window.bottom) - i32::from(info.window.top) + 1;
+        let cols = i32::from(info.window.right) - i32::from(info.window.left) + 1;
+        (rows > 0 && cols > 0).then_some((rows as usize, cols as usize))
+    }
+
+    /// Maps one console key event. `key_down` is the Windows BOOL, and
+    /// `control` is `dwControlKeyState`.
+    pub(super) fn key_from_event(
+        key_down: i32,
+        virtual_key: u16,
+        unicode: u16,
+        control: u32,
+    ) -> Option<super::Key> {
+        if key_down == 0 || matches!(virtual_key, 0x10..=0x12) {
+            return None;
+        }
+        match virtual_key {
+            0x26 => return Some(super::Key::Up),
+            0x28 => return Some(super::Key::Down),
+            0x25 => return Some(super::Key::Left),
+            0x27 => return Some(super::Key::Right),
+            0x21 => return Some(super::Key::PageUp),
+            0x22 => return Some(super::Key::PageDown),
+            0x24 => return Some(super::Key::Home),
+            0x23 => return Some(super::Key::End),
+            0x0D => return Some(super::Key::Enter),
+            0x1B => return Some(super::Key::Esc),
+            0x08 => return Some(super::Key::Backspace),
+            0x09 => return Some(super::Key::Tab),
+            0x2E => return Some(super::Key::Delete),
+            _ => {}
+        }
+        // Ctrl+C arrives as C with a control modifier when processed input is off.
+        const CTRL_PRESSED: u32 = 0x0004 | 0x0008;
+        const ALT_PRESSED: u32 = 0x0001 | 0x0002;
+        if virtual_key == u16::from(b'C')
+            && (control & CTRL_PRESSED) != 0
+            && (control & ALT_PRESSED) == 0
+        {
+            return Some(super::Key::Char('\u{3}'));
+        }
+        char::from_u32(u32::from(unicode))
+            .filter(|ch| !ch.is_control() || *ch == '\u{3}')
+            .map(super::Key::Char)
+    }
+
+    pub(super) struct KeyReader {
+        input: *mut c_void,
+        high_surrogate: Option<u16>,
+        repeated: Option<(super::Key, u16)>,
+    }
+
+    impl KeyReader {
+        /// `input` is the console input handle whose mode `Terminal` set.
+        pub(super) fn new(input: *mut c_void) -> KeyReader {
+            KeyReader {
+                input,
+                high_surrogate: None,
+                repeated: None,
+            }
+        }
+
+        fn take_repeated(&mut self) -> Option<super::Key> {
+            let (key, remaining) = self.repeated.take()?;
+            if remaining > 1 {
+                self.repeated = Some((key, remaining - 1));
+            }
+            Some(key)
+        }
+
+        fn decode_event(&mut self, event: &KeyEvent) -> Option<super::Key> {
+            if event.key_down == 0 || matches!(event.virtual_key, 0x10..=0x12) {
+                return None;
+            }
+            let key = match event.unicode {
+                0xD800..=0xDBFF => {
+                    self.high_surrogate = Some(event.unicode);
+                    return None;
+                }
+                0xDC00..=0xDFFF => {
+                    let high = self.high_surrogate.take()?;
+                    let scalar = 0x10000
+                        + ((u32::from(high) - 0xD800) << 10)
+                        + (u32::from(event.unicode) - 0xDC00);
+                    char::from_u32(scalar).map(super::Key::Char)
+                }
+                _ => {
+                    self.high_surrogate = None;
+                    key_from_event(
+                        event.key_down,
+                        event.virtual_key,
+                        event.unicode,
+                        event.control,
+                    )
+                }
+            }?;
+            if event.repeat > 1 {
+                self.repeated = Some((key, event.repeat - 1));
+            }
+            Some(key)
+        }
+
+        pub(super) fn read_key(&mut self) -> Option<super::Key> {
+            if let Some(key) = self.take_repeated() {
+                return Some(key);
+            }
+            let input = self.input;
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(u64::from(READ_TIMEOUT_MS));
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                let wait_ms = u32::try_from(remaining.as_millis()).unwrap_or(READ_TIMEOUT_MS);
+                // SAFETY: a console input handle can be waited on for the next event.
+                let waited = unsafe { WaitForSingleObject(input, wait_ms) };
+                if waited != WAIT_OBJECT_0 {
+                    if waited == u32::MAX {
+                        std::thread::sleep(std::time::Duration::from_millis(u64::from(
+                            READ_TIMEOUT_MS,
+                        )));
+                    }
+                    return None;
+                }
+                let mut record = InputRecord::default();
+                let mut read = 0u32;
+                // SAFETY: `record` is a complete input record and `read` receives the count.
+                let ok = unsafe { ReadConsoleInputW(input, &mut record, 1, &mut read) };
+                if ok == 0 || read == 0 {
+                    return None;
+                }
+                if record.event_type == KEY_EVENT {
+                    if let Some(key) = self.decode_event(&record.key) {
+                        return Some(key);
+                    }
+                }
+            }
+        }
+    }
+
+    const KEY_EVENT: u16 = 0x0001;
+
+    #[repr(C)]
+    struct KeyEvent {
+        key_down: i32,
+        repeat: u16,
+        virtual_key: u16,
+        _scan: u16,
+        unicode: u16,
+        control: u32,
+    }
+
+    #[repr(C)]
+    struct InputRecord {
+        event_type: u16,
+        _pad: u16,
+        key: KeyEvent,
+    }
+
+    impl Default for InputRecord {
+        fn default() -> Self {
+            Self {
+                event_type: 0,
+                _pad: 0,
+                key: KeyEvent {
+                    key_down: 0,
+                    repeat: 0,
+                    virtual_key: 0,
+                    _scan: 0,
+                    unicode: 0,
+                    control: 0,
+                },
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn input_record_matches_the_windows_layout() {
+        assert_eq!(std::mem::size_of::<InputRecord>(), 20);
+        assert_eq!(std::mem::align_of::<InputRecord>(), 4);
+        assert_eq!(std::mem::offset_of!(InputRecord, key), 4);
+        assert_eq!(std::mem::offset_of!(KeyEvent, unicode), 10);
+        assert_eq!(std::mem::offset_of!(KeyEvent, control), 12);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn console_reader_preserves_repeats_and_surrogate_pairs() {
+        let mut reader = KeyReader::new(std::ptr::null_mut());
+        let mut event = InputRecord::default().key;
+        event.key_down = 1;
+        event.virtual_key = 0x26;
+        event.repeat = 3;
+        assert_eq!(reader.decode_event(&event), Some(super::Key::Up));
+        assert_eq!(reader.take_repeated(), Some(super::Key::Up));
+        assert_eq!(reader.take_repeated(), Some(super::Key::Up));
+        assert_eq!(reader.take_repeated(), None);
+
+        event.virtual_key = 0;
+        event.repeat = 1;
+        event.unicode = 0xD83D;
+        assert_eq!(reader.decode_event(&event), None);
+        event.key_down = 0;
+        assert_eq!(reader.decode_event(&event), None);
+        event.key_down = 1;
+        event.unicode = 0xDE00;
+        assert_eq!(
+            reader.decode_event(&event),
+            Some(super::Key::Char('\u{1F600}'))
+        );
+        assert_eq!(reader.decode_event(&event), None);
+
+        event.unicode = 0xD83D;
+        assert_eq!(reader.decode_event(&event), None);
+        event.unicode = u16::from(b'a');
+        assert_eq!(reader.decode_event(&event), Some(super::Key::Char('a')));
+        event.unicode = 0xDE00;
+        assert_eq!(reader.decode_event(&event), None);
+    }
+}
+
 /// Reads one key press (waiting up to 200 ms), decoding escape sequences
 /// and UTF-8 input.
+#[cfg(not(windows))]
 fn read_key() -> Option<Key> {
     let first = read_byte()?;
     Some(match first {
@@ -1096,5 +1511,28 @@ mod tests {
         screen.pad("\x1b[1mabcdefg\x1b[0m");
         assert_eq!(screen.out, "\x1b[1mabcde\x1b[0m");
         assert_eq!(visible_len("\x1b[31m↓ 1\x1b[0m"), 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn console_events_map_to_terminal_keys() {
+        assert_eq!(console::key_from_event(1, 0x26, 0, 0), Some(Key::Up));
+        assert_eq!(console::key_from_event(1, 0x0D, 13, 0), Some(Key::Enter));
+        assert_eq!(console::key_from_event(1, 0x08, 8, 0), Some(Key::Backspace));
+        assert_eq!(
+            console::key_from_event(1, u16::from(b'C'), 3, 0x0008),
+            Some(Key::Char('\u{3}'))
+        );
+        assert_eq!(
+            console::key_from_event(1, u16::from(b'Q'), u16::from(b'q'), 0),
+            Some(Key::Char('q'))
+        );
+        assert_eq!(console::key_from_event(0, 0x26, 0, 0), None);
+        assert_eq!(console::key_from_event(1, 0x10, 0, 0), None);
+        // AltGr is reported as Ctrl+Alt; typing a character must not exit the UI.
+        assert_eq!(
+            console::key_from_event(1, u16::from(b'C'), 0x0107, 0x0009),
+            Some(Key::Char('\u{107}'))
+        );
     }
 }

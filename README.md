@@ -442,7 +442,7 @@ implemented in this repository.
 | macOS 11+ (Intel and Apple silicon) | ✅ Supported, with a native app bundle |
 | Linux x86_64 | ✅ Supported and tested in CI |
 | Linux aarch64 | 🟡 Builds from source; not runtime-tested in CI |
-| Windows | 🟡 Builds and runs its tests in CI; NAT-PMP gateway detection and the terminal interface are unavailable |
+| Windows 10/11 | ✅ [Native desktop window](windows/README.md), CLI, web and terminal interfaces. Desktop requires WebView2; `--daemon` remains Unix-only |
 
 ## Development
 

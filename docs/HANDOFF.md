@@ -31,6 +31,7 @@ All are GitHub pre-releases.
 - **Hole-punch status:** the UI doesn't show that hole punching is happening. A counter or a peer flag ("via hole punch") would make it visible.
 - **Upload slots:** the upload slot count is a fixed 6 (`UPLOAD_SLOTS`). qBittorrent uses 4 per torrent and scales with the upload rate.
 - **Signing:** the app is not Developer ID signed or notarized, so macOS asks on first launch.
+- **Windows app** (`feature/windows-app`): CI builds, smoke-tests and uploads the x64 ZIP as `windows-x86_64`, but the Release workflow does not publish it yet, and the package is unsigned. Not yet checked by hand: the terminal UI with a physical keyboard and Ctrl+C, NAT-PMP against a real router, the ARM64 build, the missing-WebView2 message, multi-monitor DPI changes, tray restore, and shutdown during a Windows sign-out.
 - **CI warning:** actions pinned to Node 20 (`actions/checkout`, `actions/setup-node`) print a deprecation warning. They still pass; bump the pinned SHAs when convenient.
 
 ## Local setup
@@ -40,5 +41,6 @@ All are GitHub pre-releases.
 - **Interop tests:** `transmission-daemon` for `tests/e2e_transmission.py`, and libtorrent's Python bindings for `tests/e2e_libtorrent.py` (`brew install libtorrent-rasterbar` on macOS; PyPI has no wheel for recent Pythons).
 - **Toolchains:** CI uses the latest stable Rust and denies warnings, so run clippy with the newest release too (`rustup toolchain install <version> -c clippy -c rustfmt`, then `cargo +<version> clippy ...`) as well as `cargo +1.89.0 check`.
 - **macOS app:** `./macos/package_app.sh --universal --dmg`.
+- **Windows app:** Visual Studio C++ Build Tools with the Windows SDK, then `.\windows\package_app.ps1`.
 
 See `CLAUDE.md` for the checks to run before pushing and for the release steps.

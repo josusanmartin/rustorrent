@@ -143,6 +143,14 @@ impl ProcessTree {
         }
 
         #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // A console subsystem child such as Python would otherwise open
+            // its own window on top of the client.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        #[cfg(windows)]
         let job = WindowsJob::new().map_err(|err| format!("create process job: {err}"))?;
 
         let child = command
@@ -1137,6 +1145,7 @@ fn detect_python() -> Option<String> {
         "/usr/local/bin/python",
         "python3",
         "python",
+        "py",
     ]
     .iter()
     .find(|candidate| command_available(candidate))

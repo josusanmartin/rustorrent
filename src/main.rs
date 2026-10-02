@@ -37,6 +37,8 @@ mod util;
 mod utp;
 #[cfg(windows)]
 mod windows_fs;
+#[cfg(windows)]
+mod windows_launcher;
 mod xml;
 
 #[cfg(not(feature = "dht"))]
@@ -1257,7 +1259,7 @@ interface:
   --ui [port]                 web interface on 127.0.0.1 (default port 8080)
   --ui-addr <addr>            web interface address (loopback only)
   --tui                       interactive terminal interface
-  --daemon                    run in the background with the web interface
+  --daemon                    run in the background with the web interface (Unix)
   --pid-file <path>           write the process id
   --log <path>                append logs to a file
 
@@ -1356,7 +1358,48 @@ fn install_signal_handlers() {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+unsafe extern "system" fn handle_console_ctrl(ctrl: u32) -> i32 {
+    const CTRL_C_EVENT: u32 = 0;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    const CTRL_CLOSE_EVENT: u32 = 2;
+    const CTRL_LOGOFF_EVENT: u32 = 5;
+    const CTRL_SHUTDOWN_EVENT: u32 = 6;
+    match ctrl {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+            request_shutdown();
+            1
+        }
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
+            // Windows ends the process as soon as this handler returns, so
+            // wait here while the main thread saves the session and exits.
+            // Windows still ends the process after its own timeout.
+            request_shutdown();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(windows)]
+fn install_signal_handlers() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+    }
+    // SAFETY: the handler only sets an atomic flag and stays registered for
+    // the process lifetime, so Ctrl+C can save state instead of killing us.
+    unsafe {
+        let _ = SetConsoleCtrlHandler(Some(handle_console_ctrl), 1);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn install_signal_handlers() {}
 
 fn shutdown_requested() -> bool {
@@ -2840,6 +2883,8 @@ fn open_private_log_file(path: &Path) -> Result<fs::File, String> {
 
 fn run() -> Result<(), String> {
     install_signal_handlers();
+    #[cfg(windows)]
+    windows_launcher::install_shutdown_watch()?;
     install_panic_logger();
     let mut args = parse_args()?;
 
@@ -8837,8 +8882,10 @@ fn decode_session_path(
             return Err("invalid wide session path".to_string());
         }
         let wide = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect::<Vec<_>>();
         return Ok(Some(PathBuf::from(std::ffi::OsString::from_wide(&wide))));
     }

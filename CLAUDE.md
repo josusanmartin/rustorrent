@@ -11,6 +11,7 @@ Read `PRODUCT.md` (who it is for, tone) and `DESIGN.md` (UI rules) before changi
 - Protocols: `peer.rs` (wire messages), `peer_stream.rs` (TCP or uTP, optional MSE), `utp.rs` (BEP 29), `dht.rs`, `holepunch.rs` (BEP 55), `tracker.rs`, `udp_tracker.rs`, `lpd.rs`, `mse.rs`, `natpmp.rs`, `upnp.rs`.
 - `src/search.rs`: runs qBittorrent nova3 search plugins. `src/firewall.rs`: the macOS application firewall.
 - `macos/`: `package_app.sh` builds the app and DMG (ULMO compression), `Launcher.swift` is the native window and menu bar mode, and `create_icon.sh` builds the icon from `AppIcon.svg`.
+- `windows/`: `package_app.ps1` builds the ZIP, `build_launcher.ps1` builds `Launcher.cpp`, the native WebView2 window, and `create_icon.ps1` builds `AppIcon.ico` from `macos/AppIcon.svg`. `src/windows_launcher.rs` is the engine side: it saves and exits when the launcher asks or exits.
 - `docs/releases/`: one Markdown file per release; it becomes the GitHub release body.
 
 ## Features
