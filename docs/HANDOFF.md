@@ -1,6 +1,6 @@
 # Handoff: state on 1 October 2026
 
-All code is on `master`, released as 0.2.0-rc.5. No work is left unmerged, and nothing is scheduled to run.
+All code is on `master`, released as 0.2.0-rc.6. No work is left unmerged, and nothing is scheduled to run.
 
 ## Releases
 
@@ -11,6 +11,7 @@ All code is on `master`, released as 0.2.0-rc.5. No work is left unmerged, and n
 | v0.2.0-rc.3 | Double-NAT port mapping, BEP 55 hole punching, one UDP port for DHT and uTP, more outgoing connections when unreachable, "Outgoing only" wording, a uTP fix for libtorrent peers, recommended search plugins, adult sites hidden from the plugin catalog |
 | v0.2.0-rc.4 | Connected-peer table in the Peers tab, and `GET /torrent/peers?id=` |
 | v0.2.0-rc.5 | Working DHT (BEP 42 no longer drops replies, lookups start from bootstrap replies, fast retries), parallel magnet metadata, uTP-first connections, `p`/`v`/`yourip` in the BEP 10 handshake, separate incoming slots, 100 connections per transfer with a Settings field, Rust 1.99 compatibility |
+| v0.2.0-rc.6 | libtorrent-style seeding: seed-to-seed connections close, known seeds are not dialled while seeding, BEP 21 `upload_only`; BEP 11 PEX lists connected peers with listen ports and seed/uTP/encryption flags and sends added/dropped changes |
 
 All are GitHub pre-releases.
 
@@ -24,7 +25,7 @@ All are GitHub pre-releases.
 
 - **Peer table:** "Has" reads 0% for peers that do not send HAVE messages to a seed; libtorrent does not send them. An estimate from the bytes uploaded to that peer would help.
 - **Peer ID:** still fixed at `-RT0001-`. Since rc.5 the BEP 10 `v` field names the client, so libtorrent shows "Rustorrent 0.2.0-rc.5"; the peer ID itself should carry the version too.
-- **Incoming peers:** on the same swarm libtorrent held 50–60 incoming peers and Rustorrent 1–19. Rustorrent's outgoing PEX does not yet set the uTP flag (0x04) or report peers' listen ports, which would spread its address further.
+- **Incoming peers:** on the same swarm libtorrent held 50–60 incoming peers and Rustorrent 1–19. PEX lists connected peers with their listen ports and seed/uTP flags since rc.6, which should help; measure again on a swarm with more downloaders.
 - **Flaky test:** `test_required_encryption_upload_to_transmission` in `tests/e2e_transmission.py` fails about half the time on macOS, on rc.4 as well: Transmission hangs up during the inbound MSE handshake.
 - **Torrent creation:** only from the CLI (`--create`), and only with one tracker. There is no UI for it.
 - **Hole-punch status:** the UI doesn't show that hole punching is happening. A counter or a peer flag ("via hole punch") would make it visible.

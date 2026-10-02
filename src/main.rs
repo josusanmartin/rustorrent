@@ -871,6 +871,9 @@ struct TorrentContext {
     peer_id: [u8; 20],
     metadata: Arc<Vec<u8>>,
     peer_queue: Arc<Mutex<PeerQueue>>,
+    /// Connected peers as PEX lists them: the address that reaches each one
+    /// and its BEP 11 flags, keyed by connection.
+    swarm: Mutex<HashMap<u64, (SocketAddr, u8)>>,
     allow_pex: bool,
     /// BEP 55 needs uTP, direct connections and a public torrent.
     allow_holepunch: bool,
@@ -4719,6 +4722,7 @@ fn run_torrent_once(
         peer_id,
         metadata: Arc::clone(&metadata),
         peer_queue: Arc::clone(&peer_queue),
+        swarm: Mutex::new(HashMap::new()),
         allow_pex: !meta.info.private,
         allow_holepunch: !meta.info.private
             && connect_cfg.utp.is_some()
@@ -4926,7 +4930,8 @@ fn run_torrent_once(
                 }
             }
             let (known_count, queue_len) = {
-                let q = lock_or_recover(&peer_queue);
+                let mut q = lock_or_recover(&peer_queue);
+                q.set_complete(is_complete);
                 (q.known_len(), q.len())
             };
             let active_count = active_peers.load(Ordering::SeqCst);
@@ -6417,7 +6422,7 @@ fn expected_metadata_piece_len(total: usize, piece: usize) -> Option<usize> {
 }
 
 fn build_ext_handshake(metadata_size: Option<usize>, allow_pex: bool) -> Vec<u8> {
-    build_ext_handshake_with(metadata_size, allow_pex, false, None)
+    build_ext_handshake_with(metadata_size, allow_pex, false, false, None)
 }
 
 /// BEP 10 handshake. `p` tells the peer where we accept connections: without
@@ -6427,11 +6432,19 @@ fn build_ext_handshake_with(
     metadata_size: Option<usize>,
     allow_pex: bool,
     holepunch: bool,
+    upload_only: bool,
     peer_ip: Option<std::net::IpAddr>,
 ) -> Vec<u8> {
     let listen_port = LISTEN_PORT.load(Ordering::Relaxed);
     let reachable_port = (listen_port != 0).then(|| announce_port(listen_port));
-    encode_ext_handshake(metadata_size, allow_pex, holepunch, reachable_port, peer_ip)
+    encode_ext_handshake(
+        metadata_size,
+        allow_pex,
+        holepunch,
+        reachable_port,
+        upload_only,
+        peer_ip,
+    )
 }
 
 fn encode_ext_handshake(
@@ -6439,6 +6452,7 @@ fn encode_ext_handshake(
     allow_pex: bool,
     holepunch: bool,
     reachable_port: Option<u16>,
+    upload_only: bool,
     peer_ip: Option<std::net::IpAddr>,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
@@ -6457,7 +6471,8 @@ fn encode_ext_handshake(
         out.extend_from_slice(b"6:ut_pexi2e");
     }
     out.push(b'e');
-    // Top-level keys also sort bytewise: m < metadata_size < p < v < yourip.
+    // Top-level keys also sort bytewise:
+    // m < metadata_size < p < upload_only < v < yourip.
     if let Some(size) = metadata_size {
         out.extend_from_slice(b"13:metadata_sizei");
         out.extend_from_slice(size.to_string().as_bytes());
@@ -6467,6 +6482,11 @@ fn encode_ext_handshake(
         out.extend_from_slice(b"1:pi");
         out.extend_from_slice(port.to_string().as_bytes());
         out.push(b'e');
+    }
+    // BEP 21: a seed tells peers it will not download, so other seeds can
+    // close the connection at once.
+    if upload_only {
+        out.extend_from_slice(b"11:upload_onlyi1e");
     }
     let version = concat!("Rustorrent ", env!("CARGO_PKG_VERSION"));
     out.extend_from_slice(b"1:v");
@@ -6588,6 +6608,20 @@ fn request_metadata_pieces<W: Write>(
 }
 
 /// The peer's ut_holepunch ID and listening port from its extended handshake.
+/// The peer's listening port (BEP 10 `p`) and BEP 21 `upload_only`.
+fn parse_listen_port_and_upload_only(payload: &[u8]) -> (Option<u16>, bool) {
+    let Ok((dict, _)) = parse_bencode_dict(payload) else {
+        return (None, false);
+    };
+    let port = match dict_get(&dict, b"p") {
+        Some(Value::Int(port)) => u16::try_from(*port).ok().filter(|port| *port != 0),
+        _ => None,
+    };
+    let upload_only =
+        matches!(dict_get(&dict, b"upload_only"), Some(Value::Int(flag)) if *flag != 0);
+    (port, upload_only)
+}
+
 fn parse_holepunch_caps(payload: &[u8]) -> (Option<u8>, Option<u16>) {
     let Ok((dict, _)) = parse_bencode_dict(payload) else {
         return (None, None);
@@ -6792,6 +6826,12 @@ struct PeerQueue {
     banned: HashMap<SocketAddr, Instant>,
     filter: Option<Arc<IpFilter>>,
     local_peer_addrs: HashSet<SocketAddr>,
+    /// Peers known to have every piece, from their bitfield, BEP 21
+    /// `upload_only`, or the BEP 11 seed flag another peer sent.
+    seeds: HashSet<SocketAddr>,
+    /// Set while we have every piece too: a seed can then gain nothing from
+    /// another seed, so known seeds are not dialled (as libtorrent does).
+    skip_seeds: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -6828,7 +6868,22 @@ impl PeerQueue {
             banned: HashMap::new(),
             filter,
             local_peer_addrs,
+            seeds: HashSet::new(),
+            skip_seeds: false,
         }
+    }
+
+    fn mark_seed(&mut self, addr: SocketAddr) {
+        let addr = normalize_peer_addr(addr);
+        if self.seeds.len() < MAX_KNOWN_PEERS {
+            self.seeds.insert(addr);
+        }
+    }
+
+    /// Tells the queue whether we have every piece; known seeds are skipped
+    /// while we do.
+    fn set_complete(&mut self, complete: bool) {
+        self.skip_seeds = complete;
     }
 
     fn enqueue_with_source<I: IntoIterator<Item = SocketAddr>>(
@@ -6860,6 +6915,9 @@ impl PeerQueue {
             if self.queued.contains(&addr) || self.inflight.contains(&addr) {
                 continue;
             }
+            if self.skip_seeds && self.seeds.contains(&addr) {
+                continue;
+            }
             if self.is_deferred(addr) {
                 continue;
             }
@@ -6881,7 +6939,11 @@ impl PeerQueue {
     fn pop(&mut self) -> Option<SocketAddr> {
         self.promote_ready();
         while let Some(addr) = self.queue.pop_front() {
-            if self.is_local_self_peer(addr) || self.is_filtered(addr) || self.is_banned(addr) {
+            if self.is_local_self_peer(addr)
+                || self.is_filtered(addr)
+                || self.is_banned(addr)
+                || (self.skip_seeds && self.seeds.contains(&addr))
+            {
                 self.queued.remove(&addr);
                 continue;
             }
@@ -10849,6 +10911,12 @@ const CHOKED_PIECE_RELEASE: Duration = Duration::from_secs(60);
 const STALE_PIECE_STEAL: Duration = Duration::from_secs(30);
 const PIECE_RESERVE_RETRY: Duration = Duration::from_millis(200);
 const PEX_INTERVAL: Duration = Duration::from_secs(60);
+// BEP 11 flags for each added peer.
+const PEX_FLAG_ENCRYPTION: u8 = 0x01;
+const PEX_FLAG_SEED: u8 = 0x02;
+const PEX_FLAG_UTP: u8 = 0x04;
+/// Set for peers we connected to: their address accepts connections.
+const PEX_FLAG_REACHABLE: u8 = 0x10;
 
 /// Buffers socket reads for `peer::MessageReader`, which reads at most 4 KiB
 /// per call. Only the first read of a batch may block; later reads report
@@ -10972,6 +11040,17 @@ struct PeerConn<'a> {
     client: String,
     incoming: bool,
     snapshots: VecDeque<(Instant, u64, u64)>,
+    /// The peer supports BEP 10, so it can be sent a new extension handshake.
+    extensions: bool,
+    /// Where the peer accepts connections (BEP 10 `p`), and whether it only
+    /// uploads (BEP 21 `upload_only`).
+    peer_listen_port: Option<u16>,
+    peer_upload_only: bool,
+    piece_count: usize,
+    /// Addresses already sent to this peer in PEX messages.
+    pex_sent: HashSet<SocketAddr>,
+    /// What this connection last published to `TorrentContext::swarm`.
+    swarm_entry: Option<(SocketAddr, u8)>,
 }
 
 /// Outcome of a step of the peer loop.
@@ -11075,6 +11154,12 @@ impl<'a> PeerConn<'a> {
             client: String::new(),
             incoming: false,
             snapshots: VecDeque::new(),
+            extensions: false,
+            peer_listen_port: None,
+            peer_upload_only: false,
+            piece_count: lock_or_recover(&ctx.pieces).piece_count(),
+            pex_sent: HashSet::new(),
+            swarm_entry: None,
         }
     }
 
@@ -11098,18 +11183,9 @@ impl<'a> PeerConn<'a> {
             // BEP 3: the bitfield is always the first message after the handshake.
             send_message(stream, &peer::Message::Bitfield(local_bitfield), "bitfield")?;
         }
+        self.extensions = extensions;
         if extensions {
-            let payload = build_ext_handshake_with(
-                Some(ctx.metadata.len()),
-                ctx.allow_pex,
-                ctx.allow_holepunch,
-                Some(self.addr.ip()),
-            );
-            send_message(
-                stream,
-                &peer::Message::Extended { ext_id: 0, payload },
-                "ext handshake",
-            )?;
+            self.send_ext_handshake(stream)?;
         }
         let interest = if self.seed_mode {
             peer::Message::NotInterested
@@ -11119,6 +11195,111 @@ impl<'a> PeerConn<'a> {
         send_message(stream, &interest, "interested")?;
         let _ = stream.flush();
         Ok(())
+    }
+
+    fn send_ext_handshake(&mut self, stream: &mut PeerStream) -> Result<(), String> {
+        let ctx = self.ctx;
+        let payload = build_ext_handshake_with(
+            Some(ctx.metadata.len()),
+            ctx.allow_pex,
+            ctx.allow_holepunch,
+            self.seed_mode,
+            Some(self.addr.ip()),
+        );
+        send_message(
+            stream,
+            &peer::Message::Extended { ext_id: 0, payload },
+            "ext handshake",
+        )
+    }
+
+    /// The peer has every piece, or said it only uploads (BEP 21).
+    fn peer_is_seed(&self) -> bool {
+        self.peer_upload_only
+            || self.bitfield.as_ref().is_some_and(|bits| {
+                self.piece_count > 0
+                    && bits.iter().map(|b| b.count_ones() as usize).sum::<usize>()
+                        >= self.piece_count
+            })
+    }
+
+    /// Where other peers can reach this one: the address we dialled, or for
+    /// a peer that connected to us, its IP with the port it listens on.
+    fn reachable_addr(&self) -> Option<SocketAddr> {
+        let addr = normalize_peer_addr(self.addr);
+        if !self.incoming {
+            return Some(addr);
+        }
+        self.peer_listen_port
+            .filter(|port| *port != 0)
+            .map(|port| SocketAddr::new(addr.ip(), port))
+    }
+
+    /// Keeps this connection's entry in the PEX list current.
+    fn sync_swarm_entry(&mut self, stream: &PeerStream) {
+        let entry = self.reachable_addr().map(|addr| {
+            let mut flags = 0u8;
+            if stream.is_encrypted() {
+                flags |= PEX_FLAG_ENCRYPTION;
+            }
+            if self.peer_is_seed() {
+                flags |= PEX_FLAG_SEED;
+            }
+            if stream.is_utp() {
+                flags |= PEX_FLAG_UTP;
+            }
+            if !self.incoming {
+                flags |= PEX_FLAG_REACHABLE;
+            }
+            (addr, flags)
+        });
+        if entry == self.swarm_entry {
+            return;
+        }
+        let mut swarm = lock_or_recover(&self.ctx.swarm);
+        match entry {
+            Some(entry) => {
+                swarm.insert(self.peer_tag, entry);
+            }
+            None => {
+                swarm.remove(&self.peer_tag);
+            }
+        }
+        self.swarm_entry = entry;
+    }
+
+    /// BEP 11: the peers we are connected to, as changes since the last
+    /// message to this peer, at most 50 added and 50 dropped.
+    fn send_pex(&mut self, stream: &mut PeerStream, ext_id: u8) {
+        let current: HashMap<SocketAddr, u8> = lock_or_recover(&self.ctx.swarm)
+            .iter()
+            .filter(|(tag, _)| **tag != self.peer_tag)
+            .map(|(_, (addr, flags))| (*addr, *flags))
+            .collect();
+        let own = normalize_peer_addr(self.addr);
+        let added: Vec<(SocketAddr, u8)> = current
+            .iter()
+            .filter(|(addr, _)| **addr != own && !self.pex_sent.contains(*addr))
+            .take(MAX_PEX_PEERS_PER_MESSAGE / 2)
+            .map(|(addr, flags)| (*addr, *flags))
+            .collect();
+        let dropped: Vec<SocketAddr> = self
+            .pex_sent
+            .iter()
+            .filter(|addr| !current.contains_key(*addr))
+            .take(MAX_PEX_PEERS_PER_MESSAGE / 2)
+            .copied()
+            .collect();
+        if added.is_empty() && dropped.is_empty() {
+            return;
+        }
+        let payload = build_ut_pex_payload(&added, &dropped);
+        if peer::write_message(stream, &peer::Message::Extended { ext_id, payload }).is_ok() {
+            self.pex_sent.extend(added.iter().map(|(addr, _)| *addr));
+            for addr in &dropped {
+                self.pex_sent.remove(addr);
+            }
+        }
     }
 
     fn run(&mut self, stream: &mut PeerStream) -> Result<(), String> {
@@ -11200,6 +11381,7 @@ impl<'a> PeerConn<'a> {
     fn teardown(&mut self) {
         let ctx = self.ctx;
         ui::remove_peer(ctx.id, self.peer_tag);
+        lock_or_recover(&ctx.swarm).remove(&self.peer_tag);
         {
             let mut pieces = lock_or_recover(&ctx.pieces);
             abandon_inflight(&mut pieces, &mut self.pending, &self.active_pieces);
@@ -11319,6 +11501,17 @@ impl<'a> PeerConn<'a> {
     fn maintain(&mut self, stream: &mut PeerStream, now: Instant) -> Result<PeerStep, String> {
         let ctx = self.ctx;
         self.flush_download_record();
+        self.sync_swarm_entry(stream);
+        // Two seeds have nothing to exchange. libtorrent closes such a
+        // connection at once; keeping it held a slot a downloader could use,
+        // and redialling seeds was most of a seed's connection churn.
+        if self.seed_mode && self.peer_is_seed() && !self.peer_interested {
+            if let Some(addr) = self.reachable_addr() {
+                lock_or_recover(&ctx.peer_queue).mark_seed(addr);
+            }
+            log_debug!("peer {} is a seed and so are we; closing", self.addr);
+            return Ok(PeerStep::Close);
+        }
         if ctx.ui_state.is_some() {
             self.publish_snapshot(stream, now);
         }
@@ -11445,12 +11638,7 @@ impl<'a> PeerConn<'a> {
 
         if let Some(ext_id) = self.peer_ut_pex.filter(|_| ctx.allow_pex) {
             if now.saturating_duration_since(self.last_pex) > PEX_INTERVAL {
-                let peers = lock_or_recover(&ctx.peer_queue).sample(50);
-                if !peers.is_empty() {
-                    let payload = build_ut_pex_payload(&peers, &[]);
-                    let _ =
-                        peer::write_message(stream, &peer::Message::Extended { ext_id, payload });
-                }
+                self.send_pex(stream, ext_id);
                 self.last_pex = now;
             }
         }
@@ -11466,6 +11654,10 @@ impl<'a> PeerConn<'a> {
         self.pending.clear();
         self.release_active_pieces(false);
         let _ = peer::write_message(stream, &peer::Message::NotInterested);
+        if self.extensions {
+            // BEP 21: a repeated extension handshake updates `upload_only`.
+            self.send_ext_handshake(stream)?;
+        }
         let torrent_id = self.ctx.id;
         update_ui(&self.ctx.ui_state, |state| {
             if state.current_id == Some(torrent_id) {
@@ -11725,6 +11917,11 @@ impl<'a> PeerConn<'a> {
                             self.peer_ut_pex = ut_pex;
                         }
                     }
+                    let (listen_port, upload_only) = parse_listen_port_and_upload_only(&payload);
+                    if listen_port.is_some() {
+                        self.peer_listen_port = listen_port;
+                    }
+                    self.peer_upload_only = upload_only;
                     if ctx.allow_holepunch {
                         let (ext_id, listen_port) = parse_holepunch_caps(&payload);
                         ctx.holepunch.set_caps(self.addr, ext_id, listen_port);
@@ -11744,13 +11941,20 @@ impl<'a> PeerConn<'a> {
                         ctx.holepunch.on_message(self.addr, msg, Instant::now());
                     }
                 } else if ctx.allow_pex && ext_id == 2 {
-                    if let Ok(peers) = parse_ut_pex(&payload) {
+                    if let Ok(flagged) = parse_ut_pex(&payload) {
+                        let peers: Vec<SocketAddr> =
+                            flagged.iter().map(|(addr, _)| *addr).collect();
                         if ctx.allow_holepunch {
                             ctx.holepunch.note_pex(self.addr, &peers);
                         }
                         if !peers.is_empty() {
-                            lock_or_recover(&ctx.peer_queue)
-                                .enqueue_with_source(peers, PeerSource::Pex);
+                            let mut queue = lock_or_recover(&ctx.peer_queue);
+                            for (addr, flags) in &flagged {
+                                if flags & PEX_FLAG_SEED != 0 {
+                                    queue.mark_seed(*addr);
+                                }
+                            }
+                            queue.enqueue_with_source(peers, PeerSource::Pex);
                         }
                     }
                 }
@@ -13011,16 +13215,14 @@ fn build_bitfield(pieces: &piece::PieceManager) -> Vec<u8> {
     bitfield
 }
 
-fn build_ut_pex_payload(peers: &[SocketAddr], dropped: &[SocketAddr]) -> Vec<u8> {
+fn build_ut_pex_payload(peers: &[(SocketAddr, u8)], dropped: &[SocketAddr]) -> Vec<u8> {
     let mut v4 = Vec::new();
     let mut v4_flags = Vec::new();
     let mut v6 = Vec::new();
     let mut v6_flags = Vec::new();
     let mut drop4 = Vec::new();
     let mut drop6 = Vec::new();
-    // BEP 11 flags: 0x01=encryption, 0x02=seed, 0x04=uTP, 0x10=outgoing
-    let flags: u8 = 0x10; // outgoing connection
-    for peer in peers {
+    for &(peer, flags) in peers {
         match peer.ip() {
             std::net::IpAddr::V4(ip) => {
                 v4.extend_from_slice(&ip.octets());
@@ -13064,14 +13266,30 @@ fn build_ut_pex_payload(peers: &[SocketAddr], dropped: &[SocketAddr]) -> Vec<u8>
     bencode::encode(&Value::Dict(dict))
 }
 
-fn parse_ut_pex(payload: &[u8]) -> Result<Vec<SocketAddr>, String> {
+/// Added peers with their BEP 11 flags (0 when the sender gave none).
+fn parse_ut_pex(payload: &[u8]) -> Result<Vec<(SocketAddr, u8)>, String> {
     let (dict, _) = parse_bencode_dict(payload)?;
     let mut peers = Vec::new();
-    if let Some(Value::Bytes(bytes)) = dict_get(&dict, b"added") {
-        peers.extend(decode_compact_peers(bytes));
-    }
-    if let Some(Value::Bytes(bytes)) = dict_get(&dict, b"added6") {
-        peers.extend(decode_compact_peers6(bytes));
+    for (key, flags_key, decode) in [
+        (
+            &b"added"[..],
+            &b"added.f"[..],
+            decode_compact_peers as fn(&[u8]) -> Vec<SocketAddr>,
+        ),
+        (b"added6", b"added6.f", decode_compact_peers6),
+    ] {
+        if let Some(Value::Bytes(bytes)) = dict_get(&dict, key) {
+            let flags = match dict_get(&dict, flags_key) {
+                Some(Value::Bytes(flags)) => flags.as_slice(),
+                _ => &[],
+            };
+            peers.extend(
+                decode(bytes)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, addr)| (addr, flags.get(i).copied().unwrap_or(0))),
+            );
+        }
     }
     // BEP 11 messages carry at most 50 added peers; ignore any excess.
     peers.truncate(MAX_PEX_PEERS_PER_MESSAGE);
@@ -14656,7 +14874,7 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
 
     #[test]
     fn extended_handshake_advertises_holepunch_in_sorted_order() {
-        let payload = build_ext_handshake_with(Some(4096), true, true, None);
+        let payload = build_ext_handshake_with(Some(4096), true, true, false, None);
         assert!(payload.starts_with(b"d1:md12:ut_holepunchi3e11:ut_metadatai1e6:ut_pexi2ee"));
         assert_eq!(parse_holepunch_caps(&payload), (Some(3), None));
         assert!(!build_ext_handshake(None, true)
@@ -14685,12 +14903,26 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
     #[test]
     fn extended_handshake_tells_peers_where_to_connect() {
         let peer: std::net::IpAddr = "::ffff:203.0.113.7".parse().unwrap();
-        let payload = encode_ext_handshake(Some(4096), true, false, Some(31777), Some(peer));
+        let payload = encode_ext_handshake(Some(4096), true, false, Some(31777), true, Some(peer));
         let bencode::Value::Dict(dict) = bencode::parse(&payload).unwrap() else {
             panic!("handshake is not a dictionary");
         };
         let keys: Vec<&[u8]> = dict.iter().map(|(key, _)| key.as_slice()).collect();
-        assert_eq!(keys, [&b"m"[..], b"metadata_size", b"p", b"v", b"yourip"]);
+        assert_eq!(
+            keys,
+            [
+                &b"m"[..],
+                b"metadata_size",
+                b"p",
+                b"upload_only",
+                b"v",
+                b"yourip"
+            ]
+        );
+        assert_eq!(
+            parse_listen_port_and_upload_only(&payload),
+            (Some(31777), true)
+        );
         assert!(payload.windows(9).any(|w| w == b"1:pi31777"));
         assert!(payload.ends_with(b"6:yourip4:\xcb\x00\x71\x07e"));
         let version = format!("Rustorrent {}", env!("CARGO_PKG_VERSION"));
@@ -14699,7 +14931,8 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
             .any(|w| w == version.as_bytes()));
         assert_eq!(parse_holepunch_caps(&payload).1, Some(31777));
         // Without a listener there is no port to advertise.
-        let payload = encode_ext_handshake(None, false, false, None, None);
+        let payload = encode_ext_handshake(None, false, false, None, false, None);
+        assert_eq!(parse_listen_port_and_upload_only(&payload), (None, false));
         assert!(!payload.windows(3).any(|w| w == b"1:p"));
     }
 
@@ -15253,6 +15486,7 @@ mod core_helpers_tests {
             peer_id: [9u8; 20],
             metadata: Arc::new(torrent::info_bytes(&torrent_bytes).unwrap().to_vec()),
             peer_queue: Arc::new(Mutex::new(PeerQueue::new(None))),
+            swarm: Mutex::new(HashMap::new()),
             allow_pex: true,
             allow_holepunch: true,
             holepunch: holepunch::Holepunch::default(),
@@ -17304,10 +17538,50 @@ mod core_helpers_tests {
     }
 
     #[test]
+    fn complete_torrents_skip_known_seeds_like_libtorrent() {
+        let seed: SocketAddr = "8.8.8.8:6881".parse().unwrap();
+        let leecher: SocketAddr = "8.8.4.4:6881".parse().unwrap();
+        let mut queue = PeerQueue::new(None);
+        queue.mark_seed(seed);
+        queue.enqueue_with_source([seed, leecher], PeerSource::Pex);
+        // While downloading, a seed is the best peer there is.
+        assert_eq!(queue.pop(), Some(seed));
+        queue.finish(seed);
+        queue.set_complete(true);
+        queue.enqueue_with_source([seed], PeerSource::Dht);
+        assert_eq!(queue.pop(), Some(leecher));
+        assert_eq!(queue.pop(), None, "a seed has nothing to gain from a seed");
+        // A file selected again makes seeds useful once more.
+        queue.finish(leecher);
+        queue.set_complete(false);
+        queue.enqueue_with_source([seed], PeerSource::Dht);
+        assert_eq!(queue.pop(), Some(seed));
+    }
+
+    #[test]
+    fn pex_flags_default_to_zero_when_missing() {
+        let payload = bencode::encode(&Value::Dict(vec![(
+            b"added".to_vec(),
+            Value::Bytes(vec![8, 8, 8, 8, 0x1a, 0xe1, 1, 1, 1, 1, 0x1a, 0xe1]),
+        )]));
+        let parsed = parse_ut_pex(&payload).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("8.8.8.8:6881".parse().unwrap(), 0),
+                ("1.1.1.1:6881".parse().unwrap(), 0)
+            ]
+        );
+    }
+
+    #[test]
     fn pex_payload_roundtrip_includes_v4_and_v6() {
         let peers = vec![
-            "127.0.0.1:6881".parse().unwrap(),
-            "[2001:db8::1]:51413".parse().unwrap(),
+            (
+                "127.0.0.1:6881".parse().unwrap(),
+                PEX_FLAG_SEED | PEX_FLAG_UTP,
+            ),
+            ("[2001:db8::1]:51413".parse().unwrap(), PEX_FLAG_REACHABLE),
         ];
         let payload = build_ut_pex_payload(&peers, &[]);
         let parsed = parse_ut_pex(&payload).unwrap();
