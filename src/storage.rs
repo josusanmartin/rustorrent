@@ -1193,7 +1193,7 @@ fn clean_segment(bytes: &[u8]) -> Result<OsString, Error> {
     }
     #[cfg(not(unix))]
     {
-        let invalid = [b':', b'*', b'?', b'"', b'<', b'>', b'|'];
+        let invalid = *b":*?\"<>|";
         if bytes.iter().any(|b| invalid.contains(b)) {
             return Err(Error::InvalidPathSegment);
         }

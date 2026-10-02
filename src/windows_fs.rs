@@ -17,7 +17,7 @@ use std::path::{Component, Path, PathBuf};
 const DELETE: u32 = 0x0001_0000;
 const READ_CONTROL: u32 = 0x0002_0000;
 const WRITE_DAC: u32 = 0x0004_0000;
-const SYNCHRONIZE: u32 = 0x0010_0000;
+pub(crate) const SYNCHRONIZE: u32 = 0x0010_0000;
 
 const FILE_READ_DATA: u32 = 0x0000_0001;
 const FILE_LIST_DIRECTORY: u32 = FILE_READ_DATA;
