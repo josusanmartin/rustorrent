@@ -220,28 +220,29 @@ class TransferTests(unittest.TestCase):
         wait_for(lambda: not self.app.get('/status')['torrents'])
         self.assertEqual((self.app.root / 'fixture.bin').read_bytes(), PAYLOAD)
 
-    def test_seed_closes_connections_to_other_seeds(self):
+    def test_seed_stays_connected_to_other_seeds(self):
+        """Seeds pass on the addresses of their peers through PEX. A seed that
+        hung up on other seeds, as libtorrent does, stopped being passed on
+        and uploaded far less, so Rustorrent keeps such connections."""
         torrent, info_hash, _ = make_torrent(private=False)
         tid = self.app.add(torrent)
         self.download(tid, info_hash)
         with self.app.peer(info_hash) as sock:
             send(sock, 20, b'\0' + bencode({b'm': {b'ut_pex': 3}}))
             send(sock, 5, b'\xf8')  # every piece: this peer is a seed too
-            upload_only = False
-            closed = False
-            deadline = time.monotonic() + 10
+            handshake = None
+            deadline = time.monotonic() + 6
             while time.monotonic() < deadline:
                 try:
                     msg = message(sock)
                 except socket.timeout:
                     continue
                 except (EOFError, ConnectionError):
-                    closed = True
-                    break
-                if msg[:2] == b'\x14\x00' and b'11:upload_onlyi1e' in msg:
-                    upload_only = True
-            self.assertTrue(upload_only, 'a seed must advertise BEP 21 upload_only')
-            self.assertTrue(closed, 'two seeds kept a connection that can carry nothing')
+                    self.fail('a seed hung up on another seed')
+                if msg[:2] == b'\x14\x00':
+                    handshake = msg
+            self.assertIsNotNone(handshake, 'no extension handshake')
+            self.assertNotIn(b'upload_only', handshake)
 
     def test_start_paused_and_file_selection_are_atomic(self):
         torrent, info_hash, _ = make_torrent(b'collection', multi=True)

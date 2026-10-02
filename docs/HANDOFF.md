@@ -1,6 +1,6 @@
 # Handoff: state on 1 October 2026
 
-All code is on `master`, released as 0.2.0-rc.6. No work is left unmerged, and nothing is scheduled to run.
+All code is on `master`, released as 0.2.0-rc.7. No work is left unmerged, and nothing is scheduled to run.
 
 ## Releases
 
@@ -12,6 +12,7 @@ All code is on `master`, released as 0.2.0-rc.6. No work is left unmerged, and n
 | v0.2.0-rc.4 | Connected-peer table in the Peers tab, and `GET /torrent/peers?id=` |
 | v0.2.0-rc.5 | Working DHT (BEP 42 no longer drops replies, lookups start from bootstrap replies, fast retries), parallel magnet metadata, uTP-first connections, `p`/`v`/`yourip` in the BEP 10 handshake, separate incoming slots, 100 connections per transfer with a Settings field, Rust 1.99 compatibility |
 | v0.2.0-rc.6 | libtorrent-style seeding: seed-to-seed connections close, known seeds are not dialled while seeding, BEP 21 `upload_only`; BEP 11 PEX lists connected peers with listen ports and seed/uTP/encryption flags and sends added/dropped changes |
+| v0.2.0-rc.7 | A full known-peer list (4,096) forgets its oldest idle address instead of refusing new ones; seeds stay connected to seeds and no longer send `upload_only` (rc.6's libtorrent-style closing made Rustorrent invisible in PEX); seeds that hang up are redialled after 10 minutes |
 
 All are GitHub pre-releases.
 

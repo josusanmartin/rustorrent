@@ -359,6 +359,8 @@ const MAX_PEX_PEERS_PER_MESSAGE: usize = 100;
 const PEER_RETRY_BASE_SECS: u64 = 2;
 const NO_PEER_REANNOUNCE_SECS: u64 = 30;
 const PEER_BAN_SECS: u64 = 60;
+/// While seeding, how long before a seed that hung up is dialled again.
+const SEED_REDIAL_DELAY: Duration = Duration::from_secs(10 * 60);
 const PEER_RETRY_EXHAUSTED_BAN_SECS: u64 = 15 * 60;
 const PEER_RETRY_MAX_SECS: u64 = 30;
 const PEER_THREAD_STACK: usize = 512 * 1024; // 512KB
@@ -6818,6 +6820,9 @@ fn percent_decode(input: &str) -> String {
 
 struct PeerQueue {
     known: HashSet<SocketAddr>,
+    /// `known` in the order addresses arrived, so the oldest idle one can
+    /// make room once MAX_KNOWN_PEERS is reached.
+    known_order: VecDeque<SocketAddr>,
     queued: HashSet<SocketAddr>,
     inflight: HashSet<SocketAddr>,
     queue: VecDeque<SocketAddr>,
@@ -6860,6 +6865,7 @@ impl PeerQueue {
     ) -> Self {
         Self {
             known: HashSet::new(),
+            known_order: VecDeque::new(),
             queued: HashSet::new(),
             inflight: HashSet::new(),
             queue: VecDeque::new(),
@@ -6871,6 +6877,31 @@ impl PeerQueue {
             seeds: HashSet::new(),
             skip_seeds: false,
         }
+    }
+
+    /// Drops the longest-known address that is not queued, waiting for a
+    /// retry or connected. False when every known address is busy.
+    fn forget_oldest_idle(&mut self) -> bool {
+        for _ in 0..self.known_order.len() {
+            let Some(addr) = self.known_order.pop_front() else {
+                break;
+            };
+            if !self.known.contains(&addr) {
+                continue;
+            }
+            if self.queued.contains(&addr)
+                || self.inflight.contains(&addr)
+                || self.is_deferred(addr)
+            {
+                self.known_order.push_back(addr);
+                continue;
+            }
+            self.known.remove(&addr);
+            self.seeds.remove(&addr);
+            self.failures.remove(&addr);
+            return true;
+        }
+        false
     }
 
     fn mark_seed(&mut self, addr: SocketAddr) {
@@ -6908,16 +6939,20 @@ impl PeerQueue {
                 continue;
             }
             // Bound memory: DHT and PEX can supply unbounded address lists.
-            if !self.known.contains(&addr) && self.known.len() >= MAX_KNOWN_PEERS {
-                continue;
+            // A full list forgets its oldest idle address rather than every
+            // new one: refusing them left a long-running seed with only stale
+            // addresses and no way to learn of peers that joined later.
+            if !self.known.contains(&addr) {
+                if self.known.len() >= MAX_KNOWN_PEERS && !self.forget_oldest_idle() {
+                    continue;
+                }
+                self.known.insert(addr);
+                self.known_order.push_back(addr);
             }
-            self.known.insert(addr);
             if self.queued.contains(&addr) || self.inflight.contains(&addr) {
                 continue;
             }
-            if self.skip_seeds && self.seeds.contains(&addr) {
-                continue;
-            }
+
             if self.is_deferred(addr) {
                 continue;
             }
@@ -6939,11 +6974,7 @@ impl PeerQueue {
     fn pop(&mut self) -> Option<SocketAddr> {
         self.promote_ready();
         while let Some(addr) = self.queue.pop_front() {
-            if self.is_local_self_peer(addr)
-                || self.is_filtered(addr)
-                || self.is_banned(addr)
-                || (self.skip_seeds && self.seeds.contains(&addr))
-            {
+            if self.is_local_self_peer(addr) || self.is_filtered(addr) || self.is_banned(addr) {
                 self.queued.remove(&addr);
                 continue;
             }
@@ -11203,7 +11234,7 @@ impl<'a> PeerConn<'a> {
             Some(ctx.metadata.len()),
             ctx.allow_pex,
             ctx.allow_holepunch,
-            self.seed_mode,
+            false,
             Some(self.addr.ip()),
         );
         send_message(
@@ -11505,12 +11536,10 @@ impl<'a> PeerConn<'a> {
         // Two seeds have nothing to exchange. libtorrent closes such a
         // connection at once; keeping it held a slot a downloader could use,
         // and redialling seeds was most of a seed's connection churn.
-        if self.seed_mode && self.peer_is_seed() && !self.peer_interested {
+        if self.seed_mode && self.peer_is_seed() {
             if let Some(addr) = self.reachable_addr() {
                 lock_or_recover(&ctx.peer_queue).mark_seed(addr);
             }
-            log_debug!("peer {} is a seed and so are we; closing", self.addr);
-            return Ok(PeerStep::Close);
         }
         if ctx.ui_state.is_some() {
             self.publish_snapshot(stream, now);
@@ -11654,10 +11683,6 @@ impl<'a> PeerConn<'a> {
         self.pending.clear();
         self.release_active_pieces(false);
         let _ = peer::write_message(stream, &peer::Message::NotInterested);
-        if self.extensions {
-            // BEP 21: a repeated extension handshake updates `upload_only`.
-            self.send_ext_handshake(stream)?;
-        }
         let torrent_id = self.ctx.id;
         update_ui(&self.ctx.ui_state, |state| {
             if state.current_id == Some(torrent_id) {
@@ -13164,6 +13189,11 @@ fn is_unreachable_peer_error(err: &str) -> bool {
 
 fn record_peer_result(queue: &mut PeerQueue, addr: SocketAddr, result: &Result<(), String>) {
     queue.finish(addr);
+    if queue.skip_seeds && queue.seeds.contains(&normalize_peer_addr(addr)) {
+        queue.clear_failure(addr);
+        queue.schedule_retry(addr, SEED_REDIAL_DELAY);
+        return;
+    }
     match result {
         Ok(()) => {
             queue.clear_failure(addr);
@@ -16734,6 +16764,28 @@ mod core_helpers_tests {
     }
 
     #[test]
+    fn full_peer_list_still_admits_new_peers() {
+        let mut queue = PeerQueue::new(None);
+        let old = (0..MAX_KNOWN_PEERS as u32).map(|n| {
+            let [_, a, b, c] = n.to_be_bytes();
+            SocketAddr::from(([8, a, b, c], 6881))
+        });
+        queue.enqueue_with_source(old, PeerSource::Dht);
+        // Every old address has been tried and is idle now.
+        while let Some(addr) = queue.pop() {
+            queue.finish(addr);
+        }
+        let newcomer: SocketAddr = "9.9.9.9:6881".parse().unwrap();
+        queue.enqueue_with_source([newcomer], PeerSource::Pex);
+        assert_eq!(queue.known_len(), MAX_KNOWN_PEERS);
+        assert_eq!(
+            queue.pop(),
+            Some(newcomer),
+            "a peer that joined later is dialled"
+        );
+    }
+
+    #[test]
     fn peer_discovery_input_is_bounded() {
         let mut queue = PeerQueue::new(None);
         let peers = (0..(MAX_KNOWN_PEERS as u32 + 500)).map(|n| {
@@ -17538,24 +17590,36 @@ mod core_helpers_tests {
     }
 
     #[test]
-    fn complete_torrents_skip_known_seeds_like_libtorrent() {
+    fn seeds_that_hang_up_on_a_seed_wait_before_redial() {
         let seed: SocketAddr = "8.8.8.8:6881".parse().unwrap();
-        let leecher: SocketAddr = "8.8.4.4:6881".parse().unwrap();
         let mut queue = PeerQueue::new(None);
         queue.mark_seed(seed);
-        queue.enqueue_with_source([seed, leecher], PeerSource::Pex);
+        queue.enqueue_with_source([seed], PeerSource::Pex);
         // While downloading, a seed is the best peer there is.
         assert_eq!(queue.pop(), Some(seed));
-        queue.finish(seed);
+        record_peer_result(&mut queue, seed, &Err("peer closed connection".to_string()));
+        assert!(
+            !queue.deferred.iter().any(|entry| entry.addr == seed),
+            "while downloading, a seed is not held back for SEED_REDIAL_DELAY"
+        );
+
+        // While seeding, a seed that hung up is not redialled every few
+        // seconds, as rc.5 did, but it is not forgotten either: staying in
+        // touch with seeds is how their downloaders hear about us via PEX.
+        let mut queue = PeerQueue::new(None);
+        queue.mark_seed(seed);
         queue.set_complete(true);
-        queue.enqueue_with_source([seed], PeerSource::Dht);
-        assert_eq!(queue.pop(), Some(leecher));
-        assert_eq!(queue.pop(), None, "a seed has nothing to gain from a seed");
-        // A file selected again makes seeds useful once more.
-        queue.finish(leecher);
-        queue.set_complete(false);
-        queue.enqueue_with_source([seed], PeerSource::Dht);
+        queue.enqueue_with_source([seed], PeerSource::Pex);
         assert_eq!(queue.pop(), Some(seed));
+        record_peer_result(&mut queue, seed, &Err("peer closed connection".to_string()));
+        let ready_at = queue
+            .deferred
+            .iter()
+            .find(|entry| entry.addr == seed)
+            .map(|entry| entry.ready_at)
+            .expect("seed scheduled again");
+        assert!(ready_at >= Instant::now() + SEED_REDIAL_DELAY - Duration::from_secs(5));
+        assert_eq!(queue.pop(), None);
     }
 
     #[test]
