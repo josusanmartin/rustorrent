@@ -547,10 +547,14 @@ pub fn start(
             };
             let state = state.clone();
             let cmd_tx = cmd_tx.clone();
-            thread::spawn(move || {
-                let _slot_guard = slot_guard;
-                let _ = handle_connection(stream, state, cmd_tx);
-            });
+            // Out of threads, drop this request instead of aborting the app
+            // (std::thread::spawn panics, and release builds abort on panic).
+            let _ = thread::Builder::new()
+                .name("ui".to_string())
+                .spawn(move || {
+                    let _slot_guard = slot_guard;
+                    let _ = handle_connection(stream, state, cmd_tx);
+                });
         }
     });
     Ok(local_addr)

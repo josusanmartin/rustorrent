@@ -1242,6 +1242,14 @@ fn install_panic_logger() {
             .unwrap_or_else(|| "<unknown>".to_string());
         let message = format!("panic: {payload} at {location}");
         eprintln!("{message}");
+        // The macOS app discards the backend's stderr, so a crash left no
+        // trace. try_lock: the panicking thread may hold the log file lock.
+        if let Some(file) = LOG_FILE.get() {
+            if let Ok(mut f) = file.try_lock() {
+                let _ = writeln!(f, "{} {message}", log_timestamp());
+                let _ = f.flush();
+            }
+        }
     }));
 }
 
