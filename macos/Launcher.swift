@@ -1258,6 +1258,16 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
     }
 
     private func handleWebViewLoadFailure(_ error: Error, phase: String) {
+        // A newer load replacing this one cancels it (NSURLErrorCancelled,
+        // -999, or WebKit's "frame load interrupted", 102). That is not a
+        // failure: the replacing load reports its own outcome.
+        let nsError = error as NSError
+        if (nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled)
+            || (nsError.domain == "WebKitErrorDomain" && nsError.code == 102)
+        {
+            log("webview \(phase) superseded by a newer load (\(nsError.domain) \(nsError.code))")
+            return
+        }
         stopWebViewLoadTimer()
         log("webview \(phase) failed: \(error.localizedDescription)")
         if isUiReachable(timeout: 0.6) {
