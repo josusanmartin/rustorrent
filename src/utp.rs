@@ -18,6 +18,14 @@ const UTP_RECV_DATAGRAM_MAX: usize = UTP_RECV_PAYLOAD_MAX + 1024;
 const UTP_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 const UTP_SYN_RETRY: Duration = Duration::from_secs(1);
 const UTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A caller stops waiting for the socket loop's answer after this, so a
+/// stalled loop cannot strand one thread per connection attempt: 16,268 such
+/// threads exhausted the process limit after the loop hung in sendto.
+const UTP_CONNECT_ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+/// A UDP send that cannot complete in this time is dropped, as the network
+/// may drop any datagram, instead of blocking the loop (and the DHT sharing
+/// the socket) indefinitely.
+const UDP_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 const UTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Idle connections exchange ST_STATE keepalives (as libutp does every 29
 /// seconds) so neither side's idle timeout fires between application messages.
@@ -124,6 +132,10 @@ fn start_inner(port: u16, share: bool) -> (UtpConnector, UtpListener, Option<Sha
     let (accept_tx, accept_rx) = mpsc::sync_channel(MAX_PENDING_ACCEPTS);
     let socket = UdpSocket::bind(("0.0.0.0", port))
         .or_else(|_| UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port)));
+    if let Ok(socket) = socket.as_ref() {
+        // Shared by every clone of the socket, including the DHT's.
+        let _ = socket.set_write_timeout(Some(UDP_SEND_TIMEOUT));
+    }
     let waker = Arc::new(Waker::new(socket.as_ref().ok()));
     let mut shared = None;
     if let Ok(socket) = socket {
@@ -153,6 +165,10 @@ fn is_dht_datagram(packet: &[u8]) -> bool {
 
 impl UtpConnector {
     pub fn connect(&self, addr: SocketAddr) -> Result<UtpStream, String> {
+        self.connect_within(addr, UTP_CONNECT_ANSWER_TIMEOUT)
+    }
+
+    fn connect_within(&self, addr: SocketAddr, wait: Duration) -> Result<UtpStream, String> {
         let (resp_tx, resp_rx) = mpsc::channel();
         self.cmd_tx
             .send(Command::Connect {
@@ -161,9 +177,11 @@ impl UtpConnector {
             })
             .map_err(|_| "utp manager closed".to_string())?;
         self.waker.wake();
-        resp_rx
-            .recv()
-            .map_err(|_| "utp connect failed".to_string())?
+        match resp_rx.recv_timeout(wait) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err("utp connect: no answer".to_string()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err("utp connect failed".to_string()),
+        }
     }
 }
 
@@ -1467,6 +1485,22 @@ mod tests {
                 return bytes;
             }
         }
+    }
+
+    #[test]
+    fn connect_gives_up_when_the_socket_loop_never_answers() {
+        // A loop stuck in sendto keeps the command queue open but never
+        // replies; the caller must still return.
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let connector = UtpConnector {
+            cmd_tx,
+            waker: Arc::new(Waker::new(None)),
+        };
+        let started = Instant::now();
+        let result =
+            connector.connect_within("127.0.0.1:9".parse().unwrap(), Duration::from_millis(100));
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

@@ -1540,6 +1540,14 @@ fn collect_bootstrap_resolutions_at(
 }
 
 fn bind_socket(bind_port: u16) -> Option<UdpSocket> {
+    let socket = bind_socket_inner(bind_port)?;
+    // Never let a stalled send hold the DHT thread; a dropped datagram is
+    // ordinary on UDP.
+    let _ = socket.set_write_timeout(Some(Duration::from_millis(250)));
+    Some(socket)
+}
+
+fn bind_socket_inner(bind_port: u16) -> Option<UdpSocket> {
     match UdpSocket::bind(("0.0.0.0", bind_port)) {
         Ok(socket) => Some(socket),
         Err(_) => match UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, bind_port)) {
