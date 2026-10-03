@@ -231,7 +231,9 @@ function connect(){
 /* rendering */
 function render(){
   raf=0;
-  txt($('rDown'),rate(G.download_rate_bps));txt($('rUp'),rate(G.upload_rate_bps));
+  // Totals across transfers; G's own rates belong to one "current" transfer.
+  let down=0,up=0;for(const t of T.values()){down+=t.download_rate_bps||0;up+=t.upload_rate_bps||0}
+  txt($('rDown'),rate(down));txt($('rUp'),rate(up));
   renderSide();renderReach();
   if(structural){
     for(const [id,r] of rows)if(!T.has(id)){r.el.remove();rows.delete(id)}
