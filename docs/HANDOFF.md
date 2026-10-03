@@ -12,7 +12,7 @@ All code is on `master`, released as 0.2.0-rc.7. No work is left unmerged, and n
 | v0.2.0-rc.4 | Connected-peer table in the Peers tab, and `GET /torrent/peers?id=` |
 | v0.2.0-rc.5 | Working DHT (BEP 42 no longer drops replies, lookups start from bootstrap replies, fast retries), parallel magnet metadata, uTP-first connections, `p`/`v`/`yourip` in the BEP 10 handshake, separate incoming slots, 100 connections per transfer with a Settings field, Rust 1.99 compatibility |
 | v0.2.0-rc.6 | libtorrent-style seeding: seed-to-seed connections close, known seeds are not dialled while seeding, BEP 21 `upload_only`; BEP 11 PEX lists connected peers with listen ports and seed/uTP/encryption flags and sends added/dropped changes |
-| v0.2.0-rc.7 | A full known-peer list (4,096) forgets its oldest idle address instead of refusing new ones; seeds stay connected to seeds and no longer send `upload_only` (rc.6's libtorrent-style closing made Rustorrent invisible in PEX); seeds that hang up are redialled after 10 minutes |
+| v0.2.0-rc.7 | A full known-peer list (4,096) forgets its oldest idle address instead of refusing new ones; seeds stay connected to seeds and no longer send `upload_only` (rc.6's libtorrent-style closing made Rustorrent invisible in PEX); seeds that hang up are redialled after 10 minutes; UDP sends time out (250 ms) and uTP connects wait at most 10 s, after a stalled sendto leaked 16,268 threads and aborted the app; panics go to the log file; early tracker announces wait ≥5 min and the tracker's `min interval`; the launcher ignores cancelled web view loads |
 
 All are GitHub pre-releases.
 
@@ -31,7 +31,9 @@ All are GitHub pre-releases.
 - **Torrent creation:** only from the CLI (`--create`), and only with one tracker. There is no UI for it.
 - **Hole-punch status:** the UI doesn't show that hole punching is happening. A counter or a peer flag ("via hole punch") would make it visible.
 - **Upload slots:** the upload slot count is a fixed 6 (`UPLOAD_SLOTS`). qBittorrent uses 4 per torrent and scales with the upload rate.
-- **Signing:** the app is not Developer ID signed or notarized, so macOS asks on first launch.
+- **Signing:** the app is not Developer ID signed or notarized, so macOS asks on first launch. Every new build also asks again for Downloads access (the launcher's preflight blocks until it is answered), because each ad-hoc signature is a new identity.
+- **Stalled sendto (rc.7):** the cause of the UDP send that blocked for an hour on 2 October is unknown (Little Snitch is installed on that Mac). The send timeout contains it; a log line when sends time out would help confirm.
+- **Experiments not adopted:** dialling never-seen non-seed peers first while seeding (won 3.9× in one 4-hour A/B, lost slightly in the replication) and a 1,024-packet uTP send window (no downloader burst during its test). Both are local branches only; the window cap (64 × 1,200 bytes, ~77 KB) still limits each uTP peer to ~0.4–1.5 MB/s depending on RTT.
 - **CI warning:** actions pinned to Node 20 (`actions/checkout`, `actions/setup-node`) print a deprecation warning. They still pass; bump the pinned SHAs when convenient.
 
 ## Local setup
