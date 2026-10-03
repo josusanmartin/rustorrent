@@ -362,7 +362,7 @@ but trackers, DHT and LPD announce the v1 swarm identifier.
 | `--max-peers-torrent <n>` | `100` | Per-torrent peer limit |
 | `--max-active <n>` | `4` | Concurrently loading or downloading transfers |
 | `--numwant <n>` | `200` | Peers requested from trackers |
-| `--retry-interval <secs>` | `60` | Tracker retry interval |
+| `--retry-interval <secs>` | `300` | Least time between early tracker announces (a tracker's `min interval` can make it longer) |
 | `--download-rate <rate>` | `0` | Global download limit (`k`/`m`/`g`) |
 | `--upload-rate <rate>` | `0` | Global upload limit |
 | `--torrent-download-rate <rate>` | `0` | Per-torrent download limit |

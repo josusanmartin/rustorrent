@@ -12,6 +12,8 @@ const MAX_TRACKER_PEERS: usize = 1024;
 
 pub struct TrackerResponse {
     pub interval: u64,
+    /// BEP 3 extension `min interval`: announce no more often than this.
+    pub min_interval: Option<u64>,
     pub peers: Vec<SocketAddr>,
     /// Our address as the tracker saw it (BEP 24).
     pub external_ip: Option<std::net::IpAddr>,
@@ -200,8 +202,13 @@ fn parse_tracker_body(body: &[u8]) -> Result<TrackerResponse, String> {
         _ => None,
     };
     crate::log_stderr(format_args!("  tracker: {} peers", peers.len()));
+    let min_interval = match dict_get(&dict, b"min interval") {
+        Some(Value::Int(min)) if *min >= 0 => Some(*min as u64),
+        _ => None,
+    };
     Ok(TrackerResponse {
         interval,
+        min_interval,
         peers,
         external_ip,
     })
@@ -307,6 +314,15 @@ mod tests {
         let mut peers = Vec::new();
         parse_compact_peers(bytes, stride, MAX_TRACKER_PEERS, &mut peers)?;
         Ok(peers)
+    }
+
+    #[test]
+    fn min_interval_is_read_when_present() {
+        let response =
+            parse_tracker_body(b"d8:intervali1800e12:min intervali900e5:peers0:e").unwrap();
+        assert_eq!(response.min_interval, Some(900));
+        let response = parse_tracker_body(b"d8:intervali1800e5:peers0:e").unwrap();
+        assert_eq!(response.min_interval, None);
     }
 
     #[test]

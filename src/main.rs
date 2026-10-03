@@ -357,8 +357,10 @@ const MAX_PEER_RETRIES: u32 = 8;
 const MAX_KNOWN_PEERS: usize = 4096;
 const MAX_PEX_PEERS_PER_MESSAGE: usize = 100;
 const PEER_RETRY_BASE_SECS: u64 = 2;
-const NO_PEER_REANNOUNCE_SECS: u64 = 30;
 const PEER_BAN_SECS: u64 = 60;
+/// Least time between early tracker announces, unless --retry-interval says
+/// otherwise; a tracker's own `min interval` can make it longer.
+const DEFAULT_RETRY_INTERVAL_SECS: u64 = 300;
 /// While seeding, how long before a seed that hung up is dialled again.
 const SEED_REDIAL_DELAY: Duration = Duration::from_secs(10 * 60);
 const PEER_RETRY_EXHAUSTED_BAN_SECS: u64 = 15 * 60;
@@ -371,7 +373,6 @@ const TRACKER_STOPPED_WAIT_BUDGET: Duration = Duration::from_secs(2);
 const TRACKER_ANNOUNCE_POLL: Duration = Duration::from_millis(150);
 const TORRENT_LOOP_INTERVAL: Duration = Duration::from_millis(200);
 const PEER_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const STALL_REANNOUNCE_SECS: u64 = 30;
 const STARTUP_BURST_MIN_WORKERS: usize = 24;
 const STARTUP_BURST_MAX_WORKERS: usize = 120;
 const STARTUP_BURST_MULTIPLIER: usize = 3;
@@ -1301,7 +1302,7 @@ network:
   --utp | --no-utp            micro transport protocol (default on)
   --peer-profile <conservative|balanced|aggressive>
   --max-peers <n>  --max-peers-torrent <n>  --numwant <n>
-  --retry-interval <secs>     tracker retry interval (default 60)
+  --retry-interval <secs>     least time between early tracker announces (default 300)
   --proxy <socks5://host:port | http://host:port>
   --blocklist <path>          IP ranges to refuse
   --geoip-db <path>           CSV country database for peer locations
@@ -4823,7 +4824,12 @@ fn run_torrent_once(
         // transition, including the run immediately before a completion move.
         let mut completed_sent = initial_complete;
         let mut interval = 1800u64; // Default to 30 minutes
-                                    // The `started` event forces the first announce.
+                                    // Announcing early (short of peers, stalled) waits at least
+                                    // --retry-interval and the trackers' `min interval`. Announcing every
+                                    // 30 to 60 seconds, as before, got Rustorrent HTTP 503s from busy
+                                    // trackers such as Ubuntu's, which asks for every 30 minutes.
+        let mut tracker_min_interval = 0u64;
+        // The `started` event forces the first announce.
         let mut last_announce = instant_ago(Duration::from_secs(interval + 1));
         let mut last_progress_at = Instant::now();
         let mut rates = RateWindow::default();
@@ -4954,7 +4960,7 @@ fn run_torrent_once(
             let need_peers =
                 active_count < LOW_PEER_THRESHOLD || queue_len == 0 || known_count == 0;
             let stalled_download = !is_complete
-                && last_progress_at.elapsed().as_secs() >= STALL_REANNOUNCE_SECS
+                && last_progress_at.elapsed().as_secs() >= args.retry_interval
                 && active_count <= 2;
             const SEED_REANNOUNCE_SECS: u64 = 300;
             let seed_upload_stalled =
@@ -4965,15 +4971,17 @@ fn run_torrent_once(
             // Tracker edits are live. In particular, adding the first tracker
             // to a trackerless torrent must make the pending `started`
             // announce eligible without restarting the torrent.
+            let early_reannounce_secs = args.retry_interval.max(tracker_min_interval);
             let should_announce = round.is_none()
                 && (started
                     || completed_pending
                     || time_since_announce >= interval
-                    || (stalled_download && time_since_announce >= STALL_REANNOUNCE_SECS)
-                    || (need_peers && time_since_announce >= args.retry_interval)
-                    || (no_peers && time_since_announce >= NO_PEER_REANNOUNCE_SECS)
-                    || seed_needs_peers
-                    || seed_upload_stalled);
+                    || (time_since_announce >= early_reannounce_secs
+                        && (stalled_download
+                            || need_peers
+                            || no_peers
+                            || seed_needs_peers
+                            || seed_upload_stalled)));
             let paused = torrent_paused(&paused_flag);
 
             if should_announce {
@@ -5058,6 +5066,9 @@ fn run_torrent_once(
                             current.any_success = true;
                             tracker_failures.remove(&result.tracker_url);
                             interval = response.interval.clamp(60, 3600);
+                            if let Some(min) = response.min_interval {
+                                tracker_min_interval = tracker_min_interval.max(min.min(interval));
+                            }
                             log_info!("tracker {label} returned {} peers", response.peers.len());
                             if let Some(ip) = response.external_ip {
                                 update_ui(ui_state, |state| {
@@ -9683,7 +9694,7 @@ fn parse_args() -> Result<Args, String> {
     let mut ui_addr = "127.0.0.1:8080".to_string();
     let mut peer_profile = PeerProfile::Balanced;
     let peer_tuning = peer_profile.tuning();
-    let mut retry_interval = 60u64;
+    let mut retry_interval = DEFAULT_RETRY_INTERVAL_SECS;
     let mut numwant = peer_tuning.numwant;
     let mut metadata_peer_limit = peer_tuning.metadata_peer_limit;
     let mut port = 6881u16;
@@ -19020,10 +19031,11 @@ mod core_helpers_tests {
 
     #[test]
     fn reannounce_intervals_do_not_flood_trackers_on_stalls() {
-        let no_peer_secs = std::hint::black_box(NO_PEER_REANNOUNCE_SECS);
-        let stall_secs = std::hint::black_box(STALL_REANNOUNCE_SECS);
-        assert!(no_peer_secs >= 30);
-        assert!(stall_secs >= 30);
+        let retry = std::hint::black_box(DEFAULT_RETRY_INTERVAL_SECS);
+        assert!(
+            retry >= 300,
+            "early announces at most every 5 minutes by default"
+        );
     }
 
     #[test]
