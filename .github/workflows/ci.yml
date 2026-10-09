@@ -100,6 +100,45 @@ jobs:
           cargo +1.89.0 check --locked --all-targets --no-default-features
       - name: Run platform filesystem and process tests
         run: cargo test --locked --all-features -- --test-threads=1
+      - name: Lint Windows code
+        if: runner.os == 'Windows'
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Build and inspect the Windows package
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          ./windows/package_app.ps1
+          $archives = @(Get-ChildItem target/windows-app/dist/*.zip)
+          if ($archives.Count -ne 1) { throw 'Expected exactly one Windows package.' }
+          $archive = $archives[0]
+          $expected = (Get-Content -LiteralPath "$($archive.FullName).sha256").Split(' ')[0]
+          if ((Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash -ne $expected) {
+            throw 'Windows package checksum does not match.'
+          }
+          $unpacked = Join-Path $env:RUNNER_TEMP 'rustorrent-windows-package'
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $unpacked
+          $bundle = Join-Path $unpacked $archive.BaseName
+          foreach ($name in @('Rustorrent.exe', 'rustorrent-bin.exe', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'THIRD_PARTY_LICENSES.html', 'WEBVIEW2_LICENSE.txt', 'WEBVIEW2_NOTICE.txt')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $bundle $name) -PathType Leaf)) {
+              throw "Windows package is missing $name"
+            }
+          }
+          & (Join-Path $bundle 'rustorrent-bin.exe') --help
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged executable failed.' }
+          $launcher = Join-Path $bundle 'Rustorrent.exe'
+          $check = Start-Process -FilePath $launcher -ArgumentList '--self-test' -WindowStyle Hidden -Wait -PassThru
+          if ($check.ExitCode -ne 0) { throw 'Native launcher tests failed.' }
+          $smokePath = Join-Path $env:RUNNER_TEMP 'rustorrent desktop smoke'
+          $check = Start-Process -FilePath $launcher -ArgumentList @('--smoke-test', ('"' + $smokePath + '"')) -WindowStyle Hidden -Wait -PassThru
+          if ($check.ExitCode -ne 0) { throw 'WebView2 desktop smoke test failed.' }
+          if (-not (Test-Path -LiteralPath (Join-Path $smokePath 'smoke-success.txt'))) { throw 'Desktop UI was not rendered.' }
+      - name: Upload the Windows package
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-x86_64
+          path: target/windows-app/dist/*
+          if-no-files-found: error
       - name: Build and inspect the universal macOS app
         if: runner.os == 'macOS'
         shell: bash

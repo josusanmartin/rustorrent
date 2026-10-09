@@ -152,7 +152,68 @@ fn default_gateway() -> Option<Ipv4Addr> {
     None
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Chooses the default IPv4 route. Each row is `(destination, mask, next hop,
+/// metric)`. Addresses are the native reading of a network-order DWORD, which
+/// is how `GetIpForwardTable` stores them.
+#[cfg(any(windows, test))]
+fn select_ipv4_default_gateway(rows: &[(u32, u32, u32, u32)]) -> Option<Ipv4Addr> {
+    let mut best: Option<(u32, Ipv4Addr)> = None;
+    for &(dest, mask, next_hop, metric) in rows {
+        if dest != 0 || mask != 0 || next_hop == 0 {
+            continue;
+        }
+        let gateway = Ipv4Addr::from(u32::from_be(next_hop));
+        if best.is_none_or(|(best_metric, _)| metric < best_metric) {
+            best = Some((metric, gateway));
+        }
+    }
+    best.map(|(_, gateway)| gateway)
+}
+
+#[cfg(windows)]
+fn default_gateway() -> Option<Ipv4Addr> {
+    #[link(name = "iphlpapi")]
+    unsafe extern "system" {
+        fn GetIpForwardTable(table: *mut u8, size: *mut u32, order: i32) -> u32;
+    }
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    const MAX_TABLE_BYTES: u32 = 1024 * 1024;
+    const ROW_WORDS: usize = 14;
+
+    let mut size = 0u32;
+    // SAFETY: a null table asks only for the byte length the next call needs.
+    let status = unsafe { GetIpForwardTable(std::ptr::null_mut(), &mut size, 0) };
+    if status != ERROR_INSUFFICIENT_BUFFER || !(4..=MAX_TABLE_BYTES).contains(&size) {
+        return None;
+    }
+
+    let mut words = Vec::new();
+    for _ in 0..2 {
+        words.resize((size as usize).div_ceil(4), 0);
+        // SAFETY: `words` covers `size` bytes and stays alive for the call.
+        let status = unsafe { GetIpForwardTable(words.as_mut_ptr().cast(), &mut size, 0) };
+        if status == 0 {
+            let count = usize::try_from(words.first().copied()?).ok()?;
+            let rows = words.get(1..)?;
+            if rows.len() / ROW_WORDS < count {
+                return None;
+            }
+            let parsed = (0..count)
+                .map(|index| {
+                    let row = &rows[index * ROW_WORDS..(index + 1) * ROW_WORDS];
+                    (row[0], row[1], row[3], row[9])
+                })
+                .collect::<Vec<_>>();
+            return select_ipv4_default_gateway(&parsed);
+        }
+        if status != ERROR_INSUFFICIENT_BUFFER || size > MAX_TABLE_BYTES {
+            return None;
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn default_gateway() -> Option<Ipv4Addr> {
     None
 }
@@ -344,5 +405,35 @@ mod tests {
             Some(Ipv4Addr::new(100, 64, 3, 7))
         );
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn default_route_uses_the_lowest_metric_gateway() {
+        let stored = |ip: Ipv4Addr| u32::from(ip).to_be();
+        let rows = [
+            (0, 0, stored(Ipv4Addr::new(192, 168, 1, 1)), 40),
+            (0, 0, stored(Ipv4Addr::new(10, 0, 0, 1)), 10),
+            (
+                stored(Ipv4Addr::new(10, 0, 0, 0)),
+                stored(Ipv4Addr::new(255, 255, 255, 0)),
+                stored(Ipv4Addr::new(10, 0, 0, 1)),
+                1,
+            ),
+            (0, 0, 0, 1),
+        ];
+        assert_eq!(
+            select_ipv4_default_gateway(&rows),
+            Some(Ipv4Addr::new(10, 0, 0, 1))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_routing_table_returns_a_real_gateway_or_none() {
+        if let Some(gateway) = default_gateway() {
+            assert!(!gateway.is_unspecified());
+            assert!(!gateway.is_multicast());
+            assert!(!gateway.is_broadcast());
+        }
     }
 }

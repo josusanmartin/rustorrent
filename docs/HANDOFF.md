@@ -34,6 +34,7 @@ All are GitHub pre-releases.
 - **Signing:** the app is not Developer ID signed or notarized, so macOS asks on first launch. Every new build also asks again for Downloads access (the launcher's preflight blocks until it is answered), because each ad-hoc signature is a new identity.
 - **Stalled sendto (rc.7):** the cause of the UDP send that blocked for an hour on 2 October is unknown (Little Snitch is installed on that Mac). The send timeout contains it; a log line when sends time out would help confirm.
 - **Experiments not adopted:** dialling never-seen non-seed peers first while seeding (won 3.9× in one 4-hour A/B, lost slightly in the replication) and a 1,024-packet uTP send window (no downloader burst during its test). Both are local branches only; the window cap (64 × 1,200 bytes, ~77 KB) still limits each uTP peer to ~0.4–1.5 MB/s depending on RTT.
+- **Windows app:** CI builds, smoke-tests and uploads the x64 ZIP as `windows-x86_64`, but the Release workflow does not publish it yet, and the package is unsigned. Not yet checked by hand: the terminal UI with a physical keyboard and Ctrl+C, NAT-PMP against a real router, the ARM64 build, the missing-WebView2 message, multi-monitor DPI changes, tray restore, and shutdown during a Windows sign-out.
 - **CI warning:** actions pinned to Node 20 (`actions/checkout`, `actions/setup-node`) print a deprecation warning. They still pass; bump the pinned SHAs when convenient.
 
 ## Local setup
@@ -43,5 +44,6 @@ All are GitHub pre-releases.
 - **Interop tests:** `transmission-daemon` for `tests/e2e_transmission.py`, and libtorrent's Python bindings for `tests/e2e_libtorrent.py` (`brew install libtorrent-rasterbar` on macOS; PyPI has no wheel for recent Pythons).
 - **Toolchains:** CI uses the latest stable Rust and denies warnings, so run clippy with the newest release too (`rustup toolchain install <version> -c clippy -c rustfmt`, then `cargo +<version> clippy ...`) as well as `cargo +1.89.0 check`.
 - **macOS app:** `./macos/package_app.sh --universal --dmg`.
+- **Windows app:** Visual Studio C++ Build Tools with the Windows SDK, then `.\windows\package_app.ps1`.
 
 See `CLAUDE.md` for the checks to run before pushing and for the release steps.

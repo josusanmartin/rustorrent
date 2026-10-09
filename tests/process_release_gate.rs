@@ -128,6 +128,116 @@ fn spawn_rustorrent(args: &[String], cwd: &Path) -> TestProcess {
     TestProcess { child, log }
 }
 
+#[cfg(windows)]
+#[test]
+fn desktop_launcher_event_saves_session_without_a_console() {
+    use std::ffi::c_void;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::os::windows::process::CommandExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateEventW(
+            attributes: *const c_void,
+            manual: i32,
+            initial: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+        fn SetEvent(event: *mut c_void) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+        fn DuplicateHandle(
+            source_process: *mut c_void,
+            source: *mut c_void,
+            target_process: *mut c_void,
+            target: *mut *mut c_void,
+            access: u32,
+            inherit: i32,
+            options: u32,
+        ) -> i32;
+    }
+    let root = temp_dir("desktop-shutdown");
+    fs::create_dir_all(&root).unwrap();
+    let torrent = root.join("input.torrent");
+    write_minimal_torrent(&torrent);
+    let secret = format!(
+        "{:064x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let name: Vec<u16> = format!("Local\\Rustorrent.Shutdown.{secret}")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: a NUL-terminated name and default security create a new event.
+    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
+    assert!(!event.is_null());
+    // SAFETY: CreateEventW returned an owned, valid handle.
+    let event = unsafe { OwnedHandle::from_raw_handle(event) };
+    // The launcher passes an inheritable handle to its own process.
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    let mut launcher = std::ptr::null_mut();
+    // SAFETY: the pseudo-handle of this process is duplicated into an owned handle.
+    let duplicated = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            GetCurrentProcess(),
+            GetCurrentProcess(),
+            &mut launcher,
+            SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            1,
+            0,
+        )
+    };
+    assert_ne!(duplicated, 0);
+    // SAFETY: DuplicateHandle returned an owned, valid handle.
+    let launcher = unsafe { OwnedHandle::from_raw_handle(launcher) };
+    let port = free_tcp_port();
+    let log = root.join("process-output.log");
+    let output = fs::File::create(&log).unwrap();
+    let mut process = TestProcess {
+        child: Command::new(env!("CARGO_BIN_EXE_rustorrent"))
+            .args([
+                "--ui",
+                "--ui-addr",
+                &format!("127.0.0.1:{port}"),
+                "--no-port-mapping",
+            ])
+            .arg("--download-dir")
+            .arg(&root)
+            .arg(&torrent)
+            .env("RUSTORRENT_UI_OWNER_SECRET", &secret)
+            .env(
+                "RUSTORRENT_LAUNCHER_HANDLE",
+                (launcher.as_raw_handle() as usize).to_string(),
+            )
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .current_dir(&root)
+            .stdout(Stdio::from(output.try_clone().unwrap()))
+            .stderr(Stdio::from(output))
+            .spawn()
+            .unwrap(),
+        log,
+    };
+    assert!(wait_for_tcp(port, Duration::from_secs(10)));
+    assert!(http_get(port, "/api-token").unwrap().contains(&secret));
+    assert!(wait_for_file(
+        &root.join(".rustorrent/session.benc"),
+        Duration::from_secs(10)
+    ));
+    // SAFETY: the test owns this event until the child has exited.
+    assert_ne!(unsafe { SetEvent(event.as_raw_handle()) }, 0);
+    let status = wait_for_process_exit(&mut process, Duration::from_secs(20))
+        .expect("desktop engine did not shut down after its launcher event");
+    assert!(
+        status.success(),
+        "{}",
+        fs::read_to_string(&process.log).unwrap()
+    );
+    assert!(root.join(".rustorrent/session.benc").is_file());
+}
+
 fn stop_child(mut child: TestProcess) -> String {
     let _ = child.kill();
     let _ = child.wait();
