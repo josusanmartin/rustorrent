@@ -3,6 +3,7 @@
 Run after cargo build: python3 tests/e2e_transfer.py [path/to/rustorrent]
 The independent peer fixture speaks the wire protocol using Python's standard library.
 """
+from contextlib import ExitStack, suppress
 import hashlib
 import http.client
 import json
@@ -319,6 +320,89 @@ class TransferTests(unittest.TestCase):
         result = self.app.post('/add-torrent?prealloc=1', torrent, 'application/x-bittorrent')
         wait_for(lambda: self.app.torrent(result['torrent_id'])['status'] == 'error')
         self.assertEqual(path.read_bytes(), sentinel)
+
+    def test_cli_preallocation_applies_to_the_matching_restored_torrent(self):
+        torrent, info_hash, _ = make_torrent()
+        other, other_hash, _ = make_torrent(name=b'other.bin')
+        self.app.add(torrent)
+        self.app.add(other)
+        self.app.stop()
+        magnet = f'magnet:?xt=urn:btih:{info_hash.hex()}'
+        self.app.start(['--preallocate', '--magnet', magnet])
+        items = wait_for(lambda: self.app.get('/status')['torrents'])
+        by_hash = {item['info_hash']: item for item in items}
+        wait_for(lambda: (self.app.root / 'fixture.bin').stat().st_size == len(PAYLOAD))
+        self.assertEqual(len(by_hash), 2)
+        self.assertTrue(by_hash[info_hash.hex()]['preallocate'])
+        self.assertFalse(by_hash[other_hash.hex()]['preallocate'])
+
+    def test_large_sequential_piece_is_shared_and_survives_disconnect(self):
+        self.app.stop()
+        self.app.start(['--sequential', '--max-peers', '8', '--max-peers-torrent', '8'])
+        length = 16 * 1024 * 1024
+        payload = PAYLOAD * (length // len(PAYLOAD)) + PAYLOAD[:length % len(PAYLOAD)]
+        info = {b'name': b'large.bin', b'length': length, b'piece length': length,
+                b'pieces': hashlib.sha1(payload).digest(), b'private': 1}
+        info_hash = hashlib.sha1(bencode(info)).digest()
+        tid = self.app.add(bencode({b'info': info}))
+
+        def next_request(sock):
+            while True:
+                msg = message(sock)
+                if msg[:1] == b'\x06':
+                    return struct.unpack('!III', msg[1:])
+
+        def send_block(sock, request):
+            index, begin, size = request
+            self.assertEqual(index, 0)
+            send(sock, 7, struct.pack('!II', index, begin) + payload[begin:begin + size])
+
+        with ExitStack() as stack:
+            first = stack.enter_context(self.app.peer(info_hash))
+            send(first, 5, b'\x80')
+            send(first, 1)
+            first_request = next_request(first)
+            send_block(first, first_request)
+            wait_for(lambda: self.app.torrent(tid)['downloaded_bytes'] >= first_request[2])
+
+            peers = []
+            for _ in range(5):
+                sock = stack.enter_context(self.app.peer(info_hash))
+                send(sock, 5, b'\x80')
+                send(sock, 1)
+                peers.append((sock, next_request(sock)))
+            first.close()
+            seen = {first_request[1]}
+
+            def serve(sock, request):
+                try:
+                    while not done.is_set():
+                        with lock:
+                            self.assertNotIn(request[1], seen)
+                            seen.add(request[1])
+                        send_block(sock, request)
+                        request = next_request(sock)
+                except (EOFError, OSError):
+                    pass
+                except Exception as error:
+                    errors.append(error)
+
+            lock, done, errors = threading.Lock(), threading.Event(), []
+            threads = [threading.Thread(target=serve, args=peer, daemon=True) for peer in peers]
+            for thread in threads:
+                thread.start()
+            try:
+                wait_for(lambda: self.app.torrent(tid)['percent'] == 10000)
+            finally:
+                done.set()
+                for sock, _ in peers:
+                    with suppress(OSError):
+                        sock.shutdown(socket.SHUT_RDWR)
+                for thread in threads:
+                    thread.join()
+            self.assertEqual(errors, [])
+            self.assertEqual(len(seen), length // 16384)
+        self.assertEqual((self.app.root / 'large.bin').read_bytes(), payload)
 
     def test_stopping_a_rate_limited_upload_releases_the_peer(self):
         torrent, info_hash, _ = make_torrent()

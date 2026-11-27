@@ -4,10 +4,12 @@ Requires transmission-daemon on PATH and a built Rustorrent binary.
 python3 tests/e2e_transmission.py [path/to/rustorrent]
 """
 import base64
+from contextlib import contextmanager, ExitStack
 import http.client
 import ipaddress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import shutil
 import socket
@@ -21,13 +23,29 @@ from urllib.parse import parse_qs, urlsplit
 from e2e_transfer import App, PAYLOAD, bencode, free_port, make_torrent, wait_for
 
 
+@contextmanager
+def transmission_dirs(root):
+    with ExitStack() as cleanup:
+        paths = []
+        for name in ('config', 'downloads'):
+            base = os.environ.get(f'RUSTORRENT_TRANSMISSION_{name.upper()}_ROOT')
+            if base:
+                path = Path(cleanup.enter_context(
+                    tempfile.TemporaryDirectory(prefix='rustorrent-', dir=base)))
+            else:
+                path = root / name
+                path.mkdir(parents=True)
+            paths.append(path)
+        yield tuple(paths)
+
+
 class InteropTests(unittest.TestCase):
     def run_transfer(self, rustorrent_seeds, encryption=1, dial_out=False):
-        with tempfile.TemporaryDirectory(prefix='rustorrent-transmission-') as directory:
+        with (tempfile.TemporaryDirectory(prefix='rustorrent-transmission-') as directory,
+              transmission_dirs(Path(directory)) as (config, tr_root)):
             root = Path(directory)
-            rust_root, tr_root, config = (root / name for name in ('rustorrent', 'transmission', 'config'))
-            for folder in (rust_root, tr_root, config):
-                folder.mkdir()
+            rust_root = root / 'rustorrent'
+            rust_root.mkdir()
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
                 route.connect(('192.0.2.1', 9))
                 peer_ip = route.getsockname()[0]
@@ -114,6 +132,7 @@ class InteropTests(unittest.TestCase):
                     self.assertEqual((rust_root / 'fixture.bin').read_bytes(), PAYLOAD)
             except Exception:
                 print('Transmission state:', rpc('torrent-get', {'fields': ['name','status','errorString','percentDone','peers','trackerStats']}), flush=True)
+                print((root / 'transmission.log').read_text(errors='replace')[-5000:], flush=True)
                 print((rust_root / 'process.log').read_text(errors='replace')[-5000:], flush=True)
                 raise
             finally:
@@ -130,7 +149,9 @@ class InteropTests(unittest.TestCase):
         """Transmission A seeds slowly to Rustorrent; Transmission B only knows
         Rustorrent, so every byte B gets was uploaded by a Rustorrent that is
         itself still downloading."""
-        with tempfile.TemporaryDirectory(prefix='rustorrent-relay-') as directory:
+        with (tempfile.TemporaryDirectory(prefix='rustorrent-relay-') as directory,
+              transmission_dirs(Path(directory) / 'a') as seeder_dirs,
+              transmission_dirs(Path(directory) / 'b') as leecher_dirs):
             root = Path(directory)
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
                 route.connect(('192.0.2.1', 9))
@@ -140,7 +161,8 @@ class InteropTests(unittest.TestCase):
                 self.skipTest(f'needs a LAN address, this host has {peer_ip}')
             (root / 'rustorrent').mkdir()
             app = App(root / 'rustorrent')
-            seeder, leecher = Daemon(self, root / 'a'), Daemon(self, root / 'b')
+            seeder = Daemon(self, root / 'a', seeder_dirs)
+            leecher = Daemon(self, root / 'b', leecher_dirs)
             (seeder.data / 'fixture.bin').write_bytes(PAYLOAD)
 
             class Tracker(BaseHTTPRequestHandler):
@@ -177,6 +199,8 @@ class InteropTests(unittest.TestCase):
                 wait_for(lambda: leecher.done() == 1, seconds=60)
                 self.assertEqual((leecher.data / 'fixture.bin').read_bytes(), PAYLOAD)
             except Exception:
+                for name in ('a', 'b'):
+                    print((root / name / 'transmission.log').read_text(errors='replace')[-5000:], flush=True)
                 print((root / 'rustorrent' / 'process.log').read_text(errors='replace')[-5000:], flush=True)
                 raise
             finally:
@@ -203,10 +227,10 @@ class InteropTests(unittest.TestCase):
 class Daemon:
     """A transmission-daemon with its own folders and ports."""
 
-    def __init__(self, test, root):
-        self.test, self.data, self.config = test, root / 'data', root / 'config'
-        self.data.mkdir(parents=True)
-        self.config.mkdir()
+    def __init__(self, test, root, dirs):
+        self.test = test
+        self.config, self.data = dirs
+        root.mkdir(parents=True, exist_ok=True)
         self.rpc_port, self.peer_port = free_port(), free_port()
         self.session_id, self.process = '', None
         self.log = open(root / 'transmission.log', 'wb')
