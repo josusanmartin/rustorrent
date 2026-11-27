@@ -189,7 +189,7 @@ jobs:
       - name: Install test tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y transmission-daemon python3-libtorrent
+          sudo apt-get install -y acl transmission-daemon python3-libtorrent
           sudo systemctl stop transmission-daemon || true
           npm ci
           npx playwright install --with-deps chromium
@@ -199,12 +199,24 @@ jobs:
         run: python3 tests/e2e_transfer.py
       - name: Transmission interoperability, including required encryption
         env:
-          RUSTORRENT_TRANSMISSION_CONFIG_ROOT: /var/lib/transmission-daemon/info/rustorrent-ci
+          RUSTORRENT_TRANSMISSION_CONFIG_ROOT: /var/lib/transmission-daemon/.config/transmission-daemon/rustorrent-ci
           RUSTORRENT_TRANSMISSION_DOWNLOADS_ROOT: /var/lib/transmission-daemon/downloads/rustorrent-ci
         run: |
           # Ubuntu's Transmission AppArmor profile allows these state and download roots.
           sudo install -d -m 700 -o "$(id -un)" -g "$(id -gn)" \
             "$RUSTORRENT_TRANSMISSION_CONFIG_ROOT" "$RUSTORRENT_TRANSMISSION_DOWNLOADS_ROOT"
+          # Service-owned ancestors can deny traversal even when the test roots
+          # belong to the runner. Grant only search access to this CI user.
+          for root in "$RUSTORRENT_TRANSMISSION_CONFIG_ROOT" "$RUSTORRENT_TRANSMISSION_DOWNLOADS_ROOT"; do
+            parent="$(dirname "$root")"
+            while [[ "$parent" == /var/lib/transmission-daemon || "$parent" == /var/lib/transmission-daemon/* ]]; do
+              if [[ ! -x "$parent" ]]; then
+                sudo setfacl -m "u:$(id -un):--x" "$parent"
+              fi
+              parent="$(dirname "$parent")"
+            done
+            test -w "$root"
+          done
           python3 tests/e2e_transmission.py
       - name: libtorrent uTP interoperability
         run: python3 tests/e2e_libtorrent.py
