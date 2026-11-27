@@ -15780,12 +15780,15 @@ mod core_helpers_tests {
             encryption: EncryptionMode::Prefer,
             utp: None,
             ip_filter: None,
-            proxy: None,
+            proxy: Some(proxy::ProxyConfig::Socks5 {
+                host: "127.0.0.1".to_string(),
+                port: 1,
+            }),
         };
-        // No trackers, peers or DHT: every round fails at once, and the search
-        // must keep going rather than turning into a torrent error.
+        // Proxy mode skips the public caches. With no trackers or peers,
+        // discovery fails immediately, leaving the retry loop to handle it.
         let error = fetch_magnet_until_found(
-            "magnet:?xt=urn:btih:4b07d0071f9ceb21af6b8ba05b3a3c6f507e3fb2&dn=Test",
+            "magnet:?xt=urn:btih:00112233445566778899aabbccddeeff00112233&dn=Test",
             0,
             &dht::disabled(),
             &cfg,
