@@ -198,7 +198,14 @@ jobs:
       - name: Transfer, integrity, crash recovery, and upload tests
         run: python3 tests/e2e_transfer.py
       - name: Transmission interoperability, including required encryption
-        run: python3 tests/e2e_transmission.py
+        env:
+          RUSTORRENT_TRANSMISSION_CONFIG_ROOT: /var/lib/transmission-daemon/info/rustorrent-ci
+          RUSTORRENT_TRANSMISSION_DOWNLOADS_ROOT: /var/lib/transmission-daemon/downloads/rustorrent-ci
+        run: |
+          # Ubuntu's Transmission AppArmor profile allows these state and download roots.
+          sudo install -d -m 700 -o "$(id -un)" -g "$(id -gn)" \
+            "$RUSTORRENT_TRANSMISSION_CONFIG_ROOT" "$RUSTORRENT_TRANSMISSION_DOWNLOADS_ROOT"
+          python3 tests/e2e_transmission.py
       - name: libtorrent uTP interoperability
         run: python3 tests/e2e_libtorrent.py
       - name: Browser flows and accessibility
