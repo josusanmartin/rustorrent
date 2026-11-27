@@ -88,6 +88,13 @@ def send(sock, kind, payload=b''):
     sock.sendall(struct.pack('!IB', len(payload) + 1, kind) + payload)
 
 
+def next_block_request(sock):
+    while True:
+        msg = message(sock)
+        if msg[:1] == b'\x06':
+            return struct.unpack('!III', msg[1:])
+
+
 class App:
     def __init__(self, root):
         self.root = Path(root)
@@ -329,10 +336,16 @@ class TransferTests(unittest.TestCase):
         self.app.stop()
         magnet = f'magnet:?xt=urn:btih:{info_hash.hex()}'
         self.app.start(['--preallocate', '--magnet', magnet])
-        items = wait_for(lambda: self.app.get('/status')['torrents'])
+        expected_hashes = {info_hash.hex(), other_hash.hex()}
+
+        def restored_torrents():
+            items = self.app.get('/status')['torrents']
+            return items if expected_hashes <= {item['info_hash'] for item in items} else None
+
+        items = wait_for(restored_torrents)
         by_hash = {item['info_hash']: item for item in items}
         wait_for(lambda: (self.app.root / 'fixture.bin').stat().st_size == len(PAYLOAD))
-        self.assertEqual(len(by_hash), 2)
+        self.assertEqual(len(items), 2)
         self.assertTrue(by_hash[info_hash.hex()]['preallocate'])
         self.assertFalse(by_hash[other_hash.hex()]['preallocate'])
 
@@ -346,12 +359,6 @@ class TransferTests(unittest.TestCase):
         info_hash = hashlib.sha1(bencode(info)).digest()
         tid = self.app.add(bencode({b'info': info}))
 
-        def next_request(sock):
-            while True:
-                msg = message(sock)
-                if msg[:1] == b'\x06':
-                    return struct.unpack('!III', msg[1:])
-
         def send_block(sock, request):
             index, begin, size = request
             self.assertEqual(index, 0)
@@ -361,7 +368,7 @@ class TransferTests(unittest.TestCase):
             first = stack.enter_context(self.app.peer(info_hash))
             send(first, 5, b'\x80')
             send(first, 1)
-            first_request = next_request(first)
+            first_request = next_block_request(first)
             send_block(first, first_request)
             wait_for(lambda: self.app.torrent(tid)['downloaded_bytes'] >= first_request[2])
 
@@ -370,7 +377,7 @@ class TransferTests(unittest.TestCase):
                 sock = stack.enter_context(self.app.peer(info_hash))
                 send(sock, 5, b'\x80')
                 send(sock, 1)
-                peers.append((sock, next_request(sock)))
+                peers.append((sock, next_block_request(sock)))
             first.close()
             seen = {first_request[1]}
 
@@ -381,7 +388,7 @@ class TransferTests(unittest.TestCase):
                             self.assertNotIn(request[1], seen)
                             seen.add(request[1])
                         send_block(sock, request)
-                        request = next_request(sock)
+                        request = next_block_request(sock)
                 except (EOFError, OSError):
                     pass
                 except Exception as error:
@@ -403,6 +410,35 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertEqual(len(seen), length // 16384)
         self.assertEqual((self.app.root / 'large.bin').read_bytes(), payload)
+
+    def test_large_sequential_transfer_requests_pieces_from_disjoint_peers(self):
+        self.app.stop()
+        self.app.start(['--sequential', '--max-peers', '8', '--max-peers-torrent', '8'])
+        length = 16 * 1024 * 1024
+        payload = bytes([17]) * length
+        info = {b'name': b'disjoint.bin', b'length': 8 * length, b'piece length': length,
+                b'pieces': hashlib.sha1(payload).digest() * 8, b'private': 1}
+        info_hash = hashlib.sha1(bencode(info)).digest()
+        tid = self.app.add(bencode({b'info': info}))
+
+        with ExitStack() as stack:
+            for index in range(4):
+                stalled = stack.enter_context(self.app.peer(info_hash))
+                send(stalled, 5, bytes([0x80 >> index]))
+                send(stalled, 1)
+                self.assertEqual(next_block_request(stalled)[0], index)
+
+            fast = stack.enter_context(self.app.peer(info_hash))
+            send(fast, 5, b'\x01')
+            send(fast, 1)
+            for _ in range(length // 16384):
+                index, begin, size = next_block_request(fast)
+                self.assertEqual(index, 7)
+                send(fast, 7, struct.pack('!II', index, begin) + payload[begin:begin + size])
+            wait_for(lambda: self.app.torrent(tid)['completed_bytes'] == length)
+        with (self.app.root / 'disjoint.bin').open('rb') as data:
+            data.seek(7 * length)
+            self.assertEqual(data.read(), payload)
 
     def test_stopping_a_rate_limited_upload_releases_the_peer(self):
         torrent, info_hash, _ = make_torrent()

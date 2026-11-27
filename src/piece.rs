@@ -147,7 +147,7 @@ pub struct PieceBuffer {
 
 #[cfg_attr(test, derive(Debug))]
 pub struct PieceBufferBudget {
-    limit: usize,
+    limit: AtomicUsize,
     used: AtomicUsize,
 }
 
@@ -198,7 +198,7 @@ impl std::error::Error for Error {}
 impl PieceBufferBudget {
     pub fn new(limit: usize) -> Self {
         Self {
-            limit,
+            limit: AtomicUsize::new(limit),
             used: AtomicUsize::new(0),
         }
     }
@@ -206,7 +206,8 @@ impl PieceBufferBudget {
     fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<BudgetCounterPermit> {
         self.used
             .update_with(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|next| *next <= self.limit)
+                used.checked_add(bytes)
+                    .filter(|next| *next <= self.limit.load(Ordering::Relaxed))
             })
             .ok()?;
         Some(BudgetCounterPermit {
@@ -224,6 +225,11 @@ impl PieceBufferBudget {
 impl PieceBufferBudgets {
     pub fn new(global: Arc<PieceBufferBudget>, torrent: Arc<PieceBufferBudget>) -> Self {
         Self { global, torrent }
+    }
+
+    /// New reservations respect the new limit. Buffers already in use can finish.
+    pub fn set_torrent_limit(&self, limit: usize) {
+        self.torrent.limit.store(limit, Ordering::Relaxed);
     }
 
     /// Reserves logical allocation bytes against both the per-torrent and
@@ -1492,6 +1498,22 @@ mod tests {
     }
 
     #[test]
+    fn lowering_the_torrent_budget_preserves_live_reservations() {
+        let global = Arc::new(PieceBufferBudget::new(64));
+        let torrent = Arc::new(PieceBufferBudget::new(16));
+        let budgets = PieceBufferBudgets::new(Arc::clone(&global), Arc::clone(&torrent));
+        budgets.set_torrent_limit(48);
+        let reservation = budgets.try_reserve(32).unwrap();
+        budgets.set_torrent_limit(16);
+        assert_eq!(torrent.used(), 32);
+        assert_eq!(global.used(), 32);
+        assert!(budgets.try_reserve(1).is_none());
+        drop(reservation);
+        assert!(budgets.try_reserve(16).is_some());
+        assert!(budgets.try_reserve(17).is_none());
+    }
+
+    #[test]
     fn priority_updates_are_atomic_on_validation_error() {
         let meta = dummy_meta(2, 16 * 1024, 32 * 1024);
         let mut manager = PieceManager::new(&meta).unwrap();
@@ -1783,6 +1805,7 @@ mod tests {
         assert!(!manager
             .start_peer_download(2, &second, &budgets, later)
             .unwrap());
+        assert!(manager.has_needed_piece(&second));
         manager.release_peer_block(pending);
         assert!(!manager
             .start_peer_download(2, &second, &budgets, now)

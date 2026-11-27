@@ -333,8 +333,11 @@ const MIN_PIPELINE_DEPTH: usize = 4;
 const MAX_PIPELINE_DEPTH: usize = 256;
 const MAX_SINGLE_PIECE_BUFFER_BYTES: usize = torrent::MAX_PIECE_LENGTH as usize
     + (torrent::MAX_PIECE_LENGTH as usize).div_ceil(piece::BLOCK_LEN as usize);
-const MAX_TORRENT_PIECE_BUFFER_BYTES: usize = 4 * MAX_SINGLE_PIECE_BUFFER_BYTES;
-const MAX_GLOBAL_PIECE_BUFFER_BYTES: usize = 16 * MAX_SINGLE_PIECE_BUFFER_BYTES;
+const BASE_TORRENT_PIECE_BUFFER_BYTES: usize = 4 * MAX_SINGLE_PIECE_BUFFER_BYTES;
+const MAX_PIECE_BUFFER_PEERS: usize = 64;
+// Leave the original process-wide allowance available beyond one full window.
+const MAX_GLOBAL_PIECE_BUFFER_BYTES: usize =
+    (MAX_PIECE_BUFFER_PEERS + 16) * MAX_SINGLE_PIECE_BUFFER_BYTES;
 #[cfg(feature = "webseed")]
 const WEBSEED_RESERVATION_ID: u64 = u64::MAX;
 #[cfg(feature = "webseed")]
@@ -4375,6 +4378,14 @@ fn run_torrent(
     }
 }
 
+fn torrent_piece_buffer_bytes(piece_length: u64, active_peers: usize) -> usize {
+    let length = piece_length as usize;
+    let piece_bytes = length + length.div_ceil(piece::BLOCK_LEN as usize);
+    // Peers with disjoint bitfields may each need their own piece buffer.
+    // Scale with piece size as well so smaller pieces keep the original budget.
+    BASE_TORRENT_PIECE_BUFFER_BYTES.max(piece_bytes * active_peers.min(MAX_PIECE_BUFFER_PEERS))
+}
+
 fn run_torrent_once(
     request: TorrentRequest,
     runtime: &TorrentRuntime,
@@ -4773,7 +4784,7 @@ fn run_torrent_once(
     let piece_buffer_budgets = piece::PieceBufferBudgets::new(
         Arc::clone(global_piece_buffer_budget),
         Arc::new(piece::PieceBufferBudget::new(
-            MAX_TORRENT_PIECE_BUFFER_BYTES,
+            BASE_TORRENT_PIECE_BUFFER_BYTES,
         )),
     );
     let peer_tags = Arc::new(AtomicU64::new(1));
@@ -4896,6 +4907,7 @@ fn run_torrent_once(
         let mut last_announce = instant_ago(Duration::from_secs(interval + 1));
         let mut last_progress_at = Instant::now();
         let mut last_buffer_cleanup = last_progress_at;
+        let mut buffer_peer_count = 0;
         let mut rates = RateWindow::default();
         let mut round: Option<AnnounceRound> = None;
         // Track per-tracker failures for exponential backoff: url -> (fail_count, last_failure)
@@ -5019,6 +5031,13 @@ fn run_torrent_once(
                 (q.known_len(), q.len())
             };
             let active_count = active_peers.load(Ordering::SeqCst);
+            if active_count != buffer_peer_count {
+                piece_buffer_budgets.set_torrent_limit(torrent_piece_buffer_bytes(
+                    meta.info.piece_length,
+                    active_count,
+                ));
+                buffer_peer_count = active_count;
+            }
             let interested_count = interested_peers.load(Ordering::SeqCst);
             let upload_requests_count = upload_requests_served.load(Ordering::SeqCst);
 
@@ -11841,6 +11860,7 @@ impl<'a> PeerConn<'a> {
                 {
                     continue;
                 }
+                // A peer with an unbuffered wanted piece can work when memory is available.
                 let useful = !self.pending.is_empty()
                     || self.peer_interested
                     || endgame
@@ -14985,7 +15005,7 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
     #[test]
     fn webseed_payload_memory_is_bounded_and_denial_releases_piece() {
         let max_charge = webseed_memory_budget_bytes(torrent::MAX_PIECE_LENGTH as u32).unwrap();
-        assert!(max_charge <= MAX_TORRENT_PIECE_BUFFER_BYTES);
+        assert!(max_charge <= BASE_TORRENT_PIECE_BUFFER_BYTES);
 
         let global = Arc::new(piece::PieceBufferBudget::new(max_charge));
         let torrent_budget = Arc::new(piece::PieceBufferBudget::new(max_charge));
@@ -15030,6 +15050,27 @@ mod core_helpers_tests {
     use std::fs;
     use std::io::Cursor;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn piece_buffer_allowance_scales_with_live_peers_and_piece_size() {
+        let piece_length = torrent::MAX_PIECE_LENGTH;
+        assert_eq!(
+            torrent_piece_buffer_bytes(piece_length, 0),
+            BASE_TORRENT_PIECE_BUFFER_BYTES
+        );
+        assert_eq!(
+            torrent_piece_buffer_bytes(piece_length, 5),
+            5 * MAX_SINGLE_PIECE_BUFFER_BYTES
+        );
+        assert_eq!(
+            torrent_piece_buffer_bytes(piece_length, 200),
+            MAX_PIECE_BUFFER_PEERS * MAX_SINGLE_PIECE_BUFFER_BYTES,
+        );
+        assert_eq!(
+            torrent_piece_buffer_bytes(256 * 1024, 200),
+            BASE_TORRENT_PIECE_BUFFER_BYTES
+        );
+    }
 
     fn temp_path(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -15440,7 +15481,7 @@ mod core_helpers_tests {
             piece_buffer_budgets: piece::PieceBufferBudgets::new(
                 Arc::new(piece::PieceBufferBudget::new(MAX_GLOBAL_PIECE_BUFFER_BYTES)),
                 Arc::new(piece::PieceBufferBudget::new(
-                    MAX_TORRENT_PIECE_BUFFER_BYTES,
+                    BASE_TORRENT_PIECE_BUFFER_BYTES,
                 )),
             ),
             ui_state: None,
