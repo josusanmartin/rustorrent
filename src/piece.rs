@@ -1,4 +1,5 @@
 use crate::util::AtomicUpdate;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -13,6 +14,7 @@ pub const PRIORITY_SKIP: u8 = 0;
 pub const PRIORITY_LOW: u8 = 1;
 pub const PRIORITY_NORMAL: u8 = 2;
 pub const PRIORITY_HIGH: u8 = 3;
+const IDLE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub enum PieceHash {
@@ -75,6 +77,7 @@ struct Piece {
     priority: u8,
     wanted: bool,
     verified: bool,
+    single_source_retry: bool,
 }
 
 /// Aggregates over wanted pieces, maintained incrementally so progress
@@ -92,13 +95,14 @@ pub struct PieceManager {
     pieces: Vec<Piece>,
     availability: Vec<u32>,
     reserved_by: Vec<Option<u64>>,
-    reservation_time: Vec<Option<Instant>>,
     sequential: bool,
     /// Bit set of pieces that are wanted, unverified and still have a
     /// `Missing` block; bit 63 of word 0 is piece 0 (peer bitfield order), so
     /// selection is a word-wise AND with the peer's bitfield.
     candidates: Vec<u64>,
     totals: Totals,
+    downloads: BTreeMap<u32, PeerDownload>,
+    next_download_id: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -108,9 +112,32 @@ pub struct BlockRequest {
     pub length: u32,
 }
 
+#[derive(Clone, Copy)]
+pub struct PeerBlockRequest {
+    pub block: BlockRequest,
+    download_id: u64,
+}
+
+pub enum ReceivedBlock {
+    Partial,
+    Complete {
+        buffer: PieceBuffer,
+        single_source: bool,
+    },
+}
+
+struct PeerDownload {
+    id: u64,
+    // None while the last receiver verifies and writes the assembled piece.
+    buffer: Option<PieceBuffer>,
+    last_progress: Instant,
+    owner: Option<u64>,
+    first_source: Option<u64>,
+    mixed_sources: bool,
+}
+
 #[cfg_attr(test, derive(Debug))]
 pub struct PieceBuffer {
-    index: u32,
     length: u32,
     data: Vec<u8>,
     blocks: Vec<u8>,
@@ -248,8 +275,9 @@ impl PieceManager {
             pieces,
             availability: vec![0; piece_count],
             reserved_by: vec![None; piece_count],
-            reservation_time: vec![None; piece_count],
             sequential: false,
+            downloads: BTreeMap::new(),
+            next_download_id: 0,
             candidates: Vec::new(),
             totals: Totals::default(),
         };
@@ -459,12 +487,12 @@ impl PieceManager {
     }
 
     pub fn reset_verified(&mut self) {
+        self.downloads.clear();
         for piece in &mut self.pieces {
             piece.verified = false;
             piece.fill(BlockState::Missing);
         }
         self.reserved_by.fill(None);
-        self.reservation_time.fill(None);
         self.recount();
     }
 
@@ -520,8 +548,10 @@ impl PieceManager {
             piece.priority = *priority;
             piece.wanted = *priority != PRIORITY_SKIP;
             if !piece.wanted {
+                if self.downloads.remove(&(idx as u32)).is_some() {
+                    piece.fill(BlockState::Missing);
+                }
                 self.reserved_by[idx] = None;
-                self.reservation_time[idx] = None;
             }
         }
         self.recount();
@@ -595,15 +625,8 @@ impl PieceManager {
     }
 
     /// Pick the best candidate the peer has, preferring higher priority and
-    /// then rarer pieces (lowest index on ties). `stale_before` switches to
-    /// stealing: only pieces reserved by another peer before that instant.
-    fn pick(
-        &self,
-        peer_id: u64,
-        bitfield: &[u8],
-        allow_reserved: bool,
-        stale_before: Option<Instant>,
-    ) -> Option<usize> {
+    /// then rarer pieces (lowest index on ties).
+    fn pick(&self, bitfield: &[u8], allow_reserved: bool) -> Option<usize> {
         if bitfield.len() != self.bitfield_len() {
             return None;
         }
@@ -614,17 +637,11 @@ impl PieceManager {
                 let offset = bits.leading_zeros() as usize;
                 bits &= !(1u64 << (63 - offset));
                 let idx = word * 64 + offset;
-                match stale_before {
-                    Some(cutoff) => {
-                        if self.reserved_by[idx].is_none_or(|owner| owner == peer_id)
-                            || self.reservation_time[idx].is_none_or(|at| at > cutoff)
-                        {
-                            continue;
-                        }
-                    }
-                    None if !allow_reserved && self.reserved_by[idx].is_some() => continue,
-                    None if self.sequential => return Some(idx),
-                    None => {}
+                if !allow_reserved && self.reserved_by[idx].is_some() {
+                    continue;
+                }
+                if self.sequential {
+                    return Some(idx);
                 }
                 let priority = self.pieces[idx].priority;
                 let rarity = self.availability[idx];
@@ -638,30 +655,190 @@ impl PieceManager {
         best.map(|(idx, _, _)| idx)
     }
 
-    fn reserve(&mut self, idx: usize, peer_id: u64, now: Instant) -> u32 {
+    fn reserve(&mut self, idx: usize, peer_id: u64) -> u32 {
         self.reserved_by[idx] = Some(peer_id);
-        self.reservation_time[idx] = Some(now);
         idx as u32
     }
 
+    #[cfg(any(feature = "webseed", test))]
     pub fn reserve_piece_for_peer(
         &mut self,
         peer_id: u64,
         bitfield: &[u8],
         allow_reserved: bool,
     ) -> Option<u32> {
-        let idx = self.pick(peer_id, bitfield, allow_reserved, None)?;
+        let idx = self.pick(bitfield, allow_reserved)?;
         if allow_reserved {
             return Some(idx as u32);
         }
-        Some(self.reserve(idx, peer_id, Instant::now()))
+        Some(self.reserve(idx, peer_id))
     }
 
     pub fn has_needed_piece(&self, bitfield: &[u8]) -> bool {
         bitfield.len() == self.bitfield_len()
-            && (0..self.candidates.len()).any(|word| self.peer_candidates(bitfield, word) != 0)
+            && (self
+                .downloads
+                .keys()
+                .any(|&index| bitfield_has(bitfield, index as usize))
+                || (0..self.candidates.len()).any(|word| self.peer_candidates(bitfield, word) != 0))
     }
 
+    pub fn request_buffered_block(
+        &mut self,
+        peer_id: u64,
+        bitfield: &[u8],
+    ) -> Option<PeerBlockRequest> {
+        if bitfield.len() != self.bitfield_len() {
+            return None;
+        }
+        let (&index, download) = self.downloads.iter().find(|(index, download)| {
+            let index = **index as usize;
+            self.pieces[index].is_candidate()
+                && bitfield_has(bitfield, index)
+                && download.owner.is_none_or(|owner| owner == peer_id)
+        })?;
+        let download_id = download.id;
+        let block = self.next_request_for_piece(index, false)?;
+        Some(PeerBlockRequest { block, download_id })
+    }
+
+    pub fn start_peer_download(
+        &mut self,
+        peer_id: u64,
+        bitfield: &[u8],
+        budgets: &PieceBufferBudgets,
+        now: Instant,
+    ) -> Result<bool, Error> {
+        let Some(idx) = self.pick(bitfield, false) else {
+            return Ok(false);
+        };
+        let index = idx as u32;
+        let length = self.pieces[idx].length;
+        let mut buffer = PieceBuffer::try_new(length, budgets)?;
+        if buffer.is_none() {
+            let victim = self.idle_downloads(now, true).next();
+            if let Some(victim) = victim {
+                self.reset_piece(victim)?;
+                buffer = PieceBuffer::try_new(length, budgets)?;
+            }
+        }
+        let Some(buffer) = buffer else {
+            return Ok(false);
+        };
+        let owner = self.pieces[idx].single_source_retry.then_some(peer_id);
+        self.reserve(idx, peer_id);
+        self.next_download_id += 1;
+        self.downloads.insert(
+            index,
+            PeerDownload {
+                id: self.next_download_id,
+                buffer: Some(buffer),
+                last_progress: now,
+                owner,
+                first_source: None,
+                mixed_sources: false,
+            },
+        );
+        Ok(true)
+    }
+
+    fn idle_downloads(&self, now: Instant, reclaim_empty: bool) -> impl Iterator<Item = u32> + '_ {
+        self.downloads.iter().filter_map(move |(&index, download)| {
+            let piece = &self.pieces[index as usize];
+            let no_requests = piece.blocks.len() == (piece.missing + piece.done) as usize;
+            let stale =
+                now.saturating_duration_since(download.last_progress) >= IDLE_DOWNLOAD_TIMEOUT;
+            (download.buffer.is_some()
+                && no_requests
+                && (stale || (reclaim_empty && piece.done == 0)))
+                .then_some(index)
+        })
+    }
+
+    pub fn reap_idle_downloads(&mut self, now: Instant) {
+        // A torrent without useful peers still has to return its idle buffers
+        // to the global budget so other torrents can advance.
+        let idle: Vec<_> = self.idle_downloads(now, false).collect();
+        for index in idle {
+            let _ = self.reset_piece(index);
+        }
+    }
+
+    pub fn peer_request_is_current(&self, request: PeerBlockRequest) -> bool {
+        self.downloads
+            .get(&request.block.index)
+            .is_some_and(|download| download.id == request.download_id)
+    }
+
+    pub fn release_peer_block(&mut self, request: PeerBlockRequest) {
+        let block = request.block;
+        if self.peer_request_is_current(request) {
+            let _ = self.mark_block_missing(block.index, block.begin);
+        }
+    }
+
+    pub fn abandon_exclusive_downloads(&mut self, peer_id: u64) {
+        let abandoned: Vec<_> = self
+            .downloads
+            .iter()
+            .filter(|(_, download)| download.owner == Some(peer_id) && download.buffer.is_some())
+            .map(|(&index, _)| index)
+            .collect();
+        for index in abandoned {
+            let _ = self.reset_piece(index);
+        }
+    }
+
+    pub fn receive_peer_block(
+        &mut self,
+        request: PeerBlockRequest,
+        peer_id: u64,
+        data: &[u8],
+        now: Instant,
+    ) -> Result<Option<ReceivedBlock>, Error> {
+        let block = request.block;
+        let Some(download) = self
+            .downloads
+            .get_mut(&block.index)
+            .filter(|download| download.id == request.download_id)
+        else {
+            return Ok(None);
+        };
+        let Some(buffer) = download.buffer.as_mut() else {
+            return Ok(None);
+        };
+        let complete = buffer.add_block(block.begin, data)?;
+        let first_source = *download.first_source.get_or_insert(peer_id);
+        download.mixed_sources |= first_source != peer_id;
+        download.last_progress = now;
+        let single_source = !download.mixed_sources;
+        let finished = if complete {
+            download.buffer.take()
+        } else {
+            None
+        };
+        let was_new = self.mark_block_complete(block.index, block.begin, data.len() as u32)?;
+        if !was_new {
+            return Ok(None);
+        }
+        Ok(Some(match finished {
+            Some(buffer) => ReceivedBlock::Complete {
+                buffer,
+                single_source,
+            },
+            None => ReceivedBlock::Partial,
+        }))
+    }
+
+    pub fn reset_peer_download(&mut self, request: PeerBlockRequest, single_source_retry: bool) {
+        if self.peer_request_is_current(request) {
+            let index = request.block.index;
+            self.pieces[index as usize].single_source_retry |= single_source_retry;
+            let _ = self.reset_piece(index);
+        }
+    }
+
+    #[cfg(any(feature = "webseed", test))]
     pub fn release_piece(&mut self, peer_id: u64, index: u32) {
         let idx = index as usize;
         if self.reserved_by.get(idx) == Some(&Some(peer_id)) {
@@ -669,31 +846,14 @@ impl PieceManager {
         }
     }
 
-    pub fn clear_reservation(&mut self, index: u32) {
+    fn clear_reservation(&mut self, index: u32) {
         let idx = index as usize;
         if idx < self.reserved_by.len() {
             self.reserved_by[idx] = None;
-            self.reservation_time[idx] = None;
         }
     }
 
-    /// Steal a piece that has been reserved by another peer for longer than
-    /// `stale_threshold`. Returns the piece index if a stale reservation was
-    /// found and reassigned to `peer_id`.
-    pub fn steal_stale_piece(
-        &mut self,
-        peer_id: u64,
-        bitfield: &[u8],
-        stale_threshold: Duration,
-    ) -> Option<u32> {
-        let now = Instant::now();
-        // A threshold beyond the monotonic clock's range cannot be stale yet.
-        let cutoff = now.checked_sub(stale_threshold)?;
-        let idx = self.pick(peer_id, bitfield, true, Some(cutoff))?;
-        Some(self.reserve(idx, peer_id, now))
-    }
-
-    pub fn next_request_for_piece(
+    fn next_request_for_piece(
         &mut self,
         index: u32,
         allow_duplicate: bool,
@@ -824,23 +984,23 @@ impl PieceManager {
         self.account(idx, false);
         let piece = &mut self.pieces[idx];
         piece.verified = verified;
+        if verified {
+            piece.single_source_retry = false;
+        }
         piece.fill(if verified {
             BlockState::Complete
         } else {
             BlockState::Missing
         });
         self.account(idx, true);
+        self.downloads.remove(&index);
         self.clear_reservation(index);
         Ok(changed)
     }
 }
 
 impl PieceBuffer {
-    pub fn try_new(
-        index: u32,
-        length: u32,
-        budgets: &PieceBufferBudgets,
-    ) -> Result<Option<Self>, Error> {
+    pub fn try_new(length: u32, budgets: &PieceBufferBudgets) -> Result<Option<Self>, Error> {
         if length == 0 || length as u64 > MAX_PIECE_LENGTH {
             return Err(Error::InvalidPieceLength);
         }
@@ -851,16 +1011,15 @@ impl PieceBuffer {
         let Some(reservation) = budgets.try_reserve(allocation_bytes) else {
             return Ok(None);
         };
-        Self::allocate(index, length, Some(reservation)).map(Some)
+        Self::allocate(length, Some(reservation)).map(Some)
     }
 
     #[cfg(test)]
-    pub fn new(index: u32, length: u32) -> Result<Self, Error> {
-        Self::allocate(index, length, None)
+    pub fn new(length: u32) -> Result<Self, Error> {
+        Self::allocate(length, None)
     }
 
     fn allocate(
-        index: u32,
         length: u32,
         budget_reservation: Option<PieceBufferReservation>,
     ) -> Result<Self, Error> {
@@ -878,17 +1037,12 @@ impl PieceBuffer {
             .map_err(|_| Error::InvalidPieceLength)?;
         block_map.resize(blocks, 0);
         Ok(Self {
-            index,
             length,
             data,
             blocks: block_map,
             complete: 0,
             _budget_reservation: budget_reservation,
         })
-    }
-
-    pub fn index(&self) -> u32 {
-        self.index
     }
 
     pub fn length(&self) -> u32 {
@@ -944,7 +1098,6 @@ fn v2_tree_length(data_length: u32) -> Option<u32> {
     blocks.checked_next_power_of_two()?.checked_mul(BLOCK_LEN)
 }
 
-#[cfg(test)]
 fn bitfield_has(bitfield: &[u8], index: usize) -> bool {
     let byte = bitfield[index / 8];
     let offset = index % 8;
@@ -965,6 +1118,7 @@ impl Piece {
             priority: PRIORITY_NORMAL,
             wanted: true,
             verified: false,
+            single_source_retry: false,
         }
     }
 
@@ -1192,7 +1346,7 @@ mod tests {
 
     #[test]
     fn piece_buffer_tracks_completion_across_blocks() {
-        let mut buffer = PieceBuffer::new(2, BLOCK_LEN + 4).unwrap();
+        let mut buffer = PieceBuffer::new(BLOCK_LEN + 4).unwrap();
         let first = vec![1u8; BLOCK_LEN as usize];
         let second = vec![2u8; 4];
         assert!(!buffer.add_block(0, &first).unwrap());
@@ -1202,29 +1356,117 @@ mod tests {
     }
 
     #[test]
+    fn six_peers_share_one_large_sequential_buffer_and_retry_a_released_block() {
+        let length = MAX_PIECE_LENGTH as u32;
+        let blocks = (length / BLOCK_LEN) as usize;
+        let allocation = length as usize + blocks;
+        let budget = Arc::new(PieceBufferBudget::new(allocation));
+        let torrent_budget = Arc::new(PieceBufferBudget::new(allocation));
+        let budgets = PieceBufferBudgets::new(Arc::clone(&budget), torrent_budget);
+        let meta = dummy_meta(2, length as u64, 2 * length as u64);
+        let mut manager = PieceManager::new(&meta).unwrap();
+        manager.set_sequential(true);
+        let now = Instant::now();
+        let all = [0xc0];
+        assert!(manager.start_peer_download(1, &all, &budgets, now).unwrap());
+
+        let data = vec![123; BLOCK_LEN as usize];
+        let block = manager.request_buffered_block(1, &all).unwrap();
+        assert!(matches!(
+            manager.receive_peer_block(block, 1, &data, now).unwrap(),
+            Some(ReceivedBlock::Partial),
+        ));
+        let pending: Vec<_> = (1..=6)
+            .map(|peer| (peer, manager.request_buffered_block(peer, &all).unwrap()))
+            .collect();
+        for (i, (_, request)) in pending.iter().enumerate() {
+            assert_eq!(request.block.index, 0);
+            assert_eq!(request.block.begin, (i as u32 + 1) * BLOCK_LEN);
+        }
+        assert_eq!(budget.used(), allocation);
+        assert!(!manager
+            .start_peer_download(7, &[0x40], &budgets, now)
+            .unwrap());
+        manager.release_peer_block(pending[0].1);
+        let retry = manager.request_buffered_block(2, &all).unwrap();
+        assert_eq!(retry.block.begin, pending[0].1.block.begin);
+        let mut received = manager.receive_peer_block(retry, 2, &data, now).unwrap();
+        for (peer, request) in pending.into_iter().skip(1) {
+            received = manager
+                .receive_peer_block(request, peer, &data, now)
+                .unwrap();
+        }
+        while let Some(request) = manager.request_buffered_block(2, &all) {
+            received = manager.receive_peer_block(request, 2, &data, now).unwrap();
+        }
+        let Some(ReceivedBlock::Complete {
+            buffer,
+            single_source,
+        }) = received
+        else {
+            panic!("the shared piece never completed");
+        };
+        assert!(!single_source);
+        assert!(buffer.data().iter().all(|&byte| byte == 123));
+        assert!(!manager.is_piece_complete(0));
+        manager.mark_piece_complete(0).unwrap();
+        drop(buffer);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn stale_requests_cannot_undo_a_single_source_retry() {
+        let allocation = BLOCK_LEN as usize + 1;
+        let budgets = PieceBufferBudgets::new(
+            Arc::new(PieceBufferBudget::new(allocation)),
+            Arc::new(PieceBufferBudget::new(allocation)),
+        );
+        let mut manager =
+            PieceManager::new(&dummy_meta(1, BLOCK_LEN as u64, BLOCK_LEN as u64)).unwrap();
+        let now = Instant::now();
+        let bits = [0x80];
+        assert!(manager
+            .start_peer_download(1, &bits, &budgets, now)
+            .unwrap());
+        let old = manager.request_buffered_block(1, &bits).unwrap();
+        manager.reset_peer_download(old, true);
+        assert!(manager
+            .start_peer_download(2, &bits, &budgets, now)
+            .unwrap());
+        assert!(manager.request_buffered_block(3, &bits).is_none());
+        let retry = manager.request_buffered_block(2, &bits).unwrap();
+        manager.release_peer_block(old);
+        assert!(manager.request_buffered_block(2, &bits).is_none());
+        let data = vec![0; BLOCK_LEN as usize];
+        assert!(manager
+            .receive_peer_block(old, 1, &data, now)
+            .unwrap()
+            .is_none());
+        manager.abandon_exclusive_downloads(2);
+        assert!(!manager.peer_request_is_current(retry));
+        assert!(manager
+            .start_peer_download(3, &bits, &budgets, now)
+            .unwrap());
+    }
+
+    #[test]
     fn piece_buffer_budgets_backpressure_and_release_with_buffer_lifetime() {
         let allocation = BLOCK_LEN as usize + 1;
         let global = Arc::new(PieceBufferBudget::new(allocation));
         let torrent = Arc::new(PieceBufferBudget::new(allocation * 2));
         let budgets = PieceBufferBudgets::new(Arc::clone(&global), Arc::clone(&torrent));
 
-        let first = PieceBuffer::try_new(0, BLOCK_LEN, &budgets)
-            .unwrap()
-            .unwrap();
+        let first = PieceBuffer::try_new(BLOCK_LEN, &budgets).unwrap().unwrap();
         assert_eq!(global.used(), allocation);
         assert_eq!(torrent.used(), allocation);
-        assert!(PieceBuffer::try_new(1, BLOCK_LEN, &budgets)
-            .unwrap()
-            .is_none());
+        assert!(PieceBuffer::try_new(BLOCK_LEN, &budgets).unwrap().is_none());
         assert_eq!(global.used(), allocation);
         assert_eq!(torrent.used(), allocation);
 
         drop(first);
         assert_eq!(global.used(), 0);
         assert_eq!(torrent.used(), 0);
-        let second = PieceBuffer::try_new(1, BLOCK_LEN, &budgets)
-            .unwrap()
-            .unwrap();
+        let second = PieceBuffer::try_new(BLOCK_LEN, &budgets).unwrap().unwrap();
         drop(second);
         assert_eq!(global.used(), 0);
         assert_eq!(torrent.used(), 0);
@@ -1518,21 +1760,44 @@ mod tests {
     }
 
     #[test]
-    fn steal_only_takes_stale_reservations_from_other_peers() {
-        let meta = dummy_meta(3, 16 * 1024, 48 * 1024);
-        let mut manager = PieceManager::new(&meta).unwrap();
-        let all = [0b1110_0000];
-        assert_eq!(manager.reserve_piece_for_peer(1, &all, false), Some(0));
-        assert_eq!(manager.reserve_piece_for_peer(2, &all, false), Some(1));
-        assert_eq!(
-            manager.steal_stale_piece(1, &all, Duration::from_secs(3600)),
-            None
+    fn memory_pressure_reclaims_only_idle_stale_partial_pieces() {
+        let length = 2 * BLOCK_LEN;
+        let allocation = length as usize + 2;
+        let budgets = PieceBufferBudgets::new(
+            Arc::new(PieceBufferBudget::new(allocation)),
+            Arc::new(PieceBufferBudget::new(allocation)),
         );
-        assert_eq!(manager.steal_stale_piece(1, &all, Duration::ZERO), Some(1));
-        assert_eq!(manager.reserved_by[1], Some(1));
+        let meta = dummy_meta(2, length as u64, 2 * length as u64);
+        let mut manager = PieceManager::new(&meta).unwrap();
+        let now = Instant::now();
+        let later = now + Duration::from_secs(31);
+        let first = [0x80];
+        let second = [0x40];
+        assert!(manager
+            .start_peer_download(1, &first, &budgets, now)
+            .unwrap());
+        let received = manager.request_buffered_block(1, &first).unwrap();
+        let pending = manager.request_buffered_block(1, &first).unwrap();
+        let data = vec![1; BLOCK_LEN as usize];
+        manager.receive_peer_block(received, 1, &data, now).unwrap();
+        assert!(!manager
+            .start_peer_download(2, &second, &budgets, later)
+            .unwrap());
+        manager.release_peer_block(pending);
+        assert!(!manager
+            .start_peer_download(2, &second, &budgets, now)
+            .unwrap());
+        assert!(manager
+            .start_peer_download(2, &second, &budgets, later)
+            .unwrap());
+        assert!(!manager.peer_request_is_current(pending));
         assert_eq!(
-            manager.steal_stale_piece(1, &all, Duration::from_secs(u64::MAX)),
-            None
+            manager
+                .request_buffered_block(2, &second)
+                .unwrap()
+                .block
+                .index,
+            1
         );
     }
 

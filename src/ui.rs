@@ -266,7 +266,7 @@ pub struct UiPeer {
     pub interested: bool,
     /// We let the peer download from us (unchoked).
     pub uploading_to: bool,
-    /// The peer lets us download from it.
+    /// The peer is unchoked and has at least one download request outstanding.
     pub downloading_from: bool,
     pub downloaded: u64,
     pub uploaded: u64,

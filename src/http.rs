@@ -224,10 +224,13 @@ pub(crate) fn get_public_until(
     deadline: Instant,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, String> {
-    get(
-        url,
-        &Request::public(max_bytes, RequestBudget::new(deadline, cancel)),
-    )
+    // Metainfo is passed directly to the bencode parser.
+    let headers = [("Accept-Encoding", "identity".to_string())];
+    let request = Request {
+        headers: &headers,
+        ..Request::public(max_bytes, RequestBudget::new(deadline, cancel))
+    };
+    get(url, &request)
 }
 
 /// Tracker announce: optionally tunnelled through a proxy, which then
